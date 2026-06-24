@@ -1,0 +1,74 @@
+# Docker Compose 部署配置
+#
+# 路径规则：
+# - volumes 左侧是宿主机/NAS 上的真实路径，右侧是容器内路径。
+# - 设置页里填写媒体目录时，应填写右侧的容器内路径，例如 /library/comics。
+# - 媒体目录建议保持 :ro 只读；本项目只会写入 /app/data 和 /app/generated。
+# - 同一种媒体有多个目录时，不要挂到同一个容器路径，应该挂到不同子目录：
+#   例如 /volume1/comics:/library/comics/main:ro
+#        /volume2/comics:/library/comics/archive:ro
+
+services:
+  app:
+    # 使用当前项目目录里的 Dockerfile 构建服务镜像。
+    build: .
+
+    # 端口映射：左侧是宿主机/NAS 端口，右侧是容器内端口。
+    # 访问地址通常是 http://NAS_IP:8787/
+    ports:
+      - "8787:8787"
+
+    # 可选 .env 文件。需要覆盖密码、qmediasync 地址等配置时，优先改 .env。
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # SQLite 数据库位置，保存索引、历史、阅读进度、设置等应用数据。
+      DATABASE_URL: sqlite:///app/data/library.sqlite
+
+      # 容器内监听地址。Docker 部署时应保持 0.0.0.0，方便宿主机端口转发。
+      APP_BIND: 0.0.0.0:8787
+
+      # 默认媒体目录。这些都是容器内路径，需要和下方 volumes 右侧路径对应。
+      # 如果设置页里已经保存了媒体目录，实际扫描会优先使用设置页中的目录列表。
+      COMICS_DIR: /library/comics
+      NOVELS_DIR: /library/novels
+      AUDIO_DIR: /library/audio
+      GALLERY_DIR: /library/gallery
+
+      # 派生文件目录，例如封面、缩略图等生成内容。
+      GENERATED_DIR: /app/generated
+
+      # qmediasync 服务地址，可在 .env 中设置，例如：
+      # QMEDIASYNC_BASE_URL=http://192.168.31.39:8095
+      QMEDIASYNC_BASE_URL: ${QMEDIASYNC_BASE_URL:-}
+
+      # NAS/Docker 部署建议关闭文件监听，新增资源后在网页里手动“重新扫描并重建索引”。
+      ENABLE_FILE_WATCHER: "false"
+      WATCH_DEBOUNCE_SECONDS: "20"
+
+    volumes:
+      # 本地/NAS 媒体目录挂载。
+      # 部署到 NAS 时，把左侧 ./漫画 等改成 NAS 真实路径，例如：
+      # - /volume1/media/漫画:/library/comics:ro
+      # - /volume1/media/轻小说:/library/novels:ro
+      # - /volume1/media/音声:/library/audio:ro
+      # - /volume1/media/图库:/library/gallery:ro
+      - ./漫画:/library/comics:ro
+      - ./轻小说:/library/novels:ro
+      - ./音声:/library/audio:ro
+      - ./图库:/library/gallery:ro
+
+      # qmediasync 生成的 STRM 输出目录，只读挂载。
+      # 可在 .env 中设置 QMEDIASYNC_STRM_DIR=/volume1/qmediasync/strm
+      - ${QMEDIASYNC_STRM_DIR:-./qms-strm}:/qms-strm:ro
+
+      # 应用数据目录：数据库、搜索索引、缩略图、云端缓存等，需要可写并持久化。
+      - ./data:/app/data
+
+      # 生成资源目录：封面、占位图等，需要可写并持久化。
+      - ./generated:/app/generated
+
+    # 容器异常退出或 NAS 重启后自动恢复。
+    restart: unless-stopped

@@ -1,0 +1,17 @@
+target/
+node_modules/
+frontend/dist/
+data/
+generated/
+downloads/
+qms-strm/
+漫画/
+轻小说/
+音声/
+图库/
+.env
+.DS_Store
+*.log
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
