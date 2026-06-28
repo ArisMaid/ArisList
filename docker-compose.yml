@@ -10,8 +10,11 @@
 
 services:
   app:
-    # 使用当前项目目录里的 Dockerfile 构建服务镜像。
-    build: .
+    # 默认从镜像仓库拉取，适合 NAS/服务器部署。
+    # 如需使用其它镜像或固定版本，可在 .env 中设置：
+    # ARISLIST_IMAGE=ghcr.io/arismaid/arislist:v1.0.0
+    image: ${ARISLIST_IMAGE:-ghcr.io/arismaid/arislist:latest}
+    pull_policy: always
 
     # 端口映射：左侧是宿主机/NAS 端口，右侧是容器内端口。
     # 访问地址通常是 http://NAS_IP:8787/

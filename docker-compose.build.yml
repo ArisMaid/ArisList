@@ -1,0 +1,10 @@
+# Docker Compose 本地构建覆盖配置
+#
+# 默认 docker-compose.yml 会从镜像仓库拉取镜像。
+# 需要在当前源码目录本地构建时，使用：
+# docker compose -f docker-compose.yml -f docker-compose.build.yml up --build -d
+
+services:
+  app:
+    build: .
+    pull_policy: build
