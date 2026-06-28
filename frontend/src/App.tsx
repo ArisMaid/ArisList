@@ -48,7 +48,8 @@ import {
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { api, assetUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type EpubChapter, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type WorkDetail, type WorkSummary } from "./api";
+import { api, assetUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type EpubChapter, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
+import { GlassFilterProvider, GlassSurface } from "./components/material";
 
 type KindFilter = "all" | "history" | "comic" | "novel" | "audio" | "gallery";
 type ViewMode = "grid" | "compact" | "list" | "cover";
@@ -58,6 +59,10 @@ type ComicReaderMode = "paged" | "scroll" | "horizontal";
 type NovelTheme = "paper" | "dark";
 type NovelDisplayMode = "collections" | "single";
 type DetailMode = "modal" | "docked";
+type AppearanceState = {
+  material: UiMaterial;
+  glass_intensity: GlassIntensity;
+};
 type LocalSearchState = {
   query: string;
   ids: number[];
@@ -97,6 +102,11 @@ const kindIcon: Record<string, ReactNode> = {
 Object.assign(kindIcon, {
   "novel-collection": <Folders size={16} />
 });
+
+const defaultAppearance: AppearanceState = {
+  material: "liquid",
+  glass_intensity: "standard"
+};
 
 export function App() {
   const [library, setLibrary] = useState<LibraryResponse>({ works: [], tags: [], jobs: [], history: [] });
@@ -143,6 +153,16 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("media_shelf_theme", theme);
   }, [theme]);
+
+  const appearance = settings?.appearance ?? defaultAppearance;
+  const material = appearance.material ?? "liquid";
+  const glassIntensity = appearance.glass_intensity ?? "standard";
+  const isLiquid = material === "liquid";
+
+  useEffect(() => {
+    document.documentElement.dataset.material = material;
+    document.documentElement.dataset.glassIntensity = glassIntensity;
+  }, [material, glassIntensity]);
 
   useEffect(() => {
     api.authSession().then(setAuth).catch(() => setAuth({ authenticated: false }));
@@ -402,6 +422,19 @@ export function App() {
     setSettings((prev) => (prev ? { ...prev, theme: next } : prev));
   };
 
+  const changeAppearance = (next: Partial<AppearanceState>) => {
+    setSettings((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        appearance: {
+          ...(prev.appearance ?? defaultAppearance),
+          ...next
+        }
+      };
+    });
+  };
+
   useEffect(() => {
     setCollectionStack(null);
   }, [kind, novelDisplayMode, query, tagFilters]);
@@ -471,101 +504,84 @@ export function App() {
   };
 
   return (
-    <div className={detailMode === "docked" ? "app-shell has-detail-pane" : "app-shell modal-detail"}>
+    <GlassFilterProvider>
+    <div
+      className={detailMode === "docked" ? "app-shell has-detail-pane" : "app-shell modal-detail"}
+      data-glass-intensity={glassIntensity}
+      data-material={material}
+    >
+      {isLiquid ? (
+      <GlassSurface as="aside" className="rail" variant="panel">
+        <RailContent
+          counts={counts}
+          includeTags={includeTags}
+          kind={kind}
+          selectedTag={selectedTag}
+          tagFilters={tagFilters}
+          tagLanguage={tagLanguage}
+          tagQuery={tagQuery}
+          visibleTags={visibleTags}
+          onKindChange={setKind}
+          onSelectedTagChange={setSelectedTag}
+          onTagFiltersChange={setTagFilters}
+          onTagLanguageChange={setTagLanguage}
+          onTagQueryChange={setTagQuery}
+        />
+      </GlassSurface>
+      ) : (
       <aside className="rail">
-        <div className="brand">
-          <Library />
-          <span>Aris的仓库</span>
-        </div>
-        <nav className="kind-nav">
-          {(["all", "gallery", "comic", "novel", "audio", "history"] as KindFilter[]).map((item) => (
-            <button className={kind === item ? "active" : ""} key={item} onClick={() => setKind(item)}>
-              {item === "all" ? <Grid3X3 size={16} /> : kindIcon[item]}
-              <span>{kindLabels[item]}</span>
-              <strong>{counts[item] ?? 0}</strong>
-            </button>
-          ))}
-        </nav>
-        <div className="tag-search">
-          <ListFilter size={16} />
-          <input value={tagQuery} onChange={(event) => setTagQuery(event.target.value)} placeholder="标签" />
-          <button
-            className="tag-language-toggle"
-            onClick={() => setTagLanguage((value) => (value === "translated" ? "raw" : "translated"))}
-            aria-label="切换标签语言"
-          >
-            {tagLanguage === "translated" ? "ZH" : "RAW"}
-          </button>
-        </div>
-        {includeTags.length > 0 && (
-          <div className="tag-filter-summary">
-            {includeTags.map((key) => (
-              <button key={`include-${key}`} onClick={() => setTagFilters((prev) => cycleTagFilter(prev, key))}>
-                + {shortTag(key)}
-              </button>
-            ))}
-          </div>
-        )}
-        {selectedTag && (
-          <TagDetailPanel
-            language={tagLanguage}
-            tag={selectedTag}
-            onClose={() => setSelectedTag(null)}
-          />
-        )}
-        <div className="tag-list">
-          {visibleTags.map((tag) => {
-            const key = tagKey(tag);
-            const mode = tagFilters[key];
-            return (
-              <div className={mode ? `tag-row ${mode}` : "tag-row"} key={key}>
-                <button className="tag-pick" onClick={() => setTagFilters((prev) => cycleTagFilter(prev, key))}>
-                  <span>{tagNamespace(tag, tagLanguage)}</span>
-                  <b>{tagLabel(tag, tagLanguage)}</b>
-                  <em>{tag.count}</em>
-                </button>
-                <button className="tag-info" onClick={() => setSelectedTag(tag)} aria-label="标签详情">
-                  <Info size={14} />
-                </button>
-              </div>
-            );
-          })}
-        </div>
+        <RailContent
+          counts={counts}
+          includeTags={includeTags}
+          kind={kind}
+          selectedTag={selectedTag}
+          tagFilters={tagFilters}
+          tagLanguage={tagLanguage}
+          tagQuery={tagQuery}
+          visibleTags={visibleTags}
+          onKindChange={setKind}
+          onSelectedTagChange={setSelectedTag}
+          onTagFiltersChange={setTagFilters}
+          onTagLanguageChange={setTagLanguage}
+          onTagQueryChange={setTagQuery}
+        />
       </aside>
+      )}
 
       <main className="workspace">
+        {isLiquid ? (
+        <GlassSurface as="header" className="toolbar" variant="panel">
+          <ToolbarContent
+            collectionStack={collectionStack}
+            kind={kind}
+            localSearch={localSearch}
+            novelDisplayMode={novelDisplayMode}
+            query={query}
+            viewMode={viewMode}
+            onCollectionBack={() => setCollectionStack(null)}
+            onNovelDisplayModeChange={setNovelDisplayMode}
+            onQueryChange={setQuery}
+            onSettingsOpen={() => setSettingsOpen(true)}
+            onViewModeChange={setViewMode}
+          />
+        </GlassSurface>
+        ) : (
         <header className="toolbar">
-          <div className="searchbar">
-            <Search size={18} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索书架" />
-            {localSearch.status === "loading" && <Loader2 className="spin search-state" size={15} />}
-            {localSearch.status === "ready" && localSearch.query === query.trim() && <span className="search-state">{localSearch.tookMs ?? 0}ms</span>}
-          </div>
-          <div className="toolbar-actions">
-            {collectionStack && (
-              <button className="primary-action subtle-action" onClick={() => setCollectionStack(null)}>
-                <ChevronLeft size={16} />
-                <span>返回合集</span>
-              </button>
-            )}
-            {kind === "novel" && (
-              <div className="segmented compact-segmented" aria-label="小说显示方式">
-                <button className={novelDisplayMode === "collections" ? "active" : ""} onClick={() => setNovelDisplayMode("collections")}>
-                  <Folders size={16} />
-                  <span>合集</span>
-                </button>
-                <button className={novelDisplayMode === "single" ? "active" : ""} onClick={() => setNovelDisplayMode("single")}>
-                  <BookCopy size={16} />
-                  <span>单本</span>
-                </button>
-              </div>
-            )}
-            <ViewModePicker value={viewMode} onChange={setViewMode} />
-            <button className="icon-btn" onClick={() => setSettingsOpen(true)} aria-label="设置">
-              <Settings size={18} />
-            </button>
-          </div>
+          <ToolbarContent
+            collectionStack={collectionStack}
+            kind={kind}
+            localSearch={localSearch}
+            novelDisplayMode={novelDisplayMode}
+            query={query}
+            viewMode={viewMode}
+            onCollectionBack={() => setCollectionStack(null)}
+            onNovelDisplayModeChange={setNovelDisplayMode}
+            onQueryChange={setQuery}
+            onSettingsOpen={() => setSettingsOpen(true)}
+            onViewModeChange={setViewMode}
+          />
         </header>
+        )}
 
         {error && (
           <motion.div className="error-strip" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}>
@@ -608,6 +624,7 @@ export function App() {
           onOpenReader={openReader}
           onPlayTrack={playTrackInDock}
           onTagPick={(key) => setTagFilters((prev) => cycleTagFilter(prev, key))}
+          liquid={isLiquid}
         />
       )}
       <AudioDock
@@ -616,6 +633,7 @@ export function App() {
         onClose={() => setActiveAudio(null)}
         onProgressSaved={syncProgress}
         resumePosition={activeAudio ? historyByWorkId.get(activeAudio.work.id)?.position ?? null : null}
+        liquid={isLiquid}
       />
 
       <AnimatePresence>
@@ -630,6 +648,7 @@ export function App() {
               onOpenReader={openReader}
               onPlayTrack={playTrackInDock}
               onTagPick={(key) => setTagFilters((prev) => cycleTagFilter(prev, key))}
+              liquid={isLiquid}
             />
           </motion.div>
         )}
@@ -643,6 +662,7 @@ export function App() {
             passwordMessage={passwordMessage}
             settings={settings}
             theme={theme}
+            onAppearanceChange={changeAppearance}
             onChangeAdminPassword={changeAdminPassword}
             onClose={() => setSettingsOpen(false)}
             onLogin={login}
@@ -654,6 +674,7 @@ export function App() {
             onTagImport={runTagImport}
             onThemeChange={changeTheme}
             onNewAdminPasswordChange={setNewAdminPassword}
+            liquid={isLiquid}
           />
         )}
         {readerOpen && detail && (
@@ -663,10 +684,170 @@ export function App() {
             onClose={() => setReaderOpen(false)}
             onProgressSaved={syncProgress}
             resumePosition={readerResume ? readerPositionOverride ?? historyByWorkId.get(detail.work.id)?.position ?? null : "start"}
+            liquid={isLiquid}
           />
         )}
       </AnimatePresence>
     </div>
+    </GlassFilterProvider>
+  );
+}
+
+function RailContent({
+  counts,
+  includeTags,
+  kind,
+  selectedTag,
+  tagFilters,
+  tagLanguage,
+  tagQuery,
+  visibleTags,
+  onKindChange,
+  onSelectedTagChange,
+  onTagFiltersChange,
+  onTagLanguageChange,
+  onTagQueryChange
+}: {
+  counts: Record<string, number>;
+  includeTags: string[];
+  kind: KindFilter;
+  selectedTag: Tag | null;
+  tagFilters: Record<string, TagFilterMode>;
+  tagLanguage: TagLanguage;
+  tagQuery: string;
+  visibleTags: Tag[];
+  onKindChange: (kind: KindFilter) => void;
+  onSelectedTagChange: (tag: Tag | null) => void;
+  onTagFiltersChange: (next: Record<string, TagFilterMode> | ((prev: Record<string, TagFilterMode>) => Record<string, TagFilterMode>)) => void;
+  onTagLanguageChange: (next: TagLanguage | ((prev: TagLanguage) => TagLanguage)) => void;
+  onTagQueryChange: (value: string) => void;
+}) {
+  return (
+    <>
+      <div className="brand">
+        <Library />
+        <span>Aris的仓库</span>
+      </div>
+      <nav className="kind-nav">
+        {(["all", "gallery", "comic", "novel", "audio", "history"] as KindFilter[]).map((item) => (
+          <button className={kind === item ? "active" : ""} key={item} onClick={() => onKindChange(item)}>
+            {item === "all" ? <Grid3X3 size={16} /> : kindIcon[item]}
+            <span>{kindLabels[item]}</span>
+            <strong>{counts[item] ?? 0}</strong>
+          </button>
+        ))}
+      </nav>
+      <div className="tag-search">
+        <ListFilter size={16} />
+        <input value={tagQuery} onChange={(event) => onTagQueryChange(event.target.value)} placeholder="标签" />
+        <button
+          className="tag-language-toggle"
+          onClick={() => onTagLanguageChange((value) => (value === "translated" ? "raw" : "translated"))}
+          aria-label="切换标签语言"
+        >
+          {tagLanguage === "translated" ? "ZH" : "RAW"}
+        </button>
+      </div>
+      {includeTags.length > 0 && (
+        <div className="tag-filter-summary">
+          {includeTags.map((key) => (
+            <button key={`include-${key}`} onClick={() => onTagFiltersChange((prev) => cycleTagFilter(prev, key))}>
+              + {shortTag(key)}
+            </button>
+          ))}
+        </div>
+      )}
+      {selectedTag && (
+        <TagDetailPanel
+          language={tagLanguage}
+          tag={selectedTag}
+          onClose={() => onSelectedTagChange(null)}
+        />
+      )}
+      <div className="tag-list">
+        {visibleTags.map((tag) => {
+          const key = tagKey(tag);
+          const mode = tagFilters[key];
+          return (
+            <div className={mode ? `tag-row ${mode}` : "tag-row"} key={key}>
+              <button className="tag-pick" onClick={() => onTagFiltersChange((prev) => cycleTagFilter(prev, key))}>
+                <span>{tagNamespace(tag, tagLanguage)}</span>
+                <b>{tagLabel(tag, tagLanguage)}</b>
+                <em>{tag.count}</em>
+              </button>
+              <button className="tag-info" onClick={() => onSelectedTagChange(tag)} aria-label="标签详情">
+                <Info size={14} />
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+function ToolbarContent({
+  collectionStack,
+  kind,
+  localSearch,
+  novelDisplayMode,
+  query,
+  viewMode,
+  onCollectionBack,
+  onNovelDisplayModeChange,
+  onQueryChange,
+  onSettingsOpen,
+  onViewModeChange
+}: {
+  collectionStack: WorkSummary[] | null;
+  kind: KindFilter;
+  localSearch: LocalSearchState;
+  novelDisplayMode: NovelDisplayMode;
+  query: string;
+  viewMode: ViewMode;
+  onCollectionBack: () => void;
+  onNovelDisplayModeChange: (mode: NovelDisplayMode) => void;
+  onQueryChange: (value: string) => void;
+  onSettingsOpen: () => void;
+  onViewModeChange: (value: ViewMode) => void;
+}) {
+  return (
+    <>
+      <div className="toolbar-left">
+        {collectionStack && (
+          <button className="primary-action subtle-action collection-back-action" onClick={onCollectionBack}>
+            <ChevronLeft size={16} />
+            <span>返回合集</span>
+          </button>
+        )}
+      </div>
+      <div className="toolbar-center">
+        <div className="searchbar">
+          <Search size={18} />
+          <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索书架" />
+          {localSearch.status === "loading" && <Loader2 className="spin search-state" size={15} />}
+          {localSearch.status === "ready" && localSearch.query === query.trim() && <span className="search-state">{localSearch.tookMs ?? 0}ms</span>}
+        </div>
+      </div>
+      <div className="toolbar-actions">
+        {kind === "novel" && (
+          <div className="segmented compact-segmented" aria-label="小说显示方式">
+            <button className={novelDisplayMode === "collections" ? "active" : ""} onClick={() => onNovelDisplayModeChange("collections")}>
+              <Folders size={16} />
+              <span>合集</span>
+            </button>
+            <button className={novelDisplayMode === "single" ? "active" : ""} onClick={() => onNovelDisplayModeChange("single")}>
+              <BookCopy size={16} />
+              <span>单本</span>
+            </button>
+          </div>
+        )}
+        <ViewModePicker value={viewMode} onChange={onViewModeChange} />
+        <button className="icon-btn" onClick={onSettingsOpen} aria-label="设置">
+          <Settings size={18} />
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -783,6 +964,7 @@ function SettingsOverlay({
   authBusy,
   busy,
   loginPassword,
+  liquid = false,
   newAdminPassword,
   passwordMessage,
   settings,
@@ -797,12 +979,14 @@ function SettingsOverlay({
   onResetAdminPassword,
   onSaveSettings,
   onTagImport,
-  onThemeChange
+  onThemeChange,
+  onAppearanceChange
 }: {
   auth: AuthSession;
   authBusy: boolean;
   busy: boolean;
   loginPassword: string;
+  liquid?: boolean;
   newAdminPassword: string;
   passwordMessage: string | null;
   settings: AppSettings | null;
@@ -818,6 +1002,7 @@ function SettingsOverlay({
   onSaveSettings: (settings: AppSettings) => void;
   onTagImport: () => void;
   onThemeChange: (value: ThemeMode) => void;
+  onAppearanceChange: (next: Partial<AppearanceState>) => void;
 }) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
   const [dirInputs, setDirInputs] = useState({ comics: "", novels: "", audio: "", gallery: "" });
@@ -845,6 +1030,17 @@ function SettingsOverlay({
 
   const updateDraft = (updater: (value: AppSettings) => AppSettings) => {
     setDraft((prev) => (prev ? updater(prev) : prev));
+  };
+
+  const updateAppearance = (patch: Partial<AppearanceState>) => {
+    updateDraft((prev) => ({
+      ...prev,
+      appearance: {
+        ...(prev.appearance ?? defaultAppearance),
+        ...patch
+      }
+    }));
+    onAppearanceChange(patch);
   };
 
   const addDir = (kind: keyof AppSettings["media_dirs"]) => {
@@ -984,7 +1180,7 @@ function SettingsOverlay({
           {auth.authenticated && (
             <>
               <section className="settings-section">
-                <h3>主题</h3>
+                <h3>外观</h3>
                 <div className="segmented">
                   <button className={theme === "light" ? "active" : ""} onClick={() => { onThemeChange("light"); updateDraft((prev) => ({ ...prev, theme: "light" })); }}>
                     <Sun size={16} />
@@ -995,6 +1191,33 @@ function SettingsOverlay({
                     <span>深色</span>
                   </button>
                 </div>
+                {draft && (
+                  <>
+                    <div className="settings-subtitle">界面材质</div>
+                    <div className="segmented">
+                      <button className={(draft.appearance?.material ?? "liquid") === "liquid" ? "active" : ""} onClick={() => updateAppearance({ material: "liquid" })}>
+                        <Sparkles size={16} />
+                        <span>液态玻璃</span>
+                      </button>
+                      <button className={(draft.appearance?.material ?? "liquid") === "classic" ? "active" : ""} onClick={() => updateAppearance({ material: "classic" })}>
+                        <LayoutList size={16} />
+                        <span>经典</span>
+                      </button>
+                    </div>
+                    <div className="settings-subtitle">玻璃强度</div>
+                    <div className="segmented">
+                      {(["clear", "standard", "readable"] as GlassIntensity[]).map((value) => (
+                        <button
+                          className={(draft.appearance?.glass_intensity ?? "standard") === value ? "active" : ""}
+                          key={value}
+                          onClick={() => updateAppearance({ glass_intensity: value })}
+                        >
+                          <span>{value === "clear" ? "通透" : value === "readable" ? "清晰" : "标准"}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
               </section>
 
               {draft && (
@@ -1330,7 +1553,8 @@ function DetailPane({
   onClose,
   onTagPick,
   onPlayTrack,
-  onOpenReader
+  onOpenReader,
+  liquid = false
 }: {
   detail: WorkDetail | null;
   jobs: Job[];
@@ -1340,6 +1564,7 @@ function DetailPane({
   onTagPick: (key: string) => void;
   onPlayTrack: (work: WorkDetail["work"], asset: Asset, playlist?: Asset[]) => void;
   onOpenReader: (resume?: boolean) => void;
+  liquid?: boolean;
 }) {
   const [jobOpen, setJobOpen] = useState(false);
   const tracks = detail?.assets.filter((asset) => asset.role === "track") ?? [];
@@ -1352,6 +1577,7 @@ function DetailPane({
   const canOpenReader = detail ? ["comic", "novel", "audio", "generated", "gallery"].includes(detail.work.kind) : false;
   const hasReadableProgress = Boolean(detail && detail.work.progress > 0.01 && detail.work.progress < 0.995 && canOpenReader);
   const openLabel = detail?.work.kind === "audio" ? "文件" : detail?.work.kind === "gallery" || detail?.work.kind === "generated" ? "预览" : "阅读";
+  const groupedTags = useMemo(() => groupDetailTags(detail?.tags ?? [], tagLanguage), [detail?.tags, tagLanguage]);
 
   useEffect(() => {
     setRouteInfo(null);
@@ -1371,8 +1597,8 @@ function DetailPane({
     };
   }, [routeAsset?.id]);
 
-  return (
-    <aside className={variant === "modal" ? "detail-pane detail-pane-modal" : "detail-pane"} onClick={(event) => event.stopPropagation()}>
+  const detailClassName = variant === "modal" ? "detail-pane detail-pane-modal" : "detail-pane";
+  const detailContent = (
       <AnimatePresence mode="wait">
         {detail ? (
           <motion.div key={detail.work.id} initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 12 }} className="detail-content">
@@ -1428,12 +1654,18 @@ function DetailPane({
                 )}
               </div>
             </div>
-            <div className="tag-cloud">
-              {detail.tags.slice(0, 42).map((tag) => (
-                <button key={tagKey(tag)} onClick={() => onTagPick(tagKey(tag))}>
-                  <em>{tagNamespace(tag, tagLanguage)}</em>
-                  {tagLabel(tag, tagLanguage)}
-                </button>
+            <div className="tag-cloud tag-group-list">
+              {groupedTags.map((group) => (
+                <div className="tag-group" key={group.namespace}>
+                  <span className="tag-group-name">{group.namespace}</span>
+                  <div className="tag-group-items">
+                    {group.tags.map((tag) => (
+                      <button key={tagKey(tag)} onClick={() => onTagPick(tagKey(tag))}>
+                        {tagLabel(tag, tagLanguage)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               ))}
             </div>
             {detail.work.description && <p className="description">{detail.work.description}</p>}
@@ -1490,6 +1722,15 @@ function DetailPane({
           </motion.div>
         )}
       </AnimatePresence>
+  );
+
+  return liquid ? (
+    <GlassSurface as="aside" className={detailClassName} variant={variant === "modal" ? "floating" : "panel"} onClick={(event) => event.stopPropagation()}>
+      {detailContent}
+    </GlassSurface>
+  ) : (
+    <aside className={detailClassName} onClick={(event) => event.stopPropagation()}>
+      {detailContent}
     </aside>
   );
 }
@@ -1499,13 +1740,15 @@ function AudioDock({
   canPersistProgress,
   onClose,
   onProgressSaved,
-  resumePosition
+  resumePosition,
+  liquid = false
 }: {
   active: ActiveAudioState | null;
   canPersistProgress: boolean;
   onClose: () => void;
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
   resumePosition?: string | null;
+  liquid?: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const lastProgressWrite = useRef(0);
@@ -1515,6 +1758,7 @@ function AudioDock({
   const [isPlaying, setIsPlaying] = useState(false);
   const [repeatMode, setRepeatMode] = useState<AudioRepeatMode>("none");
   const [queueOpen, setQueueOpen] = useState(false);
+  const [volume, setVolume] = useState(1);
   const meta = parseMeta<{ title?: string }>(currentAsset?.meta_json);
   const resumeTrack = parseReadingPosition(resumePosition);
   const playlist = useMemo(() => active?.playlist ?? (active?.asset ? [active.asset] : []), [active]);
@@ -1532,6 +1776,12 @@ function AudioDock({
     setDuration(0);
     setIsPlaying(false);
   }, [currentAsset?.id]);
+
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = volume;
+    }
+  }, [volume]);
 
   const saveAudioProgress = (currentTime: number, duration: number, ended = false, force = false) => {
     if (!canPersistProgress || !active || !currentAsset || !Number.isFinite(duration) || duration <= 0) return;
@@ -1593,8 +1843,8 @@ function AudioDock({
 
   if (!active || !currentAsset) return null;
 
-  return (
-    <motion.div className="audio-dock" initial={{ y: 80 }} animate={{ y: 0 }} exit={{ y: 80 }}>
+  const audioContent = (
+    <>
       <button className="icon-btn compact audio-queue-toggle" onClick={() => setQueueOpen((value) => !value)} aria-label="播放列表">
         <ListMusic size={15} />
       </button>
@@ -1639,6 +1889,18 @@ function AudioDock({
           <span>{formatAudioTime(duration)}</span>
         </div>
       </div>
+      <label className="audio-volume" style={{ "--audio-volume": `${Math.round(volume * 100)}%` } as CSSProperties}>
+        <Volume2 size={15} />
+        <input
+          aria-label="音量"
+          max={1}
+          min={0}
+          onChange={(event) => setVolume(Number(event.currentTarget.value))}
+          step={0.01}
+          type="range"
+          value={volume}
+        />
+      </label>
       <audio
         className="audio-engine"
         ref={audioRef}
@@ -1654,6 +1916,7 @@ function AudioDock({
           }
           setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
           setCurrentTime(nextTime);
+          event.currentTarget.volume = volume;
         }}
         onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
         onEnded={(event) => {
@@ -1697,6 +1960,18 @@ function AudioDock({
           </motion.div>
         )}
       </AnimatePresence>
+    </>
+  );
+
+  return liquid ? (
+    <motion.div className="audio-dock-motion" initial={{ y: 80 }} animate={{ y: 0 }} exit={{ y: 80 }}>
+      <GlassSurface className="audio-dock" variant="dock">
+        {audioContent}
+      </GlassSurface>
+    </motion.div>
+  ) : (
+    <motion.div className="audio-dock" initial={{ y: 80 }} animate={{ y: 0 }} exit={{ y: 80 }}>
+      {audioContent}
     </motion.div>
   );
 }
@@ -1706,13 +1981,15 @@ function ReaderOverlay({
   detail,
   onClose,
   onProgressSaved,
-  resumePosition
+  resumePosition,
+  liquid = false
 }: {
   canPersistProgress: boolean;
   detail: WorkDetail;
   onClose: () => void;
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
   resumePosition?: string | null;
+  liquid?: boolean;
 }) {
   const [pages, setPages] = useState<ComicPageInfo[]>([]);
   const [page, setPage] = useState(0);
@@ -1726,8 +2003,10 @@ function ReaderOverlay({
   const [comicScrollLeft, setComicScrollLeft] = useState(0);
   const [novelTheme, setNovelTheme] = useState<NovelTheme>("paper");
   const [readerError, setReaderError] = useState<string | null>(null);
+  const [readerChromeVisible, setReaderChromeVisible] = useState(false);
   const lastAudioProgressWrite = useRef(0);
   const comicStageRef = useRef<HTMLDivElement | null>(null);
+  const readerChromeTimerRef = useRef<number | null>(null);
   const resumeAppliedRef = useRef(false);
   const suppressNextProgressRef = useRef(false);
   const needsComicResumeScrollRef = useRef(false);
@@ -1750,7 +2029,12 @@ function ReaderOverlay({
     setComicZoom(1);
     setComicViewport({ width: 0, height: 0 });
     setComicScrollLeft(0);
+    setReaderChromeVisible(false);
     setReaderError(null);
+    if (readerChromeTimerRef.current !== null) {
+      window.clearTimeout(readerChromeTimerRef.current);
+      readerChromeTimerRef.current = null;
+    }
     resumeAppliedRef.current = false;
     suppressNextProgressRef.current = false;
     needsComicResumeScrollRef.current = false;
@@ -1779,6 +2063,9 @@ function ReaderOverlay({
       if (comicScrollFrameRef.current !== null) {
         window.cancelAnimationFrame(comicScrollFrameRef.current);
       }
+      if (readerChromeTimerRef.current !== null) {
+        window.clearTimeout(readerChromeTimerRef.current);
+      }
     };
   }, []);
 
@@ -1786,16 +2073,20 @@ function ReaderOverlay({
   const isNovel = detail.work.kind === "novel";
   const isGenerated = detail.work.kind === "generated";
   const isGallery = detail.work.kind === "gallery";
+  const immersiveReader = isComic;
   const comicAspect = useMemo(() => comicAspectHint(pages), [pages]);
-  const comicSlotWidth = Math.max(1, comicViewport.height * comicZoom * comicAspect);
-  const comicWindowStart = comicMode === "horizontal" && comicViewport.width > 0
+  const comicFallbackHeight = typeof window === "undefined" ? 720 : Math.max(360, window.innerHeight - 72);
+  const comicMeasuredHeight = comicViewport.height > 24 ? comicViewport.height : comicFallbackHeight;
+  const comicMeasuredWidth = comicViewport.width > 24 ? comicViewport.width : typeof window === "undefined" ? 960 : window.innerWidth;
+  const comicSlotWidth = Math.max(120, comicMeasuredHeight * comicZoom * comicAspect);
+  const comicWindowStart = comicMode === "horizontal" && comicMeasuredWidth > 0
     ? Math.max(0, Math.floor(comicScrollLeft / comicSlotWidth) - COMIC_HORIZONTAL_OVERSCAN)
     : 0;
   const comicWindowEnd = comicMode === "horizontal"
-    ? comicViewport.width > 0
+    ? comicMeasuredWidth > 0
       ? Math.min(
         pages.length,
-        Math.ceil((comicScrollLeft + comicViewport.width) / comicSlotWidth) + COMIC_HORIZONTAL_OVERSCAN
+        Math.ceil((comicScrollLeft + comicMeasuredWidth) / comicSlotWidth) + COMIC_HORIZONTAL_OVERSCAN
       )
       : Math.min(pages.length, COMIC_HORIZONTAL_OVERSCAN * 2 + 1)
     : pages.length;
@@ -1811,6 +2102,24 @@ function ReaderOverlay({
       .updateProgress(detail.work.id, progress, position)
       .then((res) => onProgressSaved(detail.work.id, res.progress, res.position ?? position))
       .catch(() => {});
+  };
+
+  const toggleReaderChrome = () => {
+    if (!immersiveReader) return;
+    setReaderChromeVisible((visible) => {
+      const next = !visible;
+      if (readerChromeTimerRef.current !== null) {
+        window.clearTimeout(readerChromeTimerRef.current);
+        readerChromeTimerRef.current = null;
+      }
+      if (next) {
+        readerChromeTimerRef.current = window.setTimeout(() => {
+          setReaderChromeVisible(false);
+          readerChromeTimerRef.current = null;
+        }, 3200);
+      }
+      return next;
+    });
   };
 
   useEffect(() => {
@@ -2034,66 +2343,111 @@ function ReaderOverlay({
   };
 
   const themedChapterHtml = useMemo(() => applyNovelTheme(chapterHtml, novelTheme), [chapterHtml, novelTheme]);
+  const readerActionsContent = (
+    <>
+        {isComic && <b>{pages.length ? `${page + 1}/${pages.length}` : "0/0"}</b>}
+        {isComic && pages.length > 0 && (
+          <>
+            <button className="icon-btn" onClick={() => navigateComic(-1)} aria-label="上一页">
+              <ChevronLeft size={16} />
+            </button>
+            <button className="icon-btn" onClick={() => navigateComic(1)} aria-label="下一页">
+              <ChevronRight size={16} />
+            </button>
+            <button
+              className={comicMode !== "paged" ? "icon-btn active" : "icon-btn"}
+              onClick={() => setComicMode((value) => (value === "paged" ? "scroll" : value === "scroll" ? "horizontal" : "paged"))}
+              aria-label="切换漫画阅读布局"
+            >
+              {comicMode === "horizontal" ? <GalleryHorizontal size={16} /> : comicMode === "scroll" ? <ListFilter size={16} /> : <BookOpen size={16} />}
+            </button>
+            <button className="icon-btn" onClick={() => changeComicZoom(-0.1)} aria-label="缩小">
+              <ZoomOut size={16} />
+            </button>
+            <button className="icon-btn" onClick={() => changeComicZoom(0.1)} aria-label="放大">
+              <ZoomIn size={16} />
+            </button>
+          </>
+        )}
+        {isNovel && <b>{showNovelCover ? `封面/${chapters.length || 0}` : chapters.length ? `${chapter + 1}/${chapters.length}` : "0/0"}</b>}
+        {isNovel && chapters.length > 0 && (
+          <>
+            <button className="icon-btn" onClick={() => moveChapter(-1)} aria-label="上一章">
+              <ChevronLeft size={16} />
+            </button>
+            <button className="icon-btn" onClick={() => moveChapter(1)} aria-label="下一章">
+              <ChevronRight size={16} />
+            </button>
+            <button className="icon-btn" onClick={() => setNovelTheme((value) => (value === "paper" ? "dark" : "paper"))} aria-label="切换阅读主题">
+              {novelTheme === "paper" ? <Moon size={16} /> : <Sun size={16} />}
+            </button>
+          </>
+        )}
+        {isNovel && bookAsset && (
+          <a href={assetUrl(bookAsset.id)} target="_blank" rel="noreferrer">
+            EPUB
+          </a>
+        )}
+    </>
+  );
+  const readerBarContent = (
+    <>
+      <button className="icon-btn reader-back-button" onClick={onClose} aria-label="关闭">
+        <ChevronLeft size={18} />
+      </button>
+      <span className="reader-title-pill">{detail.work.title}</span>
+      <div className="reader-actions">{readerActionsContent}</div>
+    </>
+  );
+  const readerClassName = [
+    "reader",
+    isNovel ? "reader-novel" : "",
+    immersiveReader ? "reader-immersive" : "",
+    immersiveReader ? (readerChromeVisible ? "chrome-visible" : "chrome-hidden") : ""
+  ].filter(Boolean).join(" ");
+  const liquidReaderBarClassName = [
+    "reader-bar",
+    isComic || isGallery ? "reader-bar-floating" : "reader-bar-docked",
+    isGallery ? "reader-bar-gallery" : "",
+    isNovel ? "reader-bar-novel" : ""
+  ].filter(Boolean).join(" ");
 
   return (
     <motion.div className="reader-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-      <motion.div className="reader" initial={{ scale: 0.98, y: 18 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.98, y: 18 }} onWheel={onHorizontalComicWheel}>
-        <div className="reader-bar">
-          <button className="icon-btn" onClick={onClose} aria-label="关闭">
-            <ChevronLeft size={18} />
-          </button>
-          <span>{detail.work.title}</span>
-          <div className="reader-actions">
-            {isComic && <b>{pages.length ? `${page + 1}/${pages.length}` : "0/0"}</b>}
-            {isComic && pages.length > 0 && (
-              <>
-                <button className="icon-btn" onClick={() => navigateComic(-1)} aria-label="上一页">
-                  <ChevronLeft size={16} />
-                </button>
-                <button className="icon-btn" onClick={() => navigateComic(1)} aria-label="下一页">
-                  <ChevronRight size={16} />
-                </button>
-                <button
-                  className={comicMode !== "paged" ? "icon-btn active" : "icon-btn"}
-                  onClick={() => setComicMode((value) => (value === "paged" ? "scroll" : value === "scroll" ? "horizontal" : "paged"))}
-                  aria-label="切换漫画阅读布局"
-                >
-                  {comicMode === "horizontal" ? <GalleryHorizontal size={16} /> : comicMode === "scroll" ? <ListFilter size={16} /> : <BookOpen size={16} />}
-                </button>
-                <button className="icon-btn" onClick={() => changeComicZoom(-0.1)} aria-label="缩小">
-                  <ZoomOut size={16} />
-                </button>
-                <button className="icon-btn" onClick={() => changeComicZoom(0.1)} aria-label="放大">
-                  <ZoomIn size={16} />
-                </button>
-              </>
+      <motion.div
+        className={readerClassName}
+        initial={{ scale: 0.98, y: 18 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.98, y: 18 }}
+        onWheel={onHorizontalComicWheel}
+      >
+        {liquid ? (
+          <div className={liquidReaderBarClassName}>
+            <GlassSurface className="reader-back-surface" variant="dock">
+              <button className="icon-btn reader-back-button" onClick={onClose} aria-label="关闭">
+                <ChevronLeft size={18} />
+              </button>
+            </GlassSurface>
+            {!isGallery && (
+              <GlassSurface className="reader-title-surface" variant="dock">
+                <span className="reader-title-pill">{detail.work.title}</span>
+              </GlassSurface>
             )}
-            {isNovel && <b>{showNovelCover ? `封面/${chapters.length || 0}` : chapters.length ? `${chapter + 1}/${chapters.length}` : "0/0"}</b>}
-            {isNovel && chapters.length > 0 && (
-              <>
-                <button className="icon-btn" onClick={() => moveChapter(-1)} aria-label="上一章">
-                  <ChevronLeft size={16} />
-                </button>
-                <button className="icon-btn" onClick={() => moveChapter(1)} aria-label="下一章">
-                  <ChevronRight size={16} />
-                </button>
-                <button className="icon-btn" onClick={() => setNovelTheme((value) => (value === "paper" ? "dark" : "paper"))} aria-label="切换阅读主题">
-                  {novelTheme === "paper" ? <Moon size={16} /> : <Sun size={16} />}
-                </button>
-              </>
-            )}
-            {isNovel && bookAsset && (
-              <a href={assetUrl(bookAsset.id)} target="_blank" rel="noreferrer">
-                EPUB
-              </a>
-            )}
+            <GlassSurface className="reader-actions-surface" variant="dock">
+              <div className="reader-actions">{readerActionsContent}</div>
+            </GlassSurface>
           </div>
-        </div>
+        ) : (
+          <div className="reader-bar">{readerBarContent}</div>
+        )}
         {isComic ? (
           <div
             className="comic-stage"
             data-mode={comicMode}
-            onClick={comicMode === "paged" ? () => navigateComic(1) : undefined}
+            onClick={(event) => {
+              if ((event.target as HTMLElement).closest(".reader-bar, button, a")) return;
+              toggleReaderChrome();
+            }}
             onPointerDown={() => {
               comicUserInteractedRef.current = true;
               needsComicResumeScrollRef.current = false;
@@ -2924,6 +3278,19 @@ function tagLabel(tag: Tag, language: TagLanguage) {
   return language === "translated" ? tag.translated_label ?? tag.label : tag.label;
 }
 
+function groupDetailTags(tags: Tag[], language: TagLanguage) {
+  const groups: Array<{ namespace: string; tags: Tag[] }> = [];
+  const byNamespace = new Map<string, Tag[]>();
+  for (const tag of tags.slice(0, 64)) {
+    const namespace = tagNamespace(tag, language);
+    byNamespace.set(namespace, [...(byNamespace.get(namespace) ?? []), tag]);
+  }
+  for (const [namespace, items] of byNamespace) {
+    groups.push({ namespace, tags: items });
+  }
+  return groups;
+}
+
 function cycleTagFilter(filters: Record<string, TagFilterMode>, key: string) {
   const next = { ...filters };
   if (!next[key]) next[key] = "include";
@@ -2934,6 +3301,7 @@ function cycleTagFilter(filters: Record<string, TagFilterMode>, key: string) {
 function normalizeSettingsDraft(settings: AppSettings): AppSettings {
   return {
     ...settings,
+    appearance: settings.appearance ?? defaultAppearance,
     media_sources: settings.media_sources ?? [],
     qmediasync: settings.qmediasync ?? {
       enabled: false,
@@ -3069,9 +3437,19 @@ function applyNovelTheme(html: string, theme: NovelTheme) {
   if (!html) return html;
   const palette =
     theme === "dark"
-      ? `:root{color-scheme:dark;}body{background:#111214!important;color:#eee7d8!important;}a{color:#e0b66c!important;}`
-      : `:root{color-scheme:light;}body{background:#f7f2e8!important;color:#24211c!important;}a{color:#8f4d34!important;}`;
-  const style = `<style id="reader-theme">${palette}</style>`;
+      ? `:root{color-scheme:dark;--reader-bg:#111214;--reader-text:#eee7d8;--reader-link:#e0b66c;}`
+      : `:root{color-scheme:light;--reader-bg:#f7f2e8;--reader-text:#24211c;--reader-link:#8f4d34;}`;
+  const reset = `
+html,body{margin:0!important;min-height:0!important;height:auto!important;background:var(--reader-bg)!important;color:var(--reader-text)!important;}
+body{overflow:auto!important;}
+body>main{min-height:0!important;height:auto!important;background:var(--reader-bg)!important;}
+main,main *{box-sizing:border-box;}
+main div,main section,main article,main p{max-height:none!important;}
+main [style*="height"],main [style*="min-height"]{height:auto!important;min-height:0!important;}
+img,svg{height:auto!important;max-height:calc(100vh - 96px)!important;}
+*{page-break-before:auto!important;page-break-after:auto!important;break-before:auto!important;break-after:auto!important;}
+a{color:var(--reader-link)!important;}`;
+  const style = `<style id="reader-theme">${palette}${reset}</style>`;
   return html.includes("</head>") ? html.replace("</head>", `${style}</head>`) : `${style}${html}`;
 }
 

@@ -129,6 +129,8 @@ export type AuthSession = {
 };
 
 export type ThemeMode = "light" | "dark";
+export type UiMaterial = "classic" | "liquid";
+export type GlassIntensity = "clear" | "standard" | "readable";
 
 export type AssetRouteInfo = {
   asset_id: number;
@@ -147,6 +149,10 @@ export type AssetRouteInfo = {
 export type AppSettings = {
   theme: ThemeMode;
   detail_mode: "modal" | "docked";
+  appearance: {
+    material: UiMaterial;
+    glass_intensity: GlassIntensity;
+  };
   media_dirs: {
     comics: string[];
     novels: string[];

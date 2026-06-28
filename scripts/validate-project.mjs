@@ -14,7 +14,6 @@ const requiredFiles = [
   "frontend/src/App.tsx",
   "frontend/src/styles.css",
   "frontend/public/assets/ambient-shelf.png",
-  "frontend/public/assets/ambient-shelf-v2.png",
   "docs/reference-research.md",
   "scripts/inspect-media.mjs",
   "Dockerfile",

@@ -92,6 +92,41 @@ pub struct OpenAiSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum UiMaterial {
+    Classic,
+    Liquid,
+}
+
+impl Default for UiMaterial {
+    fn default() -> Self {
+        Self::Liquid
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GlassIntensity {
+    Clear,
+    Standard,
+    Readable,
+}
+
+impl Default for GlassIntensity {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppearanceSettings {
+    #[serde(default)]
+    pub material: UiMaterial,
+    #[serde(default)]
+    pub glass_intensity: GlassIntensity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DetailPaneMode {
     Modal,
     Docked,
@@ -108,6 +143,8 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     #[serde(default)]
     pub detail_mode: DetailPaneMode,
+    #[serde(default)]
+    pub appearance: AppearanceSettings,
     pub media_dirs: MediaDirectorySettings,
     #[serde(default)]
     pub media_sources: Vec<MediaSourceSettings>,
@@ -122,6 +159,7 @@ impl AppSettings {
         Self {
             theme: ThemeMode::Light,
             detail_mode: DetailPaneMode::Modal,
+            appearance: AppearanceSettings::default(),
             media_dirs: MediaDirectorySettings {
                 comics: vec![path_string(&config.comics_dir)],
                 novels: vec![path_string(&config.novels_dir)],
@@ -236,6 +274,8 @@ pub async fn update_settings(
                 "qmediasync_enabled": settings.qmediasync.enabled,
                 "qmediasync_roots": settings.qmediasync.strm_roots.len(),
                 "theme": &settings.theme,
+                "appearance_material": &settings.appearance.material,
+                "glass_intensity": &settings.appearance.glass_intensity,
             }),
         )
         .await?;
