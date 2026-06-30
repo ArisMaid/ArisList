@@ -153,6 +153,9 @@ export type AppSettings = {
     material: UiMaterial;
     glass_intensity: GlassIntensity;
   };
+  reader: {
+    comic_auto_read_interval_ms: number;
+  };
   media_dirs: {
     comics: string[];
     novels: string[];

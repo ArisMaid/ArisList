@@ -126,6 +126,24 @@ pub struct AppearanceSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReaderSettings {
+    #[serde(default = "default_comic_auto_read_interval_ms")]
+    pub comic_auto_read_interval_ms: u64,
+}
+
+impl Default for ReaderSettings {
+    fn default() -> Self {
+        Self {
+            comic_auto_read_interval_ms: default_comic_auto_read_interval_ms(),
+        }
+    }
+}
+
+fn default_comic_auto_read_interval_ms() -> u64 {
+    4000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DetailPaneMode {
     Modal,
@@ -145,6 +163,8 @@ pub struct AppSettings {
     pub detail_mode: DetailPaneMode,
     #[serde(default)]
     pub appearance: AppearanceSettings,
+    #[serde(default)]
+    pub reader: ReaderSettings,
     pub media_dirs: MediaDirectorySettings,
     #[serde(default)]
     pub media_sources: Vec<MediaSourceSettings>,
@@ -160,6 +180,7 @@ impl AppSettings {
             theme: ThemeMode::Light,
             detail_mode: DetailPaneMode::Modal,
             appearance: AppearanceSettings::default(),
+            reader: ReaderSettings::default(),
             media_dirs: MediaDirectorySettings {
                 comics: vec![path_string(&config.comics_dir)],
                 novels: vec![path_string(&config.novels_dir)],
@@ -230,6 +251,8 @@ impl AppSettings {
         self.media_dirs.gallery = normalize_dirs(self.media_dirs.gallery);
         self.media_sources = normalize_sources(self.media_sources);
         self.qmediasync.strm_roots = normalize_dirs(self.qmediasync.strm_roots);
+        self.reader.comic_auto_read_interval_ms =
+            self.reader.comic_auto_read_interval_ms.clamp(500, 120_000);
         if self.qmediasync.base_url.trim().is_empty() {
             self.qmediasync.base_url = config.qmediasync_base_url.clone();
         } else {
@@ -276,6 +299,7 @@ pub async fn update_settings(
                 "theme": &settings.theme,
                 "appearance_material": &settings.appearance.material,
                 "glass_intensity": &settings.appearance.glass_intensity,
+                "comic_auto_read_interval_ms": settings.reader.comic_auto_read_interval_ms,
             }),
         )
         .await?;

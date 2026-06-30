@@ -369,6 +369,17 @@ button {
   box-shadow: 0 10px 26px rgba(0, 0, 0, 0.08);
 }
 
+.app-shell[data-material="liquid"] .work-card[data-view="cover"] {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.app-shell[data-material="liquid"] .work-card[data-view="cover"].selected .cover,
+.app-shell[data-material="liquid"] .work-card[data-view="cover"].selected .work-copy {
+  border-color: color-mix(in srgb, var(--teal) 54%, var(--line));
+}
+
 .app-shell[data-material="liquid"] .searchbar,
 .app-shell[data-material="liquid"] .tag-search,
 .app-shell[data-material="liquid"] .segmented,
@@ -2944,15 +2955,41 @@ button {
 
 .work-card[data-view="cover"] {
   grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+
+.work-card[data-view="cover"] .cover,
+.work-card[data-view="cover"] .work-copy {
+  border: 1px solid var(--line);
+  background: var(--card);
+}
+
+.work-card[data-view="cover"] .cover {
+  height: 100%;
+  aspect-ratio: auto;
+  border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
 }
 
 .work-card[data-view="cover"] .work-copy {
   gap: 4px;
+  min-height: 88px;
+  border-top: 0;
+  border-radius: 0 0 var(--radius) var(--radius);
 }
 
 .work-card[data-view="cover"] .work-copy p,
 .work-card[data-view="cover"] .meter {
   display: none;
+}
+
+.work-card[data-view="cover"] .cover,
+.work-card[data-view="cover"] .work-copy {
+  background: var(--card);
 }
 
 .settings-backdrop {
@@ -3073,6 +3110,34 @@ button {
 .directory-editor > b {
   color: var(--muted);
   font-size: 12px;
+}
+
+.setting-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(96px, 0.35fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.setting-field span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setting-field input {
+  min-width: 0;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--input);
+  color: var(--text);
+  padding: 0 10px;
+  outline: 0;
 }
 
 .directory-add {

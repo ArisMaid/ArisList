@@ -17,7 +17,6 @@ import {
   Gauge,
   GalleryHorizontal,
   GalleryThumbnails,
-  Grid3X3,
   Headphones,
   History as HistoryIcon,
   Image,
@@ -36,6 +35,7 @@ import {
   RefreshCw,
   Repeat,
   Repeat1,
+  Shuffle,
   Search,
   Settings,
   SkipBack,
@@ -51,13 +51,13 @@ import {
 import { api, assetUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type EpubChapter, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
 import { GlassFilterProvider, GlassSurface } from "./components/material";
 
-type KindFilter = "all" | "history" | "comic" | "novel" | "audio" | "gallery";
+type KindFilter = "history" | "comic" | "novel" | "audio" | "gallery";
 type ViewMode = "grid" | "compact" | "list" | "cover";
 type TagFilterMode = "include";
 type TagLanguage = "translated" | "raw";
 type ComicReaderMode = "paged" | "scroll" | "horizontal";
 type NovelTheme = "paper" | "dark";
-type NovelDisplayMode = "collections" | "single";
+type ShelfDisplayMode = "collections" | "single";
 type DetailMode = "modal" | "docked";
 type AppearanceState = {
   material: UiMaterial;
@@ -80,8 +80,8 @@ const COMIC_DEFAULT_ASPECT = 0.72;
 const COMIC_HORIZONTAL_OVERSCAN = 4;
 
 const kindLabels: Record<string, string> = {
-  all: "全部",
   comic: "漫画",
+  "comic-collection": "合集",
   novel: "轻小说",
   "novel-collection": "合集",
   audio: "音声",
@@ -100,6 +100,7 @@ const kindIcon: Record<string, ReactNode> = {
 };
 
 Object.assign(kindIcon, {
+  "comic-collection": <Folders size={16} />,
   "novel-collection": <Folders size={16} />
 });
 
@@ -108,11 +109,21 @@ const defaultAppearance: AppearanceState = {
   glass_intensity: "standard"
 };
 
+const defaultReaderSettings = {
+  comic_auto_read_interval_ms: 4000
+};
+
+function clampComicAutoReadIntervalMs(value: unknown) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return defaultReaderSettings.comic_auto_read_interval_ms;
+  return Math.round(Math.min(Math.max(numeric, 500), 120000));
+}
+
 export function App() {
   const [library, setLibrary] = useState<LibraryResponse>({ works: [], tags: [], jobs: [], history: [] });
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<WorkDetail | null>(null);
-  const [kind, setKind] = useState<KindFilter>("all");
+  const [kind, setKind] = useState<KindFilter>("comic");
   const [query, setQuery] = useState("");
   const [localSearch, setLocalSearch] = useState<LocalSearchState>({ query: "", ids: [], status: "idle" });
   const [tagQuery, setTagQuery] = useState("");
@@ -139,7 +150,8 @@ export function App() {
     if (typeof window === "undefined") return "light";
     return (window.localStorage.getItem("media_shelf_theme") as ThemeMode | null) ?? "light";
   });
-  const [novelDisplayMode, setNovelDisplayMode] = useState<NovelDisplayMode>("collections");
+  const [comicDisplayMode, setComicDisplayMode] = useState<ShelfDisplayMode>("collections");
+  const [novelDisplayMode, setNovelDisplayMode] = useState<ShelfDisplayMode>("collections");
   const [activeAudio, setActiveAudio] = useState<ActiveAudioState | null>(null);
 
   const refresh = async () => {
@@ -158,6 +170,7 @@ export function App() {
   const material = appearance.material ?? "liquid";
   const glassIntensity = appearance.glass_intensity ?? "standard";
   const isLiquid = material === "liquid";
+  const comicAutoReadIntervalMs = clampComicAutoReadIntervalMs(settings?.reader?.comic_auto_read_interval_ms);
 
   useEffect(() => {
     document.documentElement.dataset.material = material;
@@ -247,7 +260,7 @@ export function App() {
   const availableTagKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const work of scopedWorks) {
-      if (kind !== "all" && kind !== "history" && work.kind !== kind) continue;
+      if (kind !== "history" && work.kind !== kind) continue;
       for (const key of (work.tag_keys ?? "").split(",").map((value) => value.trim()).filter(Boolean)) {
         keys.add(key);
       }
@@ -256,7 +269,7 @@ export function App() {
   }, [scopedWorks, kind]);
 
   const visibleTags = useMemo(() => {
-    if (kind !== "all" && availableTagKeys.size === 0) return [];
+    if (availableTagKeys.size === 0) return [];
     const needle = tagQuery.trim().toLowerCase();
     return library.tags
       .filter((tag) => {
@@ -276,7 +289,7 @@ export function App() {
     const searchReady = needle.length >= 2 && localSearch.status === "ready" && localSearch.query.toLowerCase() === needle;
     const searchRank = searchReady ? new Map(localSearch.ids.map((id, index) => [id, index])) : null;
     return scopedWorks.filter((work) => {
-      if (kind !== "all" && kind !== "history" && work.kind !== kind) return false;
+      if (kind !== "history" && work.kind !== kind) return false;
       if (needle && searchRank && !searchRank.has(work.id)) return false;
       if (needle && !searchRank && !`${work.title} ${work.category ?? ""} ${work.source_path ?? ""}`.toLowerCase().includes(needle)) return false;
       if (includeTags.length === 0) return true;
@@ -288,11 +301,10 @@ export function App() {
   const counts = useMemo(() => {
     return baseWorks.reduce<Record<string, number>>(
       (acc, work) => {
-        acc.all += 1;
         acc[work.kind] = (acc[work.kind] ?? 0) + 1;
         return acc;
       },
-      { all: 0, history: library.history.length, comic: 0, novel: 0, audio: 0, gallery: 0 }
+      { history: library.history.length, comic: 0, novel: 0, audio: 0, gallery: 0 }
     );
   }, [baseWorks, library.history.length]);
 
@@ -437,7 +449,7 @@ export function App() {
 
   useEffect(() => {
     setCollectionStack(null);
-  }, [kind, novelDisplayMode, query, tagFilters]);
+  }, [comicDisplayMode, kind, novelDisplayMode, query, tagFilters]);
 
   const syncProgress = (id: number, progress: number, position?: string | null) => {
     setLibrary((prev) => ({
@@ -454,9 +466,10 @@ export function App() {
 
   const displayedWorks = useMemo(() => {
     if (collectionStack) return collectionStack;
-    if (kind !== "novel" || novelDisplayMode === "single") return filteredWorks;
-    return buildNovelCollections(filteredWorks);
-  }, [collectionStack, filteredWorks, kind, novelDisplayMode]);
+    if (kind === "comic" && comicDisplayMode === "collections") return buildComicCollections(filteredWorks);
+    if (kind === "novel" && novelDisplayMode === "collections") return buildNovelCollections(filteredWorks);
+    return filteredWorks;
+  }, [collectionStack, comicDisplayMode, filteredWorks, kind, novelDisplayMode]);
 
   const openWorkPreview = (work: WorkSummary) => {
     setSelectedId(work.id);
@@ -489,6 +502,24 @@ export function App() {
     }
   };
 
+  const openComicReader = async (work: WorkSummary, resume = true, position?: string | null) => {
+    setSelectedId(work.id);
+    setDetailModalOpen(false);
+    setReaderResume(resume);
+    setReaderPositionOverride(position);
+    if (detail?.work.id === work.id) {
+      setReaderOpen(true);
+      return;
+    }
+    try {
+      const next = await api.work(work.id);
+      setDetail(next);
+      setReaderOpen(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const openCollection = (work: WorkSummary) => {
     const meta = parseMeta<{ first_work_id?: number; volume_ids?: number[] }>(work.meta_json);
     const volumes = (meta.volume_ids ?? [])
@@ -501,6 +532,13 @@ export function App() {
     setCollectionStack(volumes);
     setSelectedId(volumes[0].id);
     setDetailModalOpen(false);
+  };
+
+  const openRandomComic = () => {
+    const candidates = (collectionStack ?? filteredWorks).filter((work) => work.kind === "comic");
+    if (candidates.length === 0) return;
+    const work = candidates[Math.floor(Math.random() * candidates.length)];
+    void openComicReader(work, false, "start");
   };
 
   return (
@@ -553,12 +591,16 @@ export function App() {
         <GlassSurface as="header" className="toolbar" variant="panel">
           <ToolbarContent
             collectionStack={collectionStack}
+            comicDisplayMode={comicDisplayMode}
+            comicCount={(collectionStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
             kind={kind}
             localSearch={localSearch}
             novelDisplayMode={novelDisplayMode}
             query={query}
             viewMode={viewMode}
             onCollectionBack={() => setCollectionStack(null)}
+            onComicDisplayModeChange={setComicDisplayMode}
+            onOpenRandomComic={openRandomComic}
             onNovelDisplayModeChange={setNovelDisplayMode}
             onQueryChange={setQuery}
             onSettingsOpen={() => setSettingsOpen(true)}
@@ -569,12 +611,16 @@ export function App() {
         <header className="toolbar">
           <ToolbarContent
             collectionStack={collectionStack}
+            comicDisplayMode={comicDisplayMode}
+            comicCount={(collectionStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
             kind={kind}
             localSearch={localSearch}
             novelDisplayMode={novelDisplayMode}
             query={query}
             viewMode={viewMode}
             onCollectionBack={() => setCollectionStack(null)}
+            onComicDisplayModeChange={setComicDisplayMode}
+            onOpenRandomComic={openRandomComic}
             onNovelDisplayModeChange={setNovelDisplayMode}
             onQueryChange={setQuery}
             onSettingsOpen={() => setSettingsOpen(true)}
@@ -601,7 +647,7 @@ export function App() {
               viewMode={viewMode}
               work={work}
               onClick={() => {
-                if (work.kind === "novel-collection") {
+                if (work.kind === "novel-collection" || work.kind === "comic-collection") {
                   openCollection(work);
                 } else if (work.kind === "gallery") {
                   void openGalleryReader(work);
@@ -685,6 +731,7 @@ export function App() {
             onProgressSaved={syncProgress}
             resumePosition={readerResume ? readerPositionOverride ?? historyByWorkId.get(detail.work.id)?.position ?? null : "start"}
             liquid={isLiquid}
+            comicAutoReadIntervalMs={comicAutoReadIntervalMs}
           />
         )}
       </AnimatePresence>
@@ -729,9 +776,9 @@ function RailContent({
         <span>Aris的仓库</span>
       </div>
       <nav className="kind-nav">
-        {(["all", "gallery", "comic", "novel", "audio", "history"] as KindFilter[]).map((item) => (
+        {(["gallery", "comic", "novel", "audio", "history"] as KindFilter[]).map((item) => (
           <button className={kind === item ? "active" : ""} key={item} onClick={() => onKindChange(item)}>
-            {item === "all" ? <Grid3X3 size={16} /> : kindIcon[item]}
+            {kindIcon[item]}
             <span>{kindLabels[item]}</span>
             <strong>{counts[item] ?? 0}</strong>
           </button>
@@ -788,25 +835,33 @@ function RailContent({
 
 function ToolbarContent({
   collectionStack,
+  comicDisplayMode,
+  comicCount,
   kind,
   localSearch,
   novelDisplayMode,
   query,
   viewMode,
   onCollectionBack,
+  onComicDisplayModeChange,
+  onOpenRandomComic,
   onNovelDisplayModeChange,
   onQueryChange,
   onSettingsOpen,
   onViewModeChange
 }: {
   collectionStack: WorkSummary[] | null;
+  comicDisplayMode: ShelfDisplayMode;
+  comicCount: number;
   kind: KindFilter;
   localSearch: LocalSearchState;
-  novelDisplayMode: NovelDisplayMode;
+  novelDisplayMode: ShelfDisplayMode;
   query: string;
   viewMode: ViewMode;
   onCollectionBack: () => void;
-  onNovelDisplayModeChange: (mode: NovelDisplayMode) => void;
+  onComicDisplayModeChange: (mode: ShelfDisplayMode) => void;
+  onOpenRandomComic: () => void;
+  onNovelDisplayModeChange: (mode: ShelfDisplayMode) => void;
   onQueryChange: (value: string) => void;
   onSettingsOpen: () => void;
   onViewModeChange: (value: ViewMode) => void;
@@ -830,6 +885,24 @@ function ToolbarContent({
         </div>
       </div>
       <div className="toolbar-actions">
+        {kind === "comic" && (
+          <>
+            <div className="segmented compact-segmented" aria-label="漫画显示方式">
+              <button className={comicDisplayMode === "collections" ? "active" : ""} onClick={() => onComicDisplayModeChange("collections")}>
+                <Folders size={16} />
+                <span>合集</span>
+              </button>
+              <button className={comicDisplayMode === "single" ? "active" : ""} onClick={() => onComicDisplayModeChange("single")}>
+                <BookCopy size={16} />
+                <span>单本</span>
+              </button>
+            </div>
+            <button className="primary-action subtle-action random-action" onClick={onOpenRandomComic} disabled={comicCount <= 0}>
+              <Shuffle size={16} />
+              <span>随机阅读</span>
+            </button>
+          </>
+        )}
         {kind === "novel" && (
           <div className="segmented compact-segmented" aria-label="小说显示方式">
             <button className={novelDisplayMode === "collections" ? "active" : ""} onClick={() => onNovelDisplayModeChange("collections")}>
@@ -1238,6 +1311,34 @@ function SettingsOverlay({
 
               {draft && (
                 <section className="settings-section">
+                  <h3>阅读</h3>
+                  <label className="setting-field">
+                    <span>漫画自动阅读间隔（秒）</span>
+                    <input
+                      min={0.5}
+                      max={120}
+                      step={0.5}
+                      type="number"
+                      value={Number(((draft.reader?.comic_auto_read_interval_ms ?? defaultReaderSettings.comic_auto_read_interval_ms) / 1000).toFixed(1))}
+                      onChange={(event) => {
+                        const seconds = Number(event.currentTarget.value);
+                        const milliseconds = clampComicAutoReadIntervalMs(Number.isFinite(seconds) ? seconds * 1000 : defaultReaderSettings.comic_auto_read_interval_ms);
+                        updateDraft((prev) => ({
+                          ...prev,
+                          reader: {
+                            ...(prev.reader ?? defaultReaderSettings),
+                            comic_auto_read_interval_ms: milliseconds
+                          }
+                        }));
+                      }}
+                    />
+                  </label>
+                  <p className="settings-hint">用于漫画阅读器的自动翻页按钮，支持 0.5 到 120 秒。</p>
+                </section>
+              )}
+
+              {draft && (
+                <section className="settings-section">
                   <h3>媒体目录</h3>
                   {(["comics", "novels", "audio", "gallery"] as Array<keyof AppSettings["media_dirs"]>).map((dirKind) => (
                     <div className="directory-editor" key={dirKind}>
@@ -1437,7 +1538,7 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
   const targetWidth = viewMode === "compact" ? 138 : viewMode === "cover" ? 240 : 182;
   const columns = viewMode === "list" ? 1 : Math.max(1, Math.floor((viewport.width + gap) / (targetWidth + gap)));
   const columnWidth = columns > 0 ? Math.max(viewMode === "compact" ? 120 : 160, (viewport.width - gap * (columns - 1)) / columns) : targetWidth;
-  const copyReserve = viewMode === "cover" ? 78 : Math.max(104, Math.min(168, columnWidth * 0.42 + 20));
+  const copyReserve = viewMode === "cover" ? 88 : Math.max(104, Math.min(168, columnWidth * 0.42 + 20));
   const rowHeight = viewMode === "list" ? 128 + gap : Math.ceil(columnWidth * (4 / 3) + copyReserve + gap);
   const rowCount = Math.ceil(items.length / columns);
   const overscanRows = 4;
@@ -1514,7 +1615,13 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
 
 function WorkCard({ work, index, selected, viewMode, onClick }: { work: WorkSummary; index: number; selected: boolean; viewMode: ViewMode; onClick: () => void }) {
   const meta = parseMeta<{ series?: string; page_count?: number; volume_count?: number; first_work_id?: number; image_count?: number }>(work.meta_json);
-  const badge = work.kind === "comic" && meta.page_count ? `${meta.page_count}p` : work.kind === "novel-collection" ? `${meta.volume_count ?? work.asset_count}卷` : work.kind === "gallery" && meta.image_count ? `${meta.image_count}图` : null;
+  const badge = work.kind === "comic" && meta.page_count
+    ? `${meta.page_count}p`
+    : work.kind === "comic-collection"
+      ? `${meta.volume_count ?? work.asset_count}本`
+      : work.kind === "novel-collection"
+        ? `${meta.volume_count ?? work.asset_count}卷`
+        : work.kind === "gallery" && meta.image_count ? `${meta.image_count}图` : null;
   return (
     <motion.button
       layout
@@ -1978,6 +2085,7 @@ function AudioDock({
 
 function ReaderOverlay({
   canPersistProgress,
+  comicAutoReadIntervalMs = defaultReaderSettings.comic_auto_read_interval_ms,
   detail,
   onClose,
   onProgressSaved,
@@ -1985,6 +2093,7 @@ function ReaderOverlay({
   liquid = false
 }: {
   canPersistProgress: boolean;
+  comicAutoReadIntervalMs?: number;
   detail: WorkDetail;
   onClose: () => void;
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
@@ -2001,6 +2110,7 @@ function ReaderOverlay({
   const [comicZoom, setComicZoom] = useState(1);
   const [comicViewport, setComicViewport] = useState({ width: 0, height: 0 });
   const [comicScrollLeft, setComicScrollLeft] = useState(0);
+  const [comicAutoRead, setComicAutoRead] = useState(false);
   const [novelTheme, setNovelTheme] = useState<NovelTheme>("paper");
   const [readerError, setReaderError] = useState<string | null>(null);
   const [readerChromeVisible, setReaderChromeVisible] = useState(false);
@@ -2017,6 +2127,7 @@ function ReaderOverlay({
   const bookAsset = detail.assets.find((asset) => asset.role === "book");
   const mediaImages = detail.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/"));
   const resumeTarget = useMemo(() => parseReadingPosition(resumePosition), [resumePosition]);
+  const safeComicAutoReadIntervalMs = clampComicAutoReadIntervalMs(comicAutoReadIntervalMs);
 
   useEffect(() => {
     setPage(0);
@@ -2029,6 +2140,7 @@ function ReaderOverlay({
     setComicZoom(1);
     setComicViewport({ width: 0, height: 0 });
     setComicScrollLeft(0);
+    setComicAutoRead(false);
     setReaderChromeVisible(false);
     setReaderError(null);
     if (readerChromeTimerRef.current !== null) {
@@ -2221,9 +2333,11 @@ function ReaderOverlay({
     setPage((value) => Math.min(Math.max(value + offset, 0), Math.max(0, pages.length - 1)));
   };
 
-  const navigateComic = (offset: number) => {
-    comicUserInteractedRef.current = true;
-    needsComicResumeScrollRef.current = false;
+  const navigateComic = (offset: number, source: "manual" | "auto" = "manual") => {
+    if (source === "manual") {
+      comicUserInteractedRef.current = true;
+      needsComicResumeScrollRef.current = false;
+    }
     if (comicMode === "scroll") {
       comicStageRef.current?.scrollBy({
         top: offset * (comicStageRef.current.clientHeight * 0.82),
@@ -2244,6 +2358,18 @@ function ReaderOverlay({
     }
     moveComic(offset);
   };
+
+  useEffect(() => {
+    if (!isComic || !comicAutoRead || pages.length === 0) return;
+    if (page >= pages.length - 1) {
+      setComicAutoRead(false);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      navigateComic(1, "auto");
+    }, safeComicAutoReadIntervalMs);
+    return () => window.clearTimeout(timer);
+  }, [comicAspect, comicAutoRead, comicMode, comicZoom, isComic, page, pages.length, safeComicAutoReadIntervalMs]);
 
   const moveChapter = (offset: number) => {
     if (showNovelCover && offset > 0) {
@@ -2360,6 +2486,14 @@ function ReaderOverlay({
               aria-label="切换漫画阅读布局"
             >
               {comicMode === "horizontal" ? <GalleryHorizontal size={16} /> : comicMode === "scroll" ? <ListFilter size={16} /> : <BookOpen size={16} />}
+            </button>
+            <button
+              className={comicAutoRead ? "icon-btn active" : "icon-btn"}
+              onClick={() => setComicAutoRead((value) => !value)}
+              aria-label={comicAutoRead ? "暂停自动阅读" : "自动阅读"}
+              title={comicAutoRead ? "暂停自动阅读" : "自动阅读"}
+            >
+              {comicAutoRead ? <Pause size={16} /> : <Play size={16} />}
             </button>
             <button className="icon-btn" onClick={() => changeComicZoom(-0.1)} aria-label="缩小">
               <ZoomOut size={16} />
@@ -3063,30 +3197,116 @@ function FallbackCover({ kind }: { kind: string }) {
   );
 }
 
-function buildNovelCollections(works: WorkSummary[]) {
-  const groups = new Map<string, WorkSummary[]>();
+type ShelfCollectionGroup = {
+  items: WorkSummary[];
+  title?: string;
+};
+
+function buildComicCollections(works: WorkSummary[]) {
+  const groups = new Map<string, ShelfCollectionGroup>();
   for (const work of works) {
-    if (work.kind !== "novel") {
-      groups.set(`work:${work.id}`, [work]);
+    if (work.kind !== "comic") {
+      groups.set(`work:${work.id}`, { items: [work] });
       continue;
     }
+    const artist = comicCollectionArtist(work);
+    if (!artist) {
+      groups.set(`work:${work.id}`, { items: [work] });
+      continue;
+    }
+    const key = `artist:${artist.toLocaleLowerCase()}`;
+    const group = groups.get(key) ?? { items: [], title: artist };
+    group.items.push(work);
+    groups.set(key, group);
+  }
+
+  let syntheticId = -10000;
+  return [...groups.values()].flatMap((group) => {
+    const items = group.items;
+    if (items.length <= 1) return items;
+    const sorted = [...items].sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
+    const first = sorted[0];
+    const latest = sorted.reduce((acc, item) => (new Date(item.updated_at).getTime() > new Date(acc.updated_at).getTime() ? item : acc), first);
+    const pageCount = sorted.reduce((sum, item) => sum + (parseMeta<{ page_count?: number }>(item.meta_json).page_count ?? 0), 0);
+    const collectionTitle = group.title || "未知作者";
+    return [{
+      ...first,
+      id: syntheticId--,
+      kind: "comic-collection",
+      title: collectionTitle,
+      subtitle: `${sorted.length}本`,
+      category: "Comic Artist Collection",
+      progress: sorted.reduce((sum, item) => sum + item.progress, 0) / sorted.length,
+      asset_count: sorted.length,
+      tag_count: new Set(sorted.flatMap((item) => (item.tag_keys ?? "").split(",").filter(Boolean))).size,
+      tag_keys: [...new Set(sorted.flatMap((item) => (item.tag_keys ?? "").split(",").filter(Boolean)))].join(","),
+      updated_at: latest.updated_at,
+      meta_json: JSON.stringify({
+        artist: collectionTitle,
+        first_work_id: first.id,
+        page_count: pageCount,
+        volume_ids: sorted.map((item) => item.id),
+        volume_count: sorted.length,
+        series: collectionTitle
+      })
+    } satisfies WorkSummary];
+  });
+}
+
+function buildNovelCollections(works: WorkSummary[]) {
+  const groups = new Map<string, ShelfCollectionGroup>();
+  const novels: WorkSummary[] = [];
+  for (const work of works) {
+    if (work.kind !== "novel") {
+      groups.set(`work:${work.id}`, { items: [work] });
+      continue;
+    }
+    novels.push(work);
+  }
+
+  const folderGroups = new Map<string, ShelfCollectionGroup>();
+  for (const work of novels) {
+    const folder = novelParentFolder(work.source_path);
+    if (!folder) continue;
+    const key = `folder:${normalizeNovelFolder(folder.path)}`;
+    const group = folderGroups.get(key) ?? { items: [], title: folder.name };
+    group.items.push(work);
+    folderGroups.set(key, group);
+  }
+
+  const groupedByFolder = new Set<number>();
+  for (const [key, group] of folderGroups) {
+    if (group.items.length <= 1) continue;
+    groups.set(key, group);
+    for (const item of group.items) {
+      groupedByFolder.add(item.id);
+    }
+  }
+
+  for (const work of novels) {
+    if (groupedByFolder.has(work.id)) continue;
     const meta = parseMeta<{ series?: string; creator?: string }>(work.meta_json);
-    const key = normalizeNovelSeries(meta.series || stripNovelVolume(work.title));
-    groups.set(key, [...(groups.get(key) ?? []), work]);
+    const title = meta.series || stripNovelVolume(work.title);
+    const key = `series:${normalizeNovelSeries(title)}`;
+    const group = groups.get(key) ?? { items: [], title };
+    group.items.push(work);
+    groups.set(key, group);
   }
 
   let syntheticId = -1;
-  return [...groups.values()].flatMap((items) => {
+  return [...groups.values()].flatMap((group) => {
+    const items = group.items;
     if (items.length <= 1) return items;
     const sorted = [...items].sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
     const first = sorted[0];
     const latest = sorted.reduce((acc, item) => (new Date(item.updated_at).getTime() > new Date(acc.updated_at).getTime() ? item : acc), first);
     const meta = parseMeta<Record<string, unknown>>(first.meta_json);
+    const collectionTitle = group.title || String(meta.series || stripNovelVolume(first.title));
     return [{
       ...first,
       id: syntheticId--,
       kind: "novel-collection",
-      title: String(meta.series || stripNovelVolume(first.title)),
+      title: collectionTitle,
       subtitle: `${sorted.length}卷`,
       category: "Light Novel Collection",
       progress: sorted.reduce((sum, item) => sum + item.progress, 0) / sorted.length,
@@ -3099,7 +3319,7 @@ function buildNovelCollections(works: WorkSummary[]) {
         first_work_id: first.id,
         volume_ids: sorted.map((item) => item.id),
         volume_count: sorted.length,
-        series: meta.series || stripNovelVolume(first.title)
+        series: collectionTitle
       })
     } satisfies WorkSummary];
   });
@@ -3242,6 +3462,33 @@ function normalizeNovelSeries(value: string) {
   return stripNovelVolume(value).toLocaleLowerCase();
 }
 
+function comicCollectionArtist(work: WorkSummary) {
+  const meta = parseMeta<{ artist?: string; penciller?: string; creator?: string; writer?: string }>(work.meta_json);
+  const fromMeta = meta.artist || meta.penciller || meta.creator;
+  if (fromMeta && fromMeta.trim()) return fromMeta.trim();
+  const artistTag = (work.tag_keys ?? "")
+    .split(",")
+    .map((key) => key.trim())
+    .find((key) => key.startsWith("artist:"));
+  if (artistTag) return shortTag(artistTag);
+  return null;
+}
+
+function novelParentFolder(path?: string | null) {
+  if (!path) return null;
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  const index = normalized.lastIndexOf("/");
+  if (index <= 0) return null;
+  const parent = normalized.slice(0, index);
+  const name = parent.split("/").filter(Boolean).pop();
+  if (!name) return null;
+  return { path: parent, name };
+}
+
+function normalizeNovelFolder(value: string) {
+  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+}
+
 function jobLabel(value: string) {
   const labels: Record<string, string> = {
     "scan-library": "扫描媒体库",
@@ -3302,6 +3549,11 @@ function normalizeSettingsDraft(settings: AppSettings): AppSettings {
   return {
     ...settings,
     appearance: settings.appearance ?? defaultAppearance,
+    reader: {
+      ...defaultReaderSettings,
+      ...(settings.reader ?? {}),
+      comic_auto_read_interval_ms: clampComicAutoReadIntervalMs(settings.reader?.comic_auto_read_interval_ms)
+    },
     media_sources: settings.media_sources ?? [],
     qmediasync: settings.qmediasync ?? {
       enabled: false,
