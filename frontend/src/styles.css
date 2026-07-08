@@ -657,6 +657,13 @@ button {
   text-align: left;
 }
 
+.kind-nav button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .kind-nav button:hover,
 .kind-nav button.active {
   background: #24252b;
@@ -1452,6 +1459,13 @@ button {
   background:
     linear-gradient(135deg, rgba(83, 199, 185, 0.16), transparent),
     linear-gradient(315deg, rgba(198, 95, 80, 0.18), transparent),
+    var(--cover-bg);
+}
+
+.fallback-cover[data-kind="coser-picture"] {
+  background:
+    linear-gradient(135deg, rgba(83, 199, 185, 0.2), transparent),
+    linear-gradient(315deg, rgba(217, 180, 95, 0.16), transparent),
     var(--cover-bg);
 }
 

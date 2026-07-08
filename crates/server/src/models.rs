@@ -10,6 +10,7 @@ pub enum WorkKind {
     Audio,
     Generated,
     Gallery,
+    CoserPicture,
 }
 
 impl WorkKind {
@@ -20,6 +21,7 @@ impl WorkKind {
             WorkKind::Audio => "audio",
             WorkKind::Generated => "generated",
             WorkKind::Gallery => "gallery",
+            WorkKind::CoserPicture => "coser-picture",
         }
     }
 }
@@ -150,5 +152,6 @@ pub struct ScanResponse {
     pub novels: usize,
     pub audio: usize,
     pub gallery: usize,
+    pub coser_picture: usize,
     pub jobs_created: usize,
 }

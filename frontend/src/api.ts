@@ -1,6 +1,6 @@
 export type WorkSummary = {
   id: number;
-  kind: "comic" | "novel" | "audio" | "gallery" | string;
+  kind: "comic" | "novel" | "audio" | "gallery" | "coser-picture" | string;
   title: string;
   subtitle?: string | null;
   category?: string | null;
@@ -161,6 +161,14 @@ export type AppSettings = {
     novels: string[];
     audio: string[];
     gallery: string[];
+    coser_picture: string[];
+  };
+  cover_cache_dirs: {
+    comic: string;
+    novel: string;
+    audio: string;
+    gallery: string;
+    coser_picture: string;
   };
   media_sources: Array<{
     kind: "comic" | "novel" | "audio" | "gallery";
@@ -282,7 +290,7 @@ export const api = {
   galleryPage: (id: number, cursor = 0, limit = 120) =>
     request<GalleryPageResponse>(`/api/works/${id}/gallery?cursor=${cursor}&limit=${limit}`),
   assetRoute: (id: number) => request<AssetRouteInfo>(`/api/assets/${id}/route`),
-  scan: (enqueue_enrichment = false) => request<{ comics: number; novels: number; audio: number; gallery: number; jobs_created: number }>("/api/scan", {
+  scan: (enqueue_enrichment = false) => request<{ comics: number; novels: number; audio: number; gallery: number; coser_picture: number; jobs_created: number }>("/api/scan", {
     method: "POST",
     body: JSON.stringify({ enqueue_enrichment })
   }),
@@ -307,6 +315,10 @@ export function assetUrl(id?: number | null) {
 
 export function thumbUrl(id?: number | null, size = 360) {
   return id ? `/api/assets/${id}/thumb?size=${size}` : "";
+}
+
+export function coverUrl(id?: number | null, size = 480) {
+  return id ? `/api/works/${id}/cover?size=${size}` : "";
 }
 
 export function parseMeta<T extends Record<string, unknown>>(value?: string | null): T {

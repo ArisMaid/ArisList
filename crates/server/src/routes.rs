@@ -44,6 +44,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/cloud/status", get(cloud_status))
         .route("/cloud/qmediasync/test-strm-root", post(test_qms_strm_root))
         .route("/works/{id}", get(work_detail))
+        .route("/works/{id}/cover", get(assets::work_cover))
         .route("/works/{id}/gallery", get(gallery_assets))
         .route("/works/{id}/progress", patch(update_progress))
         .route("/works/{id}/pages", get(assets::comic_pages))
@@ -84,6 +85,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "novels": dir_state(&state.config.novels_dir),
             "audio": dir_state(&state.config.audio_dir),
             "gallery": dir_state(&state.config.gallery_dir),
+            "coser_picture": dir_state(&state.config.coser_picture_dir),
             "generated": dir_state(&state.config.generated_dir),
         },
         "features": {

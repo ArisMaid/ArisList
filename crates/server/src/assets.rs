@@ -14,6 +14,7 @@ use image::codecs::jpeg::JpegEncoder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
@@ -95,6 +96,42 @@ pub struct ThumbQuery {
     pub size: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CoverQuery {
+    pub size: Option<u32>,
+}
+
+pub async fn work_cover(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+    Query(query): Query<CoverQuery>,
+) -> Result<Response> {
+    let detail = state.db.work_detail(work_id).await?;
+    let size = query.size.unwrap_or(480).clamp(96, 960);
+    let settings = crate::settings::load_settings(&state.config).await?;
+    let cache_dir = settings.cover_cache_dirs.for_work_kind(&detail.work.kind);
+    tokio::fs::create_dir_all(&cache_dir).await?;
+
+    if let Some(asset_id) = detail.work.cover_asset_id {
+        let asset = state.db.asset(asset_id).await?;
+        if asset.mime.starts_with("image/") {
+            return cached_image_cover(state, detail.work.id, asset, cache_dir, size).await;
+        }
+    }
+
+    if matches!(detail.work.kind.as_str(), "comic" | "coser-picture") {
+        let archive = detail
+            .assets
+            .iter()
+            .find(|asset| asset.role == "archive")
+            .cloned()
+            .ok_or_else(|| AppError::NotFound("archive cover source not found".to_string()))?;
+        return cached_archive_cover(state, detail.work.id, archive, cache_dir, size).await;
+    }
+
+    Err(AppError::NotFound("cover source not found".to_string()))
+}
+
 pub async fn thumb_asset(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -171,6 +208,118 @@ pub async fn thumb_asset(
     }
 }
 
+async fn cached_image_cover(
+    state: Arc<AppState>,
+    work_id: i64,
+    asset: crate::models::Asset,
+    cache_dir: PathBuf,
+    size: u32,
+) -> Result<Response> {
+    let (cache_path, source_path) = if vfs::is_qms_strm_uri(&asset.path) {
+        (
+            cache_dir.join(format!(
+                "work-{work_id}-asset-{}-{size}-{}.jpg",
+                asset.id,
+                vfs::cloud_cache_key(&asset)
+            )),
+            None,
+        )
+    } else {
+        let source_path = vfs::local_asset_path(&state, &asset.path).await?;
+        let source_meta = tokio::fs::metadata(&source_path).await?;
+        let modified = source_meta
+            .modified()
+            .ok()
+            .and_then(system_time_key)
+            .unwrap_or(0);
+        (
+            cache_dir.join(format!(
+                "work-{work_id}-asset-{}-{size}-{}-{modified}.jpg",
+                asset.id,
+                source_meta.len()
+            )),
+            Some(source_path),
+        )
+    };
+
+    if tokio::fs::try_exists(&cache_path).await? {
+        return stream_thumb_cache(cache_path).await;
+    }
+    let _permit = THUMBNAIL_WORKERS
+        .acquire()
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    let generated = if let Some(source_path) = source_path.clone() {
+        tokio::task::spawn_blocking({
+            let cache_path = cache_path.clone();
+            move || generate_thumbnail(&source_path, &cache_path, size)
+        })
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?
+    } else {
+        vfs::generate_qms_thumbnail(&state, &asset, &cache_path, size)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    };
+
+    match generated {
+        Ok(()) => stream_thumb_cache(cache_path).await,
+        Err(err) => Err(AppError::Other(format!(
+            "cover thumbnail generation failed: {err}"
+        ))),
+    }
+}
+
+async fn cached_archive_cover(
+    state: Arc<AppState>,
+    work_id: i64,
+    archive: crate::models::Asset,
+    cache_dir: PathBuf,
+    size: u32,
+) -> Result<Response> {
+    let path = vfs::asset_local_processing_path(&state, &archive).await?;
+    let metadata = tokio::fs::metadata(&path).await?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(system_time_key)
+        .unwrap_or(0);
+    let cached = cached_cbz_pages(&state, &path).await?;
+    let page_name = cached
+        .pages
+        .first()
+        .ok_or_else(|| AppError::NotFound("archive cover page not found".to_string()))?
+        .name
+        .clone();
+    let cache_path = cache_dir.join(format!(
+        "work-{work_id}-archive-{}-{size}-{}-{modified}-{}.jpg",
+        archive.id,
+        metadata.len(),
+        short_hash(&page_name)
+    ));
+    if tokio::fs::try_exists(&cache_path).await? {
+        return stream_thumb_cache(cache_path).await;
+    }
+
+    let _permit = THUMBNAIL_WORKERS
+        .acquire()
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    let archive_cache = cached.archive.clone();
+    let stream_name = page_name.clone();
+    let out = cache_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let bytes =
+            cbz_named_page_bytes(&archive_cache, &stream_name).map_err(|e| e.to_string())?;
+        generate_thumbnail_from_bytes(&bytes, &out, size)
+    })
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))?
+    .map_err(AppError::Other)?;
+    stream_thumb_cache(cache_path).await
+}
+
 fn system_time_key(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
@@ -193,6 +342,25 @@ fn generate_thumbnail(
     let mut writer = BufWriter::new(file);
     let mut encoder = JpegEncoder::new_with_quality(&mut writer, 84);
     encoder.encode_image(&thumb).map_err(|e| e.to_string())
+}
+
+fn generate_thumbnail_from_bytes(
+    bytes: &[u8],
+    cache_path: &FsPath,
+    size: u32,
+) -> std::result::Result<(), String> {
+    let image = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let thumb = image.thumbnail(size, size).to_rgb8();
+    let file = File::create(cache_path).map_err(|e| e.to_string())?;
+    let mut writer = BufWriter::new(file);
+    let mut encoder = JpegEncoder::new_with_quality(&mut writer, 84);
+    encoder.encode_image(&thumb).map_err(|e| e.to_string())
+}
+
+fn short_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
 async fn stream_thumb_cache(path: PathBuf) -> Result<Response> {
@@ -284,7 +452,7 @@ async fn maybe_update_comic_page_count(
     detail: &WorkDetail,
     page_count: usize,
 ) -> Result<()> {
-    if detail.work.kind != "comic" || page_count == 0 {
+    if !matches!(detail.work.kind.as_str(), "comic" | "coser-picture") || page_count == 0 {
         return Ok(());
     }
     let mut meta = serde_json::from_str::<serde_json::Value>(&detail.work.meta_json)
@@ -1128,4 +1296,153 @@ pub async fn generate_asset_job(
         )
         .await?;
     Ok(Json(json!({ "job_id": id, "status": "queued" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    use crate::config::Config;
+    use crate::db::Db;
+
+    const PNG_1X1: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 10, 73, 68, 65, 84, 120, 156, 99, 0, 1, 0, 0, 5, 0, 1,
+        13, 10, 45, 180, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    #[tokio::test]
+    async fn work_cover_caches_coser_archive_cover_in_kind_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let generated_dir = temp.path().join("generated");
+        let cover_cache_dir = temp.path().join("cover-cache");
+        let coser_cover_cache_dir = cover_cache_dir.join("coser-picture");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&generated_dir).unwrap();
+
+        let archive_path = temp.path().join("COS图").join("CoserA").join("set.zip");
+        std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        write_test_zip(&archive_path);
+
+        let database_url = format!(
+            "sqlite://{}",
+            test_path_string(&data_dir.join("library.sqlite"))
+        );
+        let db = Db::connect(&database_url).await.unwrap();
+        db.migrate().await.unwrap();
+        let work_id = db
+            .upsert_work(
+                "coser-picture",
+                "set",
+                Some(&test_path_string(&archive_path)),
+                Some("CoserPicture"),
+                None,
+                None,
+                json!({ "page_count": 1 }),
+            )
+            .await
+            .unwrap();
+        db.upsert_asset(
+            work_id,
+            &test_path_string(&archive_path),
+            "application/zip",
+            "archive",
+            Some("zip"),
+            None,
+            std::fs::metadata(&archive_path)
+                .ok()
+                .map(|m| m.len() as i64),
+            json!({ "page_count": 1 }),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(AppState {
+            config: Config {
+                bind: "127.0.0.1:0".to_string(),
+                database_url,
+                data_dir,
+                cover_cache_dir: cover_cache_dir.clone(),
+                comic_cover_cache_dir: cover_cache_dir.join("comic"),
+                novel_cover_cache_dir: cover_cache_dir.join("novel"),
+                audio_cover_cache_dir: cover_cache_dir.join("audio"),
+                gallery_cover_cache_dir: cover_cache_dir.join("gallery"),
+                coser_picture_cover_cache_dir: coser_cover_cache_dir.clone(),
+                comics_dir: temp.path().join("漫画"),
+                novels_dir: temp.path().join("轻小说"),
+                audio_dir: temp.path().join("音声"),
+                gallery_dir: temp.path().join("图库"),
+                coser_picture_dir: temp.path().join("COS图"),
+                generated_dir,
+                app_admin_password: "admin".to_string(),
+                lightnovel_api_bases: Vec::new(),
+                lightnovel_access_token: None,
+                enrichment_concurrency: 1,
+                ehtt_url: String::new(),
+                openai_api_key: None,
+                openai_image_model: "gpt-image-2".to_string(),
+                qmediasync_base_url: String::new(),
+                session_secret: "test-secret".to_string(),
+                enable_file_watcher: false,
+                watch_debounce_seconds: 20,
+            },
+            db,
+            http: reqwest::Client::new(),
+            comic_page_cache: Arc::new(ComicPageCache::default()),
+        });
+
+        let response = work_cover(
+            State(state.clone()),
+            Path(work_id),
+            Query(CoverQuery { size: Some(128) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let first_files = cache_files(&coser_cover_cache_dir);
+        assert_eq!(first_files.len(), 1);
+
+        let second = work_cover(
+            State(state),
+            Path(work_id),
+            Query(CoverQuery { size: Some(128) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(cache_files(&coser_cover_cache_dir), first_files);
+        assert!(cache_files(&cover_cache_dir.join("comic")).is_empty());
+    }
+
+    fn write_test_zip(path: &FsPath) {
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("1.png", options).unwrap();
+        zip.write_all(PNG_1X1).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn cache_files(path: &FsPath) -> Vec<String> {
+        if !path.exists() {
+            return Vec::new();
+        }
+        let mut files = std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn test_path_string(path: &FsPath) -> String {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }

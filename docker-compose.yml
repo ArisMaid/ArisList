@@ -39,9 +39,11 @@ services:
       NOVELS_DIR: /library/novels
       AUDIO_DIR: /library/audio
       GALLERY_DIR: /library/gallery
+      COSER_PICTURE_DIR: /library/coser-picture
 
       # 派生文件目录，例如封面、缩略图等生成内容。
       GENERATED_DIR: /app/generated
+      COVER_CACHE_DIR: /app/cover-cache
 
       # qmediasync 服务地址，可在 .env 中设置，例如：
       # QMEDIASYNC_BASE_URL=http://192.168.31.39:8095
@@ -58,10 +60,12 @@ services:
       # - /volume1/media/轻小说:/library/novels:ro
       # - /volume1/media/音声:/library/audio:ro
       # - /volume1/media/图库:/library/gallery:ro
+      # - /volume1/media/COS图:/library/coser-picture:ro
       - ./漫画:/library/comics:ro
       - ./轻小说:/library/novels:ro
       - ./音声:/library/audio:ro
       - ./图库:/library/gallery:ro
+      - ./COS图:/library/coser-picture:ro
 
       # qmediasync 生成的 STRM 输出目录，只读挂载。
       # 可在 .env 中设置 QMEDIASYNC_STRM_DIR=/volume1/qmediasync/strm
@@ -72,6 +76,9 @@ services:
 
       # 生成资源目录：封面、占位图等，需要可写并持久化。
       - ./generated:/app/generated
+
+      # 封面缓存目录：按媒体库类型分子目录保存，需要可写并持久化。
+      - ./cover-cache:/app/cover-cache
 
     # 容器异常退出或 NAS 重启后自动恢复。
     restart: unless-stopped

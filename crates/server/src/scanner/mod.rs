@@ -26,6 +26,7 @@ pub struct ScanStats {
     pub novels: usize,
     pub audio: usize,
     pub gallery: usize,
+    pub coser_picture: usize,
     pub jobs_created: usize,
 }
 
@@ -35,6 +36,7 @@ pub async fn scan_all(state: &AppState, _enqueue_enrichment: bool) -> Result<Sca
     stats.novels = scan_novels(state).await?;
     stats.audio = scan_audio(state).await?;
     stats.gallery = scan_gallery(state).await?;
+    stats.coser_picture = scan_coser_pictures(state).await?;
     stats.jobs_created += 1;
     state
         .db
@@ -50,6 +52,7 @@ pub async fn scan_all(state: &AppState, _enqueue_enrichment: bool) -> Result<Sca
         novels: stats.novels,
         audio: stats.audio,
         gallery: stats.gallery,
+        coser_picture: stats.coser_picture,
         jobs_created: stats.jobs_created,
     })
 }
@@ -672,6 +675,110 @@ async fn scan_gallery(state: &AppState) -> Result<usize> {
                 )
                 .await?;
             }
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+async fn scan_coser_pictures(state: &AppState) -> Result<usize> {
+    let app_settings = settings::load_settings(&state.config).await?;
+    let roots = app_settings.coser_picture_roots();
+    let mut count = 0;
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&root)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file() && extension_is(e.path(), &["zip"]))
+        {
+            let zip_path = entry.path().to_path_buf();
+            let page_count = count_cbz_pages(&zip_path).unwrap_or(0);
+            if page_count <= 0 {
+                continue;
+            }
+            let title = zip_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Untitled CoserPicture")
+                .to_string();
+            let coser = zip_path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("CoserPicture")
+                .to_string();
+            let relative = zip_path
+                .strip_prefix(&root)
+                .ok()
+                .map(|value| value.to_string_lossy().to_string())
+                .filter(|value| !value.is_empty());
+
+            let work_id = state
+                .db
+                .upsert_work(
+                    "coser-picture",
+                    &clean_title(&title),
+                    Some(&path_string(&zip_path)),
+                    Some("CoserPicture"),
+                    relative.as_deref(),
+                    None,
+                    json!({
+                        "page_count": page_count,
+                        "root": path_string(&root),
+                        "archive": path_string(&zip_path),
+                        "coser": coser.clone(),
+                    }),
+                )
+                .await?;
+
+            let size = std::fs::metadata(&zip_path).ok().map(|m| m.len() as i64);
+            state
+                .db
+                .upsert_asset(
+                    work_id,
+                    &path_string(&zip_path),
+                    "application/zip",
+                    "archive",
+                    Some("zip"),
+                    None,
+                    size,
+                    json!({ "source": "coser-picture", "page_count": page_count }),
+                )
+                .await?;
+
+            link_tag(
+                state,
+                work_id,
+                "coser-picture",
+                "image-set",
+                "CoserPicture",
+                "coser-picture-zip",
+            )
+            .await?;
+            link_tag(
+                state,
+                work_id,
+                "folder",
+                &normalize_key(&coser),
+                &coser,
+                "coser-picture-zip",
+            )
+            .await?;
+            link_tag(
+                state,
+                work_id,
+                "artist",
+                &normalize_key(&coser),
+                &coser,
+                "coser-picture-zip",
+            )
+            .await?;
             count += 1;
         }
     }
@@ -1399,6 +1506,13 @@ fn path_string(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    use crate::assets;
+    use crate::config::Config;
+    use crate::db::Db;
+    use crate::AppState;
 
     #[test]
     fn parses_comic_prefix_tags() {
@@ -1417,5 +1531,108 @@ mod tests {
             tags,
             vec!["black".to_string(), "girl".to_string(), "white".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn scans_coser_picture_zip_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let coser_root = temp.path().join("COS图");
+        let coser_dir = coser_root.join("CoserA");
+        std::fs::create_dir_all(&coser_dir).unwrap();
+        let archive_path = coser_dir.join("set.zip");
+        write_test_zip(&archive_path, &["2.jpg", "10.jpg", "1.jpg"]);
+
+        let data_dir = temp.path().join("data");
+        let generated_dir = temp.path().join("generated");
+        let db_path = data_dir.join("library.sqlite");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&generated_dir).unwrap();
+        let database_url = format!("sqlite://{}", path_string(&db_path));
+        let db = Db::connect(&database_url).await.unwrap();
+        db.migrate().await.unwrap();
+        let state = AppState {
+            config: Config {
+                bind: "127.0.0.1:0".to_string(),
+                database_url,
+                data_dir,
+                cover_cache_dir: temp.path().join("cover-cache"),
+                comic_cover_cache_dir: temp.path().join("cover-cache").join("comic"),
+                novel_cover_cache_dir: temp.path().join("cover-cache").join("novel"),
+                audio_cover_cache_dir: temp.path().join("cover-cache").join("audio"),
+                gallery_cover_cache_dir: temp.path().join("cover-cache").join("gallery"),
+                coser_picture_cover_cache_dir: temp
+                    .path()
+                    .join("cover-cache")
+                    .join("coser-picture"),
+                comics_dir: temp.path().join("漫画"),
+                novels_dir: temp.path().join("轻小说"),
+                audio_dir: temp.path().join("音声"),
+                gallery_dir: temp.path().join("图库"),
+                coser_picture_dir: coser_root,
+                generated_dir,
+                app_admin_password: "admin".to_string(),
+                lightnovel_api_bases: Vec::new(),
+                lightnovel_access_token: None,
+                enrichment_concurrency: 1,
+                ehtt_url: String::new(),
+                openai_api_key: None,
+                openai_image_model: "gpt-image-2".to_string(),
+                qmediasync_base_url: String::new(),
+                session_secret: "test-secret".to_string(),
+                enable_file_watcher: false,
+                watch_debounce_seconds: 20,
+            },
+            db,
+            http: reqwest::Client::new(),
+            comic_page_cache: Arc::new(assets::ComicPageCache::default()),
+        };
+
+        let response = scan_all(&state, false).await.unwrap();
+        assert_eq!(response.coser_picture, 1);
+
+        let library = state.db.library().await.unwrap();
+        let work = library
+            .works
+            .iter()
+            .find(|work| work.kind == "coser-picture")
+            .expect("coser-picture work");
+        assert_eq!(work.title, "set");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&work.meta_json)
+                .unwrap()
+                .get("page_count")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        assert!(work
+            .tag_keys
+            .as_deref()
+            .unwrap_or_default()
+            .contains("artist:cosera"));
+        assert!(work
+            .tag_keys
+            .as_deref()
+            .unwrap_or_default()
+            .contains("coser-picture:image-set"));
+
+        let detail = state.db.work_detail(work.id).await.unwrap();
+        let archive = detail
+            .assets
+            .iter()
+            .find(|asset| asset.role == "archive")
+            .expect("archive asset");
+        assert_eq!(archive.mime, "application/zip");
+        assert_eq!(archive.variant.as_deref(), Some("zip"));
+    }
+
+    fn write_test_zip(path: &Path, entries: &[&str]) {
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for entry in entries {
+            zip.start_file(entry, options).unwrap();
+            zip.write_all(b"test-image-bytes").unwrap();
+        }
+        zip.finish().unwrap();
     }
 }

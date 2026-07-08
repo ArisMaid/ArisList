@@ -6,10 +6,17 @@ pub struct Config {
     pub bind: String,
     pub database_url: String,
     pub data_dir: PathBuf,
+    pub cover_cache_dir: PathBuf,
+    pub comic_cover_cache_dir: PathBuf,
+    pub novel_cover_cache_dir: PathBuf,
+    pub audio_cover_cache_dir: PathBuf,
+    pub gallery_cover_cache_dir: PathBuf,
+    pub coser_picture_cover_cache_dir: PathBuf,
     pub comics_dir: PathBuf,
     pub novels_dir: PathBuf,
     pub audio_dir: PathBuf,
     pub gallery_dir: PathBuf,
+    pub coser_picture_dir: PathBuf,
     pub generated_dir: PathBuf,
     pub app_admin_password: String,
     pub lightnovel_api_bases: Vec<String>,
@@ -31,11 +38,28 @@ impl Config {
         let data_dir = env::var("DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data"));
+        let cover_cache_dir = env::var("COVER_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| data_dir.join("cover-cache"));
+        let cover_cache_child = |env_name: &str, child: &str| {
+            env::var(env_name)
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| cover_cache_dir.join(child))
+        };
 
         Ok(Self {
             bind: env::var("APP_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_string()),
             database_url,
             data_dir,
+            comic_cover_cache_dir: cover_cache_child("COMIC_COVER_CACHE_DIR", "comic"),
+            novel_cover_cache_dir: cover_cache_child("NOVEL_COVER_CACHE_DIR", "novel"),
+            audio_cover_cache_dir: cover_cache_child("AUDIO_COVER_CACHE_DIR", "audio"),
+            gallery_cover_cache_dir: cover_cache_child("GALLERY_COVER_CACHE_DIR", "gallery"),
+            coser_picture_cover_cache_dir: cover_cache_child(
+                "COSER_PICTURE_COVER_CACHE_DIR",
+                "coser-picture",
+            ),
+            cover_cache_dir,
             comics_dir: env::var("COMICS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("漫画")),
@@ -48,6 +72,9 @@ impl Config {
             gallery_dir: env::var("GALLERY_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("图库")),
+            coser_picture_dir: env::var("COSER_PICTURE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("COS图")),
             generated_dir: env::var("GENERATED_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("generated")),

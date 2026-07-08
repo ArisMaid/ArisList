@@ -59,6 +59,7 @@ pub fn ensure_asset_path_allowed_with_roots(
         config.novels_dir.as_path(),
         config.audio_dir.as_path(),
         config.gallery_dir.as_path(),
+        config.coser_picture_dir.as_path(),
         config.generated_dir.as_path(),
     ];
     roots.extend(additional_roots.iter().map(|path| path.as_path()));
@@ -108,6 +109,7 @@ fn legacy_container_asset_path(config: &Config, raw: &str) -> Option<PathBuf> {
         ("/library/novels", &config.novels_dir),
         ("/library/audio", &config.audio_dir),
         ("/library/gallery", &config.gallery_dir),
+        ("/library/coser-picture", &config.coser_picture_dir),
         ("/app/generated", &config.generated_dir),
     ];
     for (prefix, root) in mappings {
@@ -138,10 +140,17 @@ mod tests {
             bind: "127.0.0.1:0".to_string(),
             database_url: "sqlite::memory:".to_string(),
             data_dir: root.join("data"),
+            cover_cache_dir: root.join("cover-cache"),
+            comic_cover_cache_dir: root.join("cover-cache").join("comic"),
+            novel_cover_cache_dir: root.join("cover-cache").join("novel"),
+            audio_cover_cache_dir: root.join("cover-cache").join("audio"),
+            gallery_cover_cache_dir: root.join("cover-cache").join("gallery"),
+            coser_picture_cover_cache_dir: root.join("cover-cache").join("coser-picture"),
             comics_dir: root.join("comics"),
             novels_dir: root.join("novels"),
             audio_dir: root.join("audio"),
             gallery_dir: root.join("gallery"),
+            coser_picture_dir: root.join("coser-picture"),
             generated_dir: root.join("generated"),
             app_admin_password: "admin".to_string(),
             lightnovel_api_bases: Vec::new(),

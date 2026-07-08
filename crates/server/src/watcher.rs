@@ -29,6 +29,8 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
         state.config.comics_dir.as_path(),
         state.config.novels_dir.as_path(),
         state.config.audio_dir.as_path(),
+        state.config.gallery_dir.as_path(),
+        state.config.coser_picture_dir.as_path(),
     ] {
         if root.exists() {
             watcher
@@ -111,6 +113,7 @@ fn is_media_path(path: &Path) -> bool {
                     | "jpeg"
                     | "png"
                     | "webp"
+                    | "zip"
                     | "txt"
             )
         })

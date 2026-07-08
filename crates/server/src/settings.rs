@@ -4,7 +4,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::auth;
@@ -32,6 +32,8 @@ pub struct MediaDirectorySettings {
     pub audio: Vec<String>,
     #[serde(default)]
     pub gallery: Vec<String>,
+    #[serde(default)]
+    pub coser_picture: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +45,53 @@ pub struct MediaSourceSettings {
     pub enabled: bool,
     #[serde(default = "default_scan_depth")]
     pub scan_depth: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CoverCacheDirectorySettings {
+    #[serde(default)]
+    pub comic: String,
+    #[serde(default)]
+    pub novel: String,
+    #[serde(default)]
+    pub audio: String,
+    #[serde(default)]
+    pub gallery: String,
+    #[serde(default)]
+    pub coser_picture: String,
+}
+
+impl CoverCacheDirectorySettings {
+    pub fn defaults(config: &Config) -> Self {
+        Self {
+            comic: path_string(&config.comic_cover_cache_dir),
+            novel: path_string(&config.novel_cover_cache_dir),
+            audio: path_string(&config.audio_cover_cache_dir),
+            gallery: path_string(&config.gallery_cover_cache_dir),
+            coser_picture: path_string(&config.coser_picture_cover_cache_dir),
+        }
+    }
+
+    fn normalized(mut self, config: &Config) -> Self {
+        let defaults = Self::defaults(config);
+        self.comic = normalize_cache_dir(self.comic, defaults.comic);
+        self.novel = normalize_cache_dir(self.novel, defaults.novel);
+        self.audio = normalize_cache_dir(self.audio, defaults.audio);
+        self.gallery = normalize_cache_dir(self.gallery, defaults.gallery);
+        self.coser_picture = normalize_cache_dir(self.coser_picture, defaults.coser_picture);
+        self
+    }
+
+    pub fn for_work_kind(&self, kind: &str) -> PathBuf {
+        match kind {
+            "comic" => PathBuf::from(&self.comic),
+            "novel" => PathBuf::from(&self.novel),
+            "audio" => PathBuf::from(&self.audio),
+            "gallery" => PathBuf::from(&self.gallery),
+            "coser-picture" => PathBuf::from(&self.coser_picture),
+            _ => PathBuf::from(&self.gallery),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +216,8 @@ pub struct AppSettings {
     pub reader: ReaderSettings,
     pub media_dirs: MediaDirectorySettings,
     #[serde(default)]
+    pub cover_cache_dirs: CoverCacheDirectorySettings,
+    #[serde(default)]
     pub media_sources: Vec<MediaSourceSettings>,
     #[serde(default)]
     pub qmediasync: QMediaSyncSettings,
@@ -186,7 +237,9 @@ impl AppSettings {
                 novels: vec![path_string(&config.novels_dir)],
                 audio: vec![path_string(&config.audio_dir)],
                 gallery: vec![path_string(&config.gallery_dir)],
+                coser_picture: vec![path_string(&config.coser_picture_dir)],
             },
+            cover_cache_dirs: CoverCacheDirectorySettings::defaults(config),
             media_sources: Vec::new(),
             qmediasync: QMediaSyncSettings {
                 enabled: false,
@@ -221,12 +274,17 @@ impl AppSettings {
         roots_from_strings(&self.media_dirs.gallery)
     }
 
+    pub fn coser_picture_roots(&self) -> Vec<PathBuf> {
+        roots_from_strings(&self.media_dirs.coser_picture)
+    }
+
     pub fn all_media_roots(&self) -> Vec<PathBuf> {
         let mut roots = Vec::new();
         roots.extend(self.comic_roots());
         roots.extend(self.novel_roots());
         roots.extend(self.audio_roots());
         roots.extend(self.gallery_roots());
+        roots.extend(self.coser_picture_roots());
         roots.extend(self.qmediasync_roots());
         roots
     }
@@ -249,6 +307,8 @@ impl AppSettings {
         self.media_dirs.novels = normalize_dirs(self.media_dirs.novels);
         self.media_dirs.audio = normalize_dirs(self.media_dirs.audio);
         self.media_dirs.gallery = normalize_dirs(self.media_dirs.gallery);
+        self.media_dirs.coser_picture = normalize_dirs(self.media_dirs.coser_picture);
+        self.cover_cache_dirs = self.cover_cache_dirs.normalized(config);
         self.media_sources = normalize_sources(self.media_sources);
         self.qmediasync.strm_roots = normalize_dirs(self.qmediasync.strm_roots);
         self.reader.comic_auto_read_interval_ms =
@@ -293,6 +353,8 @@ pub async fn update_settings(
                 "novels": settings.media_dirs.novels.len(),
                 "audio": settings.media_dirs.audio.len(),
                 "gallery": settings.media_dirs.gallery.len(),
+                "coser_picture": settings.media_dirs.coser_picture.len(),
+                "cover_cache_dirs": 5,
                 "media_sources": settings.media_sources.len(),
                 "qmediasync_enabled": settings.qmediasync.enabled,
                 "qmediasync_roots": settings.qmediasync.strm_roots.len(),
@@ -312,8 +374,17 @@ pub async fn load_settings(config: &Config) -> Result<AppSettings> {
         return Ok(AppSettings::defaults(config));
     }
     let raw = tokio::fs::read_to_string(&path).await?;
-    let settings = serde_json::from_str::<AppSettings>(&raw)
+    let raw_value = serde_json::from_str::<Value>(&raw)
         .map_err(|err| AppError::Other(format!("settings file is invalid: {err}")))?;
+    let missing_coser_picture = raw_value
+        .get("media_dirs")
+        .and_then(|value| value.get("coser_picture"))
+        .is_none();
+    let mut settings = serde_json::from_value::<AppSettings>(raw_value)
+        .map_err(|err| AppError::Other(format!("settings file is invalid: {err}")))?;
+    if missing_coser_picture {
+        settings.media_dirs.coser_picture = vec![path_string(&config.coser_picture_dir)];
+    }
     Ok(settings.normalized(config))
 }
 
@@ -343,6 +414,14 @@ fn normalize_dirs(values: Vec<String>) -> Vec<String> {
         out.push(value.to_string());
     }
     out
+}
+
+fn normalize_cache_dir(value: String, default: String) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return default;
+    }
+    value.trim_end_matches(['/', '\\']).to_string()
 }
 
 fn normalize_sources(values: Vec<MediaSourceSettings>) -> Vec<MediaSourceSettings> {
