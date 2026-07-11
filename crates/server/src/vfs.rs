@@ -80,6 +80,56 @@ pub fn qmediasync_sources<'a>(
     })
 }
 
+pub fn qmediasync_scan_sources(settings: &AppSettings, kind: &str) -> Vec<MediaSourceSettings> {
+    let mut sources = qmediasync_sources(settings, kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    if kind != "comic" || !settings.qmediasync.enabled {
+        return sources;
+    }
+
+    let mut used_mounts = sources
+        .iter()
+        .map(|source| source.mount_name.clone())
+        .collect::<Vec<_>>();
+    for root in &settings.qmediasync.strm_roots {
+        let root = root.trim().trim_end_matches(['/', '\\']);
+        if root.is_empty()
+            || sources
+                .iter()
+                .any(|source| source.root.trim_end_matches(['/', '\\']) == root)
+        {
+            continue;
+        }
+        let mount_name = unique_qmediasync_mount_name(&mut used_mounts);
+        sources.push(MediaSourceSettings {
+            kind: "comic".to_string(),
+            provider: "qmediasync".to_string(),
+            root: root.to_string(),
+            mount_name,
+            enabled: true,
+            scan_depth: 12,
+        });
+    }
+    sources
+}
+
+fn unique_qmediasync_mount_name(used: &mut Vec<String>) -> String {
+    let mut index = 1;
+    loop {
+        let candidate = if index == 1 {
+            "qms".to_string()
+        } else {
+            format!("qms{index}")
+        };
+        if !used.iter().any(|name| name == &candidate) {
+            used.push(candidate.clone());
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
 pub fn qms_strm_meta_json(
     mount_name: &str,
     source_root: &Path,
@@ -138,6 +188,12 @@ pub async fn qms_strm_path_for_asset(state: &AppState, asset_path: &str) -> Resu
         .iter()
         .find(|source| {
             source.enabled && source.provider == "qmediasync" && source.mount_name == mount_name
+        })
+        .cloned()
+        .or_else(|| {
+            qmediasync_scan_sources(&settings, "comic")
+                .into_iter()
+                .find(|source| source.mount_name == mount_name)
         })
         .ok_or_else(|| AppError::NotFound(format!("qmediasync source {mount_name} not found")))?;
     let strm_path = PathBuf::from(&source.root).join(relative_path.trim_start_matches('/'));

@@ -429,10 +429,16 @@ fn normalize_sources(values: Vec<MediaSourceSettings>) -> Vec<MediaSourceSetting
     for mut value in values {
         value.kind = value.kind.trim().to_ascii_lowercase();
         value.provider = value.provider.trim().to_ascii_lowercase();
+        if value.provider == "openlist" {
+            value.provider = "qmediasync".to_string();
+        }
         value.root = normalize_cloud_root(&value.root);
         value.mount_name = value.mount_name.trim().to_string();
         value.scan_depth = value.scan_depth.clamp(1, 64);
-        if !matches!(value.kind.as_str(), "comic" | "novel" | "audio" | "gallery")
+        if !matches!(
+            value.kind.as_str(),
+            "comic" | "novel" | "audio" | "gallery" | "coser-picture"
+        )
             || value.provider != "qmediasync"
             || value.root.is_empty()
             || value.mount_name.is_empty()
@@ -486,5 +492,23 @@ mod tests {
         .unwrap();
         assert!(settings.strm_roots.is_empty());
         assert_eq!(settings.base_url, "http://qmediasync:8095");
+    }
+
+    #[test]
+    fn normalizes_legacy_openlist_sources_and_coser_picture_kind() {
+        let sources = normalize_sources(vec![MediaSourceSettings {
+            kind: " Coser-Picture ".to_string(),
+            provider: " OpenList ".to_string(),
+            root: " /qms/coser/ ".to_string(),
+            mount_name: "cloud".to_string(),
+            enabled: true,
+            scan_depth: 128,
+        }]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind, "coser-picture");
+        assert_eq!(sources[0].provider, "qmediasync");
+        assert_eq!(sources[0].root, "/qms/coser");
+        assert_eq!(sources[0].scan_depth, 64);
     }
 }

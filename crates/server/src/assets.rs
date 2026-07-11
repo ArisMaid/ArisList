@@ -441,7 +441,14 @@ pub async fn comic_pages(
         .ok_or_else(|| AppError::NotFound("comic archive asset not found".to_string()))?;
     let path = vfs::asset_local_processing_path(&state, archive).await?;
     let cached = cached_cbz_pages(&state, &path).await?;
-    maybe_update_comic_page_count(&state, &detail, cached.pages.len()).await?;
+    if let Err(err) = maybe_update_comic_page_count(&state, &detail, cached.pages.len()).await {
+        tracing::warn!(
+            work_id = detail.work.id,
+            page_count = cached.pages.len(),
+            error = %err,
+            "failed to persist archive page count"
+        );
+    }
     Ok(Json(ComicPagesResponse {
         pages: (*cached.pages).clone(),
     }))

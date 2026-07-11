@@ -231,7 +231,8 @@ async fn test_qms_strm_root(
             .to_ascii_lowercase();
         let is_strm = lower.ends_with(".strm");
         let is_kind_match = match input.kind.as_deref().unwrap_or("comic") {
-            "comic" => lower.ends_with(".cbz") || lower.ends_with(".cbz.strm"),
+            "comic" => lower.ends_with(".cbz") || is_strm,
+            "coser-picture" => lower.ends_with(".zip") || is_strm,
             _ => is_strm,
         };
         if !is_kind_match {

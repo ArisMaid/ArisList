@@ -171,8 +171,8 @@ export type AppSettings = {
     coser_picture: string;
   };
   media_sources: Array<{
-    kind: "comic" | "novel" | "audio" | "gallery";
-    provider: "qmediasync";
+    kind: "comic" | "novel" | "audio" | "gallery" | "coser-picture";
+    provider: "qmediasync" | "openlist";
     root: string;
     mount_name: string;
     enabled: boolean;

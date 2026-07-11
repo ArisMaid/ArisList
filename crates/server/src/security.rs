@@ -74,6 +74,32 @@ pub fn ensure_asset_path_allowed_with_roots(
             candidates.push(mapped);
         }
     }
+    if let Some(mapped) = legacy_root_alias_asset_path(config, raw) {
+        if !candidates.iter().any(|path| path == &mapped) {
+            candidates.push(mapped);
+        }
+    }
+    if let Some(repaired) = repair_utf8_mojibake_path(raw) {
+        let repaired_path = PathBuf::from(&repaired);
+        if !candidates.iter().any(|path| path == &repaired_path) {
+            candidates.push(repaired_path);
+        }
+        if let Some(mapped) = legacy_container_asset_path(config, &repaired) {
+            if !candidates.iter().any(|path| path == &mapped) {
+                candidates.push(mapped);
+            }
+        }
+        if let Some(mapped) = configured_root_name_asset_path(config, &repaired) {
+            if !candidates.iter().any(|path| path == &mapped) {
+                candidates.push(mapped);
+            }
+        }
+        if let Some(mapped) = legacy_root_alias_asset_path(config, &repaired) {
+            if !candidates.iter().any(|path| path == &mapped) {
+                candidates.push(mapped);
+            }
+        }
+    }
 
     let mut last_io_error = None;
     let mut found_outside_root = false;
@@ -102,6 +128,18 @@ pub fn ensure_asset_path_allowed_with_roots(
         .unwrap_or_else(|| AppError::Unauthorized(format!("asset path is not readable: {raw}"))))
 }
 
+fn repair_utf8_mojibake_path(raw: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    for ch in raw.chars() {
+        let value = ch as u32;
+        if value > u8::MAX as u32 {
+            return None;
+        }
+        bytes.push(value as u8);
+    }
+    String::from_utf8(bytes).ok().filter(|value| value != raw)
+}
+
 fn legacy_container_asset_path(config: &Config, raw: &str) -> Option<PathBuf> {
     let normalized = raw.trim().replace('\\', "/");
     let mappings = [
@@ -123,6 +161,48 @@ fn legacy_container_asset_path(config: &Config, raw: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn configured_root_name_asset_path(config: &Config, raw: &str) -> Option<PathBuf> {
+    let normalized = raw.trim().replace('\\', "/");
+    let (head, tail) = normalized.split_once('/')?;
+    let roots = [
+        &config.comics_dir,
+        &config.novels_dir,
+        &config.audio_dir,
+        &config.gallery_dir,
+        &config.coser_picture_dir,
+        &config.generated_dir,
+    ];
+    let root = roots.iter().find(|root| {
+        root.file_name()
+            .and_then(|value| value.to_str())
+            .map(|name| name == head)
+            .unwrap_or(false)
+    })?;
+    let mut mapped = (*root).clone();
+    for part in tail.split('/').filter(|part| !part.is_empty()) {
+        mapped.push(part);
+    }
+    Some(mapped)
+}
+
+fn legacy_root_alias_asset_path(config: &Config, raw: &str) -> Option<PathBuf> {
+    let normalized = raw.trim().replace('\\', "/");
+    let (head, tail) = normalized.split_once('/')?;
+    let root = match head {
+        "漫画" => &config.comics_dir,
+        "轻小说" => &config.novels_dir,
+        "音声" => &config.audio_dir,
+        "图库" => &config.gallery_dir,
+        "COS图" | "CoserPicture" | "coser-picture" => &config.coser_picture_dir,
+        _ => return None,
+    };
+    let mut mapped = root.clone();
+    for part in tail.split('/').filter(|part| !part.is_empty()) {
+        mapped.push(part);
+    }
+    Some(mapped)
 }
 
 pub fn path_mime(path: &Path) -> String {
@@ -192,6 +272,46 @@ mod tests {
         let resolved =
             ensure_asset_path_allowed_with_roots(&config, "/app/generated/covers/1.jpg", &[])
                 .unwrap();
+
+        assert_eq!(resolved, asset.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn repairs_utf8_mojibake_paths_when_resolving_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.coser_picture_dir = temp.path().join("COS图");
+        let asset = config
+            .coser_picture_dir
+            .join("Aram")
+            .join("set.zip");
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        std::fs::write(&asset, b"zip").unwrap();
+
+        let mojibake = String::from_utf8(vec![
+            b'C', b'O', b'S', 0xc3, 0xa5, 0xc2, 0x9b, 0xc2, 0xbe, b'/', b'A',
+            b'r', b'a', b'm', b'/', b's', b'e', b't', b'.', b'z', b'i', b'p',
+        ])
+        .unwrap();
+        let resolved = ensure_asset_path_allowed_with_roots(&config, &mojibake, &[]).unwrap();
+
+        assert_eq!(resolved, asset.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn maps_legacy_coser_root_alias_to_configured_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path());
+        config.coser_picture_dir = temp.path().join("library").join("coser-picture");
+        let asset = config
+            .coser_picture_dir
+            .join("Aram")
+            .join("set.zip");
+        std::fs::create_dir_all(asset.parent().unwrap()).unwrap();
+        std::fs::write(&asset, b"zip").unwrap();
+
+        let resolved =
+            ensure_asset_path_allowed_with_roots(&config, "COS图/Aram/set.zip", &[]).unwrap();
 
         assert_eq!(resolved, asset.canonicalize().unwrap());
     }

@@ -48,15 +48,15 @@ import {
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { api, assetUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type EpubChapter, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
+import { api, assetUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
 import { GlassFilterProvider, GlassSurface } from "./components/material";
+import { NovelReader } from "./components/NovelReader";
 
 type KindFilter = "history" | "comic" | "novel" | "audio" | "gallery" | "coser-picture";
 type ViewMode = "grid" | "compact" | "list" | "cover";
 type TagFilterMode = "include";
 type TagLanguage = "translated" | "raw";
 type ComicReaderMode = "paged" | "scroll" | "horizontal";
-type NovelTheme = "paper" | "dark";
 type ShelfDisplayMode = "collections" | "single";
 type DetailMode = "modal" | "docked";
 type AppearanceState = {
@@ -1189,7 +1189,8 @@ function SettingsOverlay({
     comic: "漫画",
     novel: "轻小说",
     audio: "音声",
-    gallery: "图库"
+    gallery: "图库",
+    "coser-picture": "CoserPicture"
   };
   const updateQMediaSync = (patch: Partial<AppSettings["qmediasync"]>) => {
     updateDraft((prev) => ({
@@ -2194,17 +2195,12 @@ function ReaderOverlay({
 }) {
   const [pages, setPages] = useState<ComicPageInfo[]>([]);
   const [page, setPage] = useState(0);
-  const [chapters, setChapters] = useState<EpubChapter[]>([]);
-  const [chapter, setChapter] = useState(0);
-  const [showNovelCover, setShowNovelCover] = useState(false);
-  const [chapterHtml, setChapterHtml] = useState("");
   const [comicMode, setComicMode] = useState<ComicReaderMode>("horizontal");
   const [comicZoom, setComicZoom] = useState(1);
   const [comicViewport, setComicViewport] = useState({ width: 0, height: 0 });
   const [comicScrollLeft, setComicScrollLeft] = useState(0);
   const [comicAutoRead, setComicAutoRead] = useState(false);
-  const [novelTheme, setNovelTheme] = useState<NovelTheme>("paper");
-  const [readerError, setReaderError] = useState<string | null>(null);
+  const [comicError, setComicError] = useState<string | null>(null);
   const [readerChromeVisible, setReaderChromeVisible] = useState(false);
   const lastAudioProgressWrite = useRef(0);
   const comicStageRef = useRef<HTMLDivElement | null>(null);
@@ -2216,25 +2212,37 @@ function ReaderOverlay({
   const comicUserInteractedRef = useRef(false);
   const comicScrollFrameRef = useRef<number | null>(null);
   const comicPendingScrollRef = useRef<{ left: number; page: number } | null>(null);
-  const bookAsset = detail.assets.find((asset) => asset.role === "book");
   const mediaImages = detail.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/"));
   const resumeTarget = useMemo(() => parseReadingPosition(resumePosition), [resumePosition]);
   const safeComicAutoReadIntervalMs = clampComicAutoReadIntervalMs(comicAutoReadIntervalMs);
 
   useEffect(() => {
+    const body = document.body;
+    const root = document.documentElement;
+    const previousBodyOverflow = body.style.overflow;
+    const previousRootOverflow = root.style.overflow;
+    body.classList.add("reader-open");
+    root.classList.add("reader-open");
+    body.style.overflow = "hidden";
+    root.style.overflow = "hidden";
+    return () => {
+      body.classList.remove("reader-open");
+      root.classList.remove("reader-open");
+      body.style.overflow = previousBodyOverflow;
+      root.style.overflow = previousRootOverflow;
+    };
+  }, []);
+
+  useEffect(() => {
     setPage(0);
-    setChapter(0);
-    setShowNovelCover(detail.work.kind === "novel" && Boolean(detail.work.cover_asset_id));
     setPages([]);
-    setChapters([]);
-    setChapterHtml("");
     setComicMode("horizontal");
     setComicZoom(1);
     setComicViewport({ width: 0, height: 0 });
     setComicScrollLeft(0);
     setComicAutoRead(false);
+    setComicError(null);
     setReaderChromeVisible(false);
-    setReaderError(null);
     if (readerChromeTimerRef.current !== null) {
       window.clearTimeout(readerChromeTimerRef.current);
       readerChromeTimerRef.current = null;
@@ -2252,13 +2260,14 @@ function ReaderOverlay({
     if (isArchiveWorkKind(detail.work.kind)) {
       api
         .comicPages(detail.work.id)
-        .then((res) => setPages(res.pages.map(normalizeComicPageInfo)))
-        .catch(() => setPages([]));
-    } else if (detail.work.kind === "novel") {
-      api
-        .epubManifest(detail.work.id)
-        .then((res) => setChapters(res.chapters))
-        .catch((err) => setReaderError(err instanceof Error ? err.message : String(err)));
+        .then((res) => {
+          setPages(res.pages.map(normalizeComicPageInfo));
+          setComicError(null);
+        })
+        .catch((err) => {
+          setPages([]);
+          setComicError(err instanceof Error ? err.message : String(err));
+        });
     }
   }, [detail.work.id, detail.work.kind]);
 
@@ -2282,7 +2291,7 @@ function ReaderOverlay({
   const comicFallbackHeight = typeof window === "undefined" ? 720 : Math.max(360, window.innerHeight - 72);
   const comicMeasuredHeight = comicViewport.height > 24 ? comicViewport.height : comicFallbackHeight;
   const comicMeasuredWidth = comicViewport.width > 24 ? comicViewport.width : typeof window === "undefined" ? 960 : window.innerWidth;
-  const comicSlotWidth = Math.max(120, comicMeasuredHeight * comicZoom * comicAspect);
+  const comicSlotWidth = comicHorizontalSlotWidthFromSize(comicMeasuredWidth, comicMeasuredHeight, comicAspect, comicZoom);
   const comicWindowStart = comicMode === "horizontal" && comicMeasuredWidth > 0
     ? Math.max(0, Math.floor(comicScrollLeft / comicSlotWidth) - COMIC_HORIZONTAL_OVERSCAN)
     : 0;
@@ -2343,24 +2352,6 @@ function ReaderOverlay({
   }, [detail.work.progress, isArchiveReader, pages.length, resumeTarget]);
 
   useEffect(() => {
-    if (!isNovel || chapters.length === 0 || resumeAppliedRef.current) return;
-    if (resumeTarget.kind === "cover") {
-      setShowNovelCover(Boolean(detail.work.cover_asset_id));
-      setChapter(0);
-    } else {
-      const target = resumeTarget.kind === "chapter"
-        ? resumeTarget.index
-        : resumeTarget.kind === "start"
-          ? 0
-        : Math.floor((detail.work.progress || 0) * Math.max(0, chapters.length - 1));
-      setShowNovelCover(false);
-      setChapter(Math.min(Math.max(target, 0), Math.max(0, chapters.length - 1)));
-    }
-    resumeAppliedRef.current = true;
-    suppressNextProgressRef.current = Boolean(resumeTarget.kind && resumeTarget.kind !== "start");
-  }, [chapters.length, detail.work.cover_asset_id, detail.work.progress, isNovel, resumeTarget]);
-
-  useEffect(() => {
     if (!isArchiveReader || !needsComicResumeScrollRef.current || pages.length < 2 || comicMode === "paged") return;
     const targetPage = resumeComicPageRef.current;
     const delays = [0, 250, 900, 1800, 3200];
@@ -2388,16 +2379,6 @@ function ReaderOverlay({
   }, [comicMode, isArchiveReader]);
 
   useEffect(() => {
-    if (!isNovel || showNovelCover || chapters.length === 0) return;
-    setReaderError(null);
-    setChapterHtml("");
-    api
-      .epubChapterHtml(detail.work.id, chapter)
-      .then(setChapterHtml)
-      .catch((err) => setReaderError(err instanceof Error ? err.message : String(err)));
-  }, [chapter, chapters.length, detail.work.id, isNovel, showNovelCover]);
-
-  useEffect(() => {
     if (!isArchiveReader || pages.length === 0) return;
     if (!resumeAppliedRef.current) return;
     if (suppressNextProgressRef.current) {
@@ -2406,20 +2387,6 @@ function ReaderOverlay({
     }
     persistProgress((page + 1) / pages.length, `page:${page}`);
   }, [isArchiveReader, page, pages.length]);
-
-  useEffect(() => {
-    if (!isNovel || chapters.length === 0) return;
-    if (!resumeAppliedRef.current) return;
-    if (suppressNextProgressRef.current) {
-      suppressNextProgressRef.current = false;
-      return;
-    }
-    if (showNovelCover) {
-      persistProgress(0, "cover");
-      return;
-    }
-    persistProgress((chapter + 1) / chapters.length, `chapter:${chapter}`);
-  }, [isNovel, chapter, chapters.length, showNovelCover]);
 
   const moveComic = (offset: number) => {
     setPage((value) => Math.min(Math.max(value + offset, 0), Math.max(0, pages.length - 1)));
@@ -2462,20 +2429,6 @@ function ReaderOverlay({
     }, safeComicAutoReadIntervalMs);
     return () => window.clearTimeout(timer);
   }, [comicAspect, comicAutoRead, comicMode, comicZoom, isArchiveReader, page, pages.length, safeComicAutoReadIntervalMs]);
-
-  const moveChapter = (offset: number) => {
-    if (showNovelCover && offset > 0) {
-      setShowNovelCover(false);
-      setChapter(0);
-      return;
-    }
-    if (!showNovelCover && chapter === 0 && offset < 0 && detail.work.cover_asset_id) {
-      setShowNovelCover(true);
-      return;
-    }
-    setShowNovelCover(false);
-    setChapter((value) => Math.min(Math.max(value + offset, 0), Math.max(0, chapters.length - 1)));
-  };
 
   const changeComicZoom = (delta: number) => {
     setComicZoom((value) => Math.min(1.8, Math.max(0.7, Number((value + delta).toFixed(2)))));
@@ -2542,14 +2495,10 @@ function ReaderOverlay({
         if (event.key === "+" || event.key === "=") changeComicZoom(0.1);
         if (event.key === "-" || event.key === "_") changeComicZoom(-0.1);
       }
-      if (isNovel) {
-        if (event.key === "ArrowLeft") moveChapter(-1);
-        if (event.key === "ArrowRight") moveChapter(1);
-      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [comicMode, isArchiveReader, isNovel, onClose, pages.length, chapters.length]);
+  }, [comicMode, isArchiveReader, onClose, pages.length]);
 
   const saveTrackProgress = (asset: Asset, currentTime: number, duration: number, ended = false) => {
     if (!canPersistProgress || !Number.isFinite(duration) || duration <= 0) return;
@@ -2560,7 +2509,6 @@ function ReaderOverlay({
     persistProgress(progress, `track:${asset.id}:${Math.round(currentTime)}`);
   };
 
-  const themedChapterHtml = useMemo(() => applyNovelTheme(chapterHtml, novelTheme), [chapterHtml, novelTheme]);
   const readerActionsContent = (
     <>
         {isArchiveReader && <b>{pages.length ? `${page + 1}/${pages.length}` : "0/0"}</b>}
@@ -2595,25 +2543,6 @@ function ReaderOverlay({
             </button>
           </>
         )}
-        {isNovel && <b>{showNovelCover ? `封面/${chapters.length || 0}` : chapters.length ? `${chapter + 1}/${chapters.length}` : "0/0"}</b>}
-        {isNovel && chapters.length > 0 && (
-          <>
-            <button className="icon-btn" onClick={() => moveChapter(-1)} aria-label="上一章">
-              <ChevronLeft size={16} />
-            </button>
-            <button className="icon-btn" onClick={() => moveChapter(1)} aria-label="下一章">
-              <ChevronRight size={16} />
-            </button>
-            <button className="icon-btn" onClick={() => setNovelTheme((value) => (value === "paper" ? "dark" : "paper"))} aria-label="切换阅读主题">
-              {novelTheme === "paper" ? <Moon size={16} /> : <Sun size={16} />}
-            </button>
-          </>
-        )}
-        {isNovel && bookAsset && (
-          <a href={assetUrl(bookAsset.id)} target="_blank" rel="noreferrer">
-            EPUB
-          </a>
-        )}
     </>
   );
   const readerBarContent = (
@@ -2634,8 +2563,7 @@ function ReaderOverlay({
   const liquidReaderBarClassName = [
     "reader-bar",
     isArchiveReader || isGallery ? "reader-bar-floating" : "reader-bar-docked",
-    isGallery ? "reader-bar-gallery" : "",
-    isNovel ? "reader-bar-novel" : ""
+    isGallery ? "reader-bar-gallery" : ""
   ].filter(Boolean).join(" ");
 
   return (
@@ -2647,7 +2575,7 @@ function ReaderOverlay({
         exit={{ scale: 0.98, y: 18 }}
         onWheel={onHorizontalComicWheel}
       >
-        {liquid ? (
+        {!isNovel && (liquid ? (
           <div className={liquidReaderBarClassName}>
             <GlassSurface className="reader-back-surface" variant="dock">
               <button className="icon-btn reader-back-button" onClick={onClose} aria-label="关闭">
@@ -2665,7 +2593,7 @@ function ReaderOverlay({
           </div>
         ) : (
           <div className="reader-bar">{readerBarContent}</div>
-        )}
+        ))}
         {isArchiveReader ? (
           <div
             className="comic-stage"
@@ -2684,6 +2612,7 @@ function ReaderOverlay({
             }}
             ref={comicStageRef}
           >
+            {comicError && <div className="reader-error archive-reader-error">{comicError}</div>}
             {pages.length > 0 && comicMode === "paged" ? (
               <motion.img
                 key={page}
@@ -2739,36 +2668,13 @@ function ReaderOverlay({
             )}
           </div>
         ) : isNovel ? (
-          <div className="novel-stage">
-            <div className="chapter-list">
-              {chapters.length === 0 && !readerError ? <Loader2 className="spin" /> : null}
-              {detail.work.cover_asset_id && (
-                <button className={showNovelCover ? "active" : ""} onClick={() => setShowNovelCover(true)}>
-                  <span>1</span>
-                  <b>封面</b>
-                </button>
-              )}
-              {chapters.map((item) => (
-                <button key={item.index} className={!showNovelCover && item.index === chapter ? "active" : ""} onClick={() => { setShowNovelCover(false); setChapter(item.index); }}>
-                  <span>{detail.work.cover_asset_id ? item.index + 2 : item.index + 1}</span>
-                  <b>{item.title}</b>
-                </button>
-              ))}
-            </div>
-            <div className="chapter-reader">
-              {readerError ? (
-                <div className="reader-error">{readerError}</div>
-              ) : showNovelCover && detail.work.cover_asset_id ? (
-                <div className="novel-cover-page">
-                  <img src={assetUrl(detail.work.cover_asset_id)} alt="" />
-                </div>
-              ) : chapterHtml ? (
-                <iframe title={chapters[chapter]?.title ?? detail.work.title} sandbox="" srcDoc={themedChapterHtml} />
-              ) : (
-                <Loader2 className="spin" />
-              )}
-            </div>
-          </div>
+          <NovelReader
+            canPersistProgress={canPersistProgress}
+            detail={detail}
+            onClose={onClose}
+            onProgressSaved={onProgressSaved}
+            resumePosition={resumePosition}
+          />
         ) : isGallery ? (
           <GalleryStage
             canPersistProgress={canPersistProgress}
@@ -3473,6 +3379,7 @@ function buildCoserPictureCollections(works: WorkSummary[]) {
 type ReadingPosition =
   | { kind: "page"; index: number }
   | { kind: "chapter"; index: number }
+  | { kind: "epub-cfi"; cfi: string }
   | { kind: "track"; assetId: number; seconds: number }
   | { kind: "image"; index: number }
   | { kind: "cover" }
@@ -3483,6 +3390,13 @@ function parseReadingPosition(value?: string | null): ReadingPosition {
   if (!value) return { kind: null };
   if (value === "cover") return { kind: "cover" };
   if (value === "start") return { kind: "start" };
+  if (value.startsWith("epubcfi:")) {
+    try {
+      return { kind: "epub-cfi", cfi: decodeURIComponent(value.slice("epubcfi:".length)) };
+    } catch {
+      return { kind: null };
+    }
+  }
   const [kind, first, second] = value.split(":");
   if (kind === "page") return { kind: "page", index: safeIndex(first) };
   if (kind === "chapter") return { kind: "chapter", index: safeIndex(first) };
@@ -3530,8 +3444,14 @@ function comicPageAspect(page: ComicPageInfo) {
   return COMIC_DEFAULT_ASPECT;
 }
 
+function comicHorizontalSlotWidthFromSize(width: number, height: number, aspect: number, zoom: number) {
+  const viewportWidth = Math.max(1, width);
+  const naturalWidth = Math.max(1, height * zoom * aspect);
+  return Math.min(viewportWidth, naturalWidth);
+}
+
 function comicHorizontalSlotWidth(stage: HTMLDivElement, aspect: number, zoom: number) {
-  return Math.max(1, stage.clientHeight * zoom * aspect);
+  return comicHorizontalSlotWidthFromSize(stage.clientWidth, stage.clientHeight, aspect, zoom);
 }
 
 function comicPageFromHorizontalScroll(stage: HTMLDivElement, pageCount: number, aspect: number, zoom: number) {
@@ -3856,26 +3776,6 @@ function isPreferredTrack(candidate: Asset, current: Asset) {
   const currentIsMp3 = current.mime.includes("mpeg") || current.path.toLowerCase().endsWith(".mp3");
   if (candidateIsMp3 !== currentIsMp3) return candidateIsMp3;
   return (candidate.size ?? Number.MAX_SAFE_INTEGER) < (current.size ?? Number.MAX_SAFE_INTEGER);
-}
-
-function applyNovelTheme(html: string, theme: NovelTheme) {
-  if (!html) return html;
-  const palette =
-    theme === "dark"
-      ? `:root{color-scheme:dark;--reader-bg:#111214;--reader-text:#eee7d8;--reader-link:#e0b66c;}`
-      : `:root{color-scheme:light;--reader-bg:#f7f2e8;--reader-text:#24211c;--reader-link:#8f4d34;}`;
-  const reset = `
-html,body{margin:0!important;min-height:0!important;height:auto!important;background:var(--reader-bg)!important;color:var(--reader-text)!important;}
-body{overflow:auto!important;}
-body>main{min-height:0!important;height:auto!important;background:var(--reader-bg)!important;}
-main,main *{box-sizing:border-box;}
-main div,main section,main article,main p{max-height:none!important;}
-main [style*="height"],main [style*="min-height"]{height:auto!important;min-height:0!important;}
-img,svg{height:auto!important;max-height:calc(100vh - 96px)!important;}
-*{page-break-before:auto!important;page-break-after:auto!important;break-before:auto!important;break-after:auto!important;}
-a{color:var(--reader-link)!important;}`;
-  const style = `<style id="reader-theme">${palette}${reset}</style>`;
-  return html.includes("</head>") ? html.replace("</head>", `${style}</head>`) : `${style}${html}`;
 }
 
 

@@ -37,6 +37,7 @@ pub async fn scan_all(state: &AppState, _enqueue_enrichment: bool) -> Result<Sca
     stats.audio = scan_audio(state).await?;
     stats.gallery = scan_gallery(state).await?;
     stats.coser_picture = scan_coser_pictures(state).await?;
+    stats.coser_picture += scan_qmediasync_coser_pictures(state, &settings::load_settings(&state.config).await?).await?;
     stats.jobs_created += 1;
     state
         .db
@@ -514,6 +515,25 @@ async fn scan_audio(state: &AppState) -> Result<usize> {
                     break;
                 }
             }
+            if let Some(cover) = audio_cover_candidate(&files, &root) {
+                let mime = mime_guess::from_path(&cover)
+                    .first_or_octet_stream()
+                    .to_string();
+                let size = std::fs::metadata(&cover).ok().map(|m| m.len() as i64);
+                state
+                    .db
+                    .upsert_asset(
+                        work_id,
+                        &path_string(&cover),
+                        &mime,
+                        "cover",
+                        None,
+                        None,
+                        size,
+                        json!({}),
+                    )
+                    .await?;
+            }
 
             for variant in seen_track_names {
                 link_tag(
@@ -790,7 +810,7 @@ async fn scan_qmediasync_comics(
     app_settings: &settings::AppSettings,
 ) -> Result<usize> {
     let mut count = 0;
-    for source in vfs::qmediasync_sources(app_settings, "comic") {
+    for source in vfs::qmediasync_scan_sources(app_settings, "comic") {
         let root = PathBuf::from(&source.root);
         if !root.exists() || !root.is_dir() {
             continue;
@@ -803,7 +823,7 @@ async fn scan_qmediasync_comics(
             .filter(|entry| entry.file_type().is_file())
         {
             let archive_path = entry.path().to_path_buf();
-            let is_strm = is_cbz_strm_file(&archive_path);
+            let is_strm = is_strm_file(&archive_path);
             if !is_strm && !extension_is(&archive_path, &["cbz"]) {
                 continue;
             }
@@ -978,11 +998,175 @@ async fn scan_qmediasync_comics(
     Ok(count)
 }
 
-fn is_cbz_strm_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase().ends_with(".cbz.strm"))
-        .unwrap_or(false)
+async fn scan_qmediasync_coser_pictures(
+    state: &AppState,
+    app_settings: &settings::AppSettings,
+) -> Result<usize> {
+    let mut count = 0;
+    for source in vfs::qmediasync_scan_sources(app_settings, "coser-picture") {
+        let root = PathBuf::from(&source.root);
+        if !root.exists() || !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(&root)
+            .min_depth(1)
+            .max_depth(source.scan_depth.clamp(1, 64))
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let archive_path = entry.path().to_path_buf();
+            let is_strm = is_strm_file(&archive_path);
+            if !is_strm && !extension_is(&archive_path, &["zip"]) {
+                continue;
+            }
+            let dir = archive_path.parent().unwrap_or(root.as_path());
+            let page_count = if is_strm {
+                0
+            } else {
+                count_cbz_pages(&archive_path).unwrap_or(0)
+            };
+            let title = archive_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| dir.file_name().and_then(|value| value.to_str()))
+                .unwrap_or("qmediasync CoserPicture")
+                .to_string();
+            let coser = dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("CoserPicture")
+                .to_string();
+            let relative = archive_path
+                .strip_prefix(&root)
+                .unwrap_or(&archive_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let archive_uri = if is_strm {
+                vfs::qms_strm_uri(&source.mount_name, &relative)
+            } else {
+                path_string(&archive_path)
+            };
+            let work_id = state
+                .db
+                .upsert_work(
+                    "coser-picture",
+                    &clean_title(&title),
+                    Some(&archive_uri),
+                    Some("CoserPicture"),
+                    Some(&relative),
+                    None,
+                    json!({
+                        "source": "qmediasync",
+                        "provider": "qmediasync",
+                        "mount_name": source.mount_name,
+                        "strm_root": path_string(&root),
+                        "page_count": page_count,
+                        "coser": coser.clone(),
+                    }),
+                )
+                .await?;
+
+            let size = std::fs::metadata(&archive_path)
+                .ok()
+                .map(|m| m.len() as i64);
+            let meta = if is_strm {
+                let target_url = match vfs::read_qms_strm_url(&archive_path) {
+                    Ok(target_url) => target_url,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %archive_path.to_string_lossy(),
+                            error = %err,
+                            "skipping invalid qmediasync CoserPicture STRM file"
+                        );
+                        continue;
+                    }
+                };
+                vfs::qms_strm_meta_json(
+                    &source.mount_name,
+                    &root,
+                    &archive_path,
+                    &relative,
+                    &target_url,
+                )
+            } else {
+                json!({ "source": "qmediasync", "provider": "qmediasync", "page_count": page_count })
+            };
+            state
+                .db
+                .upsert_asset(
+                    work_id,
+                    &archive_uri,
+                    if is_strm {
+                        "application/zip"
+                    } else {
+                        "application/zip"
+                    },
+                    "archive",
+                    Some(if is_strm { "zip-strm" } else { "zip" }),
+                    None,
+                    size,
+                    meta,
+                )
+                .await?;
+
+            if let Some(cover) = find_cover_file(dir) {
+                let mime = mime_guess::from_path(&cover)
+                    .first_or_octet_stream()
+                    .to_string();
+                let size = std::fs::metadata(&cover).ok().map(|m| m.len() as i64);
+                state
+                    .db
+                    .upsert_asset(
+                        work_id,
+                        &path_string(&cover),
+                        &mime,
+                        "cover",
+                        None,
+                        None,
+                        size,
+                        json!({ "source": "qmediasync" }),
+                    )
+                    .await?;
+            }
+
+            link_tag(
+                state,
+                work_id,
+                "coser-picture",
+                "image-set",
+                "CoserPicture",
+                "qmediasync",
+            )
+            .await?;
+            link_tag(
+                state,
+                work_id,
+                "artist",
+                &normalize_key(&coser),
+                &coser,
+                "qmediasync",
+            )
+            .await?;
+            link_tag(
+                state,
+                work_id,
+                "source",
+                "qmediasync",
+                "qmediasync",
+                "qmediasync",
+            )
+            .await?;
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn is_strm_file(path: &Path) -> bool {
+    extension_is(path, &["strm"])
 }
 
 async fn link_tag(
@@ -1378,6 +1562,35 @@ fn read_audio_metadata(path: &Path, fallback_title: &str, quality: &str) -> serd
     })
 }
 
+fn audio_cover_candidate(files: &[PathBuf], root: &Path) -> Option<PathBuf> {
+    let images = files
+        .iter()
+        .filter(|p| extension_is(p, &["jpg", "jpeg", "png", "webp"]))
+        .collect::<Vec<_>>();
+    images
+        .iter()
+        .copied()
+        .find(|file| {
+            let file_name = file
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            file_name.contains("cover")
+                || file_name.contains("jacket")
+                || file_name.contains("thumb")
+                || file_name.contains("folder")
+                || file_name.contains("ジャケット")
+        })
+        .or_else(|| images.first().copied())
+        .cloned()
+        .or_else(|| find_audio_cover_near_root(root))
+}
+
+fn find_audio_cover_near_root(root: &Path) -> Option<PathBuf> {
+    root.ancestors().take(3).find_map(find_cover_file)
+}
+
 fn find_cover_file(dir: &Path) -> Option<PathBuf> {
     for name in [
         "thumb.jpg",
@@ -1533,6 +1746,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn finds_audio_cover_near_work_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_root = temp.path().join("RJ123456");
+        std::fs::create_dir_all(work_root.join("tracks")).unwrap();
+        let track = work_root.join("tracks").join("01.mp3");
+        let cover = work_root.join("thumb.jpg");
+        std::fs::write(&track, b"audio").unwrap();
+        std::fs::write(&cover, b"image").unwrap();
+
+        assert_eq!(
+            audio_cover_candidate(&[track], &work_root),
+            Some(cover)
+        );
+    }
+
     #[tokio::test]
     async fn scans_coser_picture_zip_archives() {
         let temp = tempfile::tempdir().unwrap();
@@ -1623,6 +1852,107 @@ mod tests {
             .expect("archive asset");
         assert_eq!(archive.mime, "application/zip");
         assert_eq!(archive.variant.as_deref(), Some("zip"));
+    }
+
+    #[tokio::test]
+    async fn scans_qmediasync_plain_strm_comics() {
+        let temp = tempfile::tempdir().unwrap();
+        let qms_root = temp.path().join("qms");
+        let work_dir = qms_root.join("Remote Book");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("book.strm"), "https://example.test/book.cbz\n").unwrap();
+        std::fs::write(
+            work_dir.join("ComicInfo.xml"),
+            "<ComicInfo><Series>Remote Book</Series><PageCount>12</PageCount><Penciller>Artist A</Penciller></ComicInfo>",
+        )
+        .unwrap();
+        std::fs::write(work_dir.join("thumb.jpg"), b"cover").unwrap();
+
+        let data_dir = temp.path().join("data");
+        let generated_dir = temp.path().join("generated");
+        let db_path = data_dir.join("library.sqlite");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&generated_dir).unwrap();
+        let database_url = format!("sqlite://{}", path_string(&db_path));
+        let db = Db::connect(&database_url).await.unwrap();
+        db.migrate().await.unwrap();
+        let config = Config {
+            bind: "127.0.0.1:0".to_string(),
+            database_url,
+            data_dir,
+            cover_cache_dir: temp.path().join("cover-cache"),
+            comic_cover_cache_dir: temp.path().join("cover-cache").join("comic"),
+            novel_cover_cache_dir: temp.path().join("cover-cache").join("novel"),
+            audio_cover_cache_dir: temp.path().join("cover-cache").join("audio"),
+            gallery_cover_cache_dir: temp.path().join("cover-cache").join("gallery"),
+            coser_picture_cover_cache_dir: temp
+                .path()
+                .join("cover-cache")
+                .join("coser-picture"),
+            comics_dir: temp.path().join("comics"),
+            novels_dir: temp.path().join("novels"),
+            audio_dir: temp.path().join("audio"),
+            gallery_dir: temp.path().join("gallery"),
+            coser_picture_dir: temp.path().join("coser-picture"),
+            generated_dir,
+            app_admin_password: "admin".to_string(),
+            lightnovel_api_bases: Vec::new(),
+            lightnovel_access_token: None,
+            enrichment_concurrency: 1,
+            ehtt_url: String::new(),
+            openai_api_key: None,
+            openai_image_model: "gpt-image-2".to_string(),
+            qmediasync_base_url: String::new(),
+            session_secret: "test-secret".to_string(),
+            enable_file_watcher: false,
+            watch_debounce_seconds: 20,
+        };
+        let mut app_settings = settings::AppSettings::defaults(&config);
+        app_settings.qmediasync.enabled = true;
+        app_settings
+            .qmediasync
+            .strm_roots
+            .push(path_string(&qms_root));
+        let state = AppState {
+            config,
+            db,
+            http: reqwest::Client::new(),
+            comic_page_cache: Arc::new(assets::ComicPageCache::default()),
+        };
+
+        let count = scan_qmediasync_comics(&state, &app_settings).await.unwrap();
+        assert_eq!(count, 1);
+
+        let library = state.db.library().await.unwrap();
+        let work = library
+            .works
+            .iter()
+            .find(|work| work.kind == "comic")
+            .expect("comic work");
+        assert_eq!(work.title, "Remote Book");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&work.meta_json)
+                .unwrap()
+                .get("page_count")
+                .and_then(|value| value.as_i64()),
+            Some(12)
+        );
+        assert!(work
+            .tag_keys
+            .as_deref()
+            .unwrap_or_default()
+            .contains("artist:artist a"));
+
+        let detail = state.db.work_detail(work.id).await.unwrap();
+        let archive = detail
+            .assets
+            .iter()
+            .find(|asset| asset.role == "archive")
+            .expect("archive asset");
+        assert_eq!(archive.path, "qms-strm://qms/Remote Book/book.strm");
+        assert_eq!(archive.mime, "application/vnd.comicbook+zip");
+        assert_eq!(archive.variant.as_deref(), Some("cbz-strm"));
+        assert!(detail.assets.iter().any(|asset| asset.role == "cover"));
     }
 
     fn write_test_zip(path: &Path, entries: &[&str]) {

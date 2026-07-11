@@ -1,7 +1,7 @@
 {
   "name": "local-media-shelf-frontend",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
@@ -9,6 +9,8 @@
     "preview": "vite preview --host 127.0.0.1 --port 4173"
   },
   "dependencies": {
+    "@zip.js/zip.js": "^2.8.26",
+    "foliate-js": "git+https://github.com/readest/foliate-js.git#ba57ec8a3f01be5533c1302c5edd3dab3d1b9147",
     "lucide-react": "^0.556.0",
     "motion": "^12.40.0",
     "react": "^19.2.7",

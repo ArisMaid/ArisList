@@ -412,7 +412,7 @@ button {
 }
 
 .app-shell[data-material="liquid"] .reader.reader-novel {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .app-shell[data-material="liquid"] .reader > .comic-stage,
@@ -423,8 +423,9 @@ button {
   min-height: 0;
 }
 
-.app-shell[data-material="liquid"] .reader > .novel-stage {
-  grid-row: 2;
+.app-shell[data-material="liquid"] .reader > .novel-reader-shell,
+.app-shell[data-material="liquid"] .reader > .legacy-novel-shell {
+  grid-row: 1;
   min-height: 0;
 }
 
@@ -1990,6 +1991,27 @@ button {
   padding: 0;
 }
 
+body.reader-open .virtual-shelf,
+body.reader-open .tag-list,
+body.reader-open .detail-content {
+  scrollbar-width: none;
+}
+
+html.reader-open,
+body.reader-open {
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+html.reader-open::-webkit-scrollbar,
+body.reader-open::-webkit-scrollbar,
+body.reader-open .virtual-shelf::-webkit-scrollbar,
+body.reader-open .tag-list::-webkit-scrollbar,
+body.reader-open .detail-content::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
 .reader {
   position: relative;
   display: grid;
@@ -2202,6 +2224,835 @@ button {
   background: #f7f2e8;
 }
 
+.novel-reader-shell {
+  --novel-bg: #f4efe6;
+  --novel-page: #f8f4eb;
+  --novel-surface: #fffdf8;
+  --novel-surface-2: #f0e9dd;
+  --novel-sidebar-bg: #f7f1e8;
+  --novel-panel: #fffdfa;
+  --novel-text: #26221b;
+  --novel-muted: #746b5d;
+  --novel-faint: #9a9081;
+  --novel-line: rgba(68, 58, 42, 0.14);
+  --novel-accent: #2f8f86;
+  --novel-accent-strong: #1f756f;
+  --novel-accent-soft: rgba(47, 143, 134, 0.12);
+  --novel-gold: #946a2d;
+  --novel-shadow: 0 18px 52px rgba(72, 55, 31, 0.16);
+  --novel-control-bg: rgba(255, 253, 248, 0.88);
+  --novel-scrollbar: rgba(74, 63, 46, 0.28);
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(264px, 316px) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--novel-bg);
+  color: var(--novel-text);
+  overflow: hidden;
+  transition: grid-template-columns 0.22s ease;
+}
+
+.novel-reader-shell[data-sidebar="closed"] {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.novel-reader-shell[data-theme="dark"] {
+  --novel-bg: #151719;
+  --novel-page: #111316;
+  --novel-surface: #1d2023;
+  --novel-surface-2: #25292d;
+  --novel-sidebar-bg: #191c1f;
+  --novel-panel: #1f2226;
+  --novel-text: #ede7dc;
+  --novel-muted: #b8afa2;
+  --novel-faint: #847c72;
+  --novel-line: rgba(237, 231, 220, 0.12);
+  --novel-accent: #62c7bd;
+  --novel-accent-strong: #8edfd7;
+  --novel-accent-soft: rgba(98, 199, 189, 0.15);
+  --novel-gold: #e0b66c;
+  --novel-shadow: 0 18px 56px rgba(0, 0, 0, 0.34);
+  --novel-control-bg: rgba(29, 32, 35, 0.9);
+  --novel-scrollbar: rgba(237, 231, 220, 0.22);
+}
+
+.novel-reader-shell[data-theme="sepia"] {
+  --novel-bg: #ead9bf;
+  --novel-page: #f2e5cf;
+  --novel-surface: #fbefda;
+  --novel-surface-2: #ead7ba;
+  --novel-sidebar-bg: #f1dfc5;
+  --novel-panel: #fff3df;
+  --novel-text: #2d2418;
+  --novel-muted: #73604a;
+  --novel-faint: #998672;
+  --novel-line: rgba(82, 55, 28, 0.16);
+  --novel-accent: #327f77;
+  --novel-accent-strong: #236962;
+  --novel-accent-soft: rgba(50, 127, 119, 0.13);
+  --novel-gold: #9a6230;
+  --novel-shadow: 0 18px 52px rgba(86, 56, 24, 0.16);
+  --novel-control-bg: rgba(255, 243, 223, 0.9);
+  --novel-scrollbar: rgba(82, 55, 28, 0.26);
+}
+
+.novel-sidebar {
+  position: relative;
+  z-index: 6;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--novel-line);
+  background: var(--novel-sidebar-bg);
+  overflow: hidden;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.novel-reader-shell[data-sidebar="closed"] .novel-sidebar {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-18px);
+}
+
+.novel-sidebar-rail {
+  position: absolute;
+  top: 18px;
+  left: 16px;
+  z-index: 8;
+  box-shadow: var(--novel-shadow);
+  backdrop-filter: blur(12px) saturate(1.04);
+}
+
+.novel-sidebar-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  border-bottom: 1px solid var(--novel-line);
+  padding: 14px;
+}
+
+.novel-sidebar-actions {
+  display: grid;
+  grid-auto-flow: column;
+  gap: 6px;
+  justify-self: end;
+}
+
+.novel-sidebar-current {
+  display: grid;
+  gap: 3px;
+  border-bottom: 1px solid var(--novel-line);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--novel-surface) 62%, transparent), transparent),
+    color-mix(in srgb, var(--novel-accent) 5%, transparent);
+  padding: 12px 14px;
+}
+
+.novel-sidebar-current span,
+.novel-sidebar-current b,
+.novel-sidebar-current em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-sidebar-current span {
+  color: var(--novel-faint);
+  font-size: 11px;
+  font-weight: 720;
+}
+
+.novel-sidebar-current b {
+  color: var(--novel-text);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.novel-sidebar-current em {
+  color: var(--novel-gold);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 760;
+}
+
+.novel-book-summary {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  align-items: center;
+  gap: 11px;
+}
+
+.novel-book-summary > img,
+.novel-book-summary > svg {
+  width: 54px;
+  height: 72px;
+  border: 1px solid var(--novel-line);
+  border-radius: 7px;
+  background: var(--novel-surface-2);
+  object-fit: cover;
+}
+
+.novel-book-summary > svg {
+  padding: 14px;
+  color: var(--novel-muted);
+}
+
+.novel-book-summary div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.novel-book-summary b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--novel-text);
+  font-size: 14px;
+  font-weight: 760;
+}
+
+.novel-book-summary span,
+.novel-book-summary em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--novel-muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.novel-book-summary em {
+  color: var(--novel-gold);
+  font-weight: 760;
+}
+
+.novel-sidebar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--novel-line);
+  color: var(--novel-muted);
+  font-size: 12px;
+  font-weight: 780;
+  letter-spacing: 0;
+  padding: 10px 14px;
+}
+
+.novel-sidebar-title svg {
+  color: var(--novel-gold);
+}
+
+.novel-sidebar-close,
+.novel-sidebar-rail,
+.novel-reader-close,
+.novel-setting-row button,
+.novel-search-box button,
+.novel-reading-topbar button,
+.novel-panel-sheet-head button,
+.novel-icon-link {
+  display: inline-grid;
+  place-items: center;
+  min-width: 34px;
+  height: 34px;
+  border: 1px solid var(--novel-line);
+  border-radius: 8px;
+  background: var(--novel-control-bg);
+  color: var(--novel-muted);
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.novel-setting-row button.active,
+.novel-search-box button:hover,
+.novel-reading-topbar button:hover,
+.novel-reading-topbar button.active,
+.novel-panel-sheet-head button:hover,
+.novel-sidebar-rail:hover,
+.novel-sidebar-close:hover,
+.novel-reader-close:hover,
+.novel-icon-link:hover {
+  border-color: color-mix(in srgb, var(--novel-accent) 52%, var(--novel-line));
+  background: var(--novel-accent-soft);
+  color: var(--novel-accent-strong);
+}
+
+.novel-panel {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+  scrollbar-color: var(--novel-scrollbar) transparent;
+  scrollbar-width: thin;
+}
+
+.novel-panel::-webkit-scrollbar,
+.novel-foliate-host::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.novel-panel::-webkit-scrollbar-thumb,
+.novel-foliate-host::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--novel-scrollbar);
+  background-clip: padding-box;
+}
+
+.novel-toc-panel {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+}
+
+.novel-toc-panel button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 8px;
+  align-items: center;
+  min-height: 36px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--novel-muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.novel-search-results button {
+  display: grid;
+  gap: 8px;
+  align-items: center;
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--novel-muted);
+  cursor: pointer;
+  text-align: left;
+}
+
+.novel-toc-panel button:hover,
+.novel-toc-panel button.active,
+.novel-search-results button:hover {
+  border-color: color-mix(in srgb, var(--novel-accent) 44%, transparent);
+  background: var(--novel-accent-soft);
+  color: var(--novel-text);
+}
+
+.novel-toc-panel span,
+.novel-search-results span {
+  color: var(--novel-gold);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.novel-toc-panel b,
+.novel-search-results b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.novel-toc-panel span {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+}
+
+.novel-toc-panel b {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.novel-search-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.novel-search-box {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--novel-line);
+  border-radius: 8px;
+  background: var(--novel-surface);
+  color: var(--novel-muted);
+  padding: 5px 5px 5px 10px;
+}
+
+.novel-search-box input {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--novel-text);
+  outline: 0;
+}
+
+.novel-search-progress {
+  color: var(--novel-muted);
+  font-size: 12px;
+}
+
+.novel-search-progress.error {
+  color: #ffb4a8;
+}
+
+.novel-search-results {
+  display: grid;
+  gap: 8px;
+}
+
+.novel-search-results button {
+  grid-template-columns: 1fr;
+  padding: 9px 10px;
+}
+
+.novel-search-results b {
+  white-space: normal;
+  line-height: 1.45;
+}
+
+.novel-settings-panel {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+
+.novel-setting-group {
+  display: grid;
+  gap: 11px;
+  border-bottom: 1px solid var(--novel-line);
+  padding-bottom: 14px;
+}
+
+.novel-setting-group:last-child {
+  border-bottom: 0;
+  padding-bottom: 2px;
+}
+
+.novel-setting-group h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--novel-text);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.novel-setting-group h3 svg {
+  color: var(--novel-gold);
+}
+
+.novel-setting-row {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: var(--novel-muted);
+  font-size: 12px;
+}
+
+.novel-setting-row > div {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.novel-setting-row input[type="range"] {
+  flex: 1 1 150px;
+  min-width: 130px;
+  accent-color: var(--novel-accent);
+}
+
+.novel-setting-row button {
+  width: auto;
+  min-width: 44px;
+  padding: 0 10px;
+  color: var(--novel-text);
+}
+
+.novel-foliate-stage {
+  position: relative;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  isolation: isolate;
+  min-width: 0;
+  min-height: 0;
+  background: var(--novel-page);
+  overflow: hidden;
+}
+
+.novel-reading-topbar {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 20px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  pointer-events: auto;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
+}
+
+.novel-reading-topbar > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--novel-line);
+  border-radius: 8px;
+  background: var(--novel-control-bg);
+  box-shadow: var(--novel-shadow);
+  backdrop-filter: blur(12px) saturate(1.04);
+  padding: 6px;
+  pointer-events: auto;
+}
+
+.novel-edge-turn-zone {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 3;
+  width: min(14%, 220px);
+  min-width: 96px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: transparent;
+  opacity: 1;
+  padding: 0;
+  touch-action: manipulation;
+}
+
+.novel-edge-turn-zone-left {
+  left: 0;
+  cursor: w-resize;
+}
+
+.novel-edge-turn-zone-right {
+  right: 0;
+  cursor: e-resize;
+}
+
+.novel-edge-turn-zone:focus-visible {
+  outline: none;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--novel-accent) 10%, transparent), transparent);
+}
+
+.novel-edge-turn-zone-right:focus-visible {
+  background: linear-gradient(270deg, color-mix(in srgb, var(--novel-accent) 10%, transparent), transparent);
+}
+
+.novel-topbar-left {
+  max-width: min(64vw, 720px);
+}
+
+.novel-topbar-actions {
+  flex-shrink: 0;
+}
+
+.novel-current-title {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+  padding: 0 10px 0 2px;
+}
+
+.novel-current-title span,
+.novel-current-title b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-current-title span {
+  color: var(--novel-faint);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.novel-current-title b {
+  color: var(--novel-text);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.novel-foliate-host {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.novel-foliate-host::before {
+  position: absolute;
+  top: clamp(58px, 8vh, 86px);
+  bottom: clamp(66px, 9vh, 96px);
+  left: 50%;
+  z-index: 2;
+  display: none;
+  width: 1px;
+  content: "";
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--novel-line) 78%, var(--novel-text)) 16%, color-mix(in srgb, var(--novel-line) 78%, var(--novel-text)) 84%, transparent);
+  box-shadow:
+    -18px 0 28px -26px color-mix(in srgb, var(--novel-text) 38%, transparent),
+    18px 0 28px -26px color-mix(in srgb, var(--novel-text) 38%, transparent);
+  opacity: 0.64;
+  pointer-events: none;
+  transform: translateX(-0.5px);
+}
+
+.foliate-reader-view {
+  display: block;
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  background: var(--novel-page);
+  overflow: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--novel-scrollbar) transparent;
+}
+
+.foliate-reader-view::part(container) {
+  scrollbar-width: thin;
+  scrollbar-color: var(--novel-scrollbar) transparent;
+}
+
+.foliate-reader-view::part(container)::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.foliate-reader-view::part(container)::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--novel-scrollbar);
+  background-clip: padding-box;
+}
+
+.novel-reader-shell[data-theme="dark"] .foliate-reader-view {
+  background: #111316;
+}
+
+.novel-reader-shell[data-theme="sepia"] .foliate-reader-view {
+  background: #f2e5cf;
+}
+
+.novel-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--novel-page) 74%, transparent);
+  color: var(--novel-accent);
+  pointer-events: none;
+}
+
+.novel-page-indicator {
+  position: absolute;
+  right: 18px;
+  bottom: 18px;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 64px;
+  height: 32px;
+  border: 1px solid var(--novel-line);
+  border-radius: 8px;
+  background: var(--novel-control-bg);
+  color: var(--novel-muted);
+  box-shadow: var(--novel-shadow);
+  backdrop-filter: blur(12px) saturate(1.04);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0;
+  line-height: 1;
+  padding: 0 10px;
+  pointer-events: none;
+  user-select: none;
+}
+
+.novel-reader-shell[data-chrome="hidden"] .novel-reading-topbar {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-12px);
+}
+
+.novel-reader-shell[data-chrome="hidden"] .novel-topbar-actions {
+  pointer-events: none;
+}
+
+.novel-reader-shell[data-page-mode="double"][data-flow="paginated"] .novel-foliate-stage {
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--novel-page) 92%, var(--novel-surface-2)) 0 49.94%, color-mix(in srgb, var(--novel-line) 34%, transparent) 50%, color-mix(in srgb, var(--novel-page) 92%, var(--novel-surface-2)) 50.06% 100%);
+}
+
+.novel-reader-shell[data-page-mode="double"][data-flow="paginated"] .novel-foliate-host::before {
+  display: block;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .novel-reader-shell .novel-foliate-host,
+  .novel-reading-topbar {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+.novel-mobile-sidebar-backdrop {
+  display: none;
+}
+
+.novel-panel-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+}
+
+.novel-panel-backdrop {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: rgba(35, 30, 22, 0.08);
+  cursor: default;
+  padding: 0;
+  pointer-events: auto;
+}
+
+.novel-panel-sheet {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(396px, calc(100vw - 28px));
+  min-width: 0;
+  border: 0;
+  border-left: 1px solid var(--novel-line);
+  background: var(--novel-panel);
+  box-shadow: var(--novel-shadow);
+  color: var(--novel-text);
+  pointer-events: auto;
+}
+
+.novel-panel-sheet-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--novel-line);
+  padding: 14px;
+}
+
+.novel-panel-sheet-head div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.novel-panel-sheet-head span,
+.novel-panel-sheet-head b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.novel-panel-sheet-head span {
+  color: var(--novel-text);
+  font-size: 14px;
+  font-weight: 780;
+}
+
+.novel-panel-sheet-head b {
+  color: var(--novel-muted);
+  font-size: 12px;
+  font-weight: 560;
+}
+
+.legacy-novel-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  background: #101114;
+}
+
+.legacy-novel-toolbar {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 54px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  padding: 8px 10px;
+}
+
+.legacy-novel-toolbar span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.legacy-novel-toolbar > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.legacy-novel-stage .reader-error {
+  margin-bottom: 8px;
+}
+
+.legacy-novel-actions {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  gap: 7px;
+}
+
 .novel-cover-page {
   display: grid;
   place-items: center;
@@ -2227,6 +3078,16 @@ button {
   background: rgba(236, 122, 103, 0.12);
   color: #ffd8d2;
   padding: 12px 14px;
+}
+
+.archive-reader-error {
+  position: absolute;
+  inset: auto 24px 24px 24px;
+  z-index: 3;
+  max-width: min(720px, calc(100% - 48px));
+  margin: 0 auto;
+  background: rgba(35, 18, 17, 0.88);
+  box-shadow: 0 18px 56px rgba(0, 0, 0, 0.28);
 }
 
 .audio-stage {
@@ -3966,18 +4827,19 @@ button {
   }
 }
 
-/* Novel reader: no immersive chrome; keep navigation visible and make the reading pane calmer. */
+/* Novel reader: NovelReader owns its chrome. */
 .reader.reader-novel {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  background: #f4efe6;
 }
 
-.reader.reader-novel .reader-bar {
-  position: relative;
-  z-index: 2;
+.reader.reader-novel > .novel-reader-shell,
+.reader.reader-novel > .legacy-novel-shell {
+  grid-row: 1;
+  min-height: 0;
 }
 
 .reader.reader-novel .novel-stage {
-  grid-template-columns: minmax(224px, 300px) minmax(0, 1fr);
   height: 100%;
   min-height: 0;
 }
@@ -4021,18 +4883,90 @@ button {
   max-height: calc(100vh - 132px);
 }
 
-.app-shell[data-material="liquid"] .reader.reader-novel .reader-bar.reader-bar-docked .reader-actions-surface > .glass-surface-content {
-  max-width: none;
-}
-
 @media (max-width: 820px) {
-  .reader.reader-novel .novel-stage {
+  .novel-reader-shell,
+  .novel-reader-shell[data-sidebar="closed"] {
     grid-template-columns: 1fr;
-    grid-template-rows: minmax(124px, 30vh) minmax(0, 1fr);
   }
 
-  .reader.reader-novel .chapter-list {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
+  .novel-sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 9;
+    width: min(86vw, 324px);
+    border-right: 1px solid var(--novel-line);
+    border-bottom: 0;
+    box-shadow: var(--novel-shadow);
+  }
+
+  .novel-reader-shell[data-sidebar="closed"] .novel-sidebar {
+    transform: translateX(-100%);
+  }
+
+  .novel-mobile-sidebar-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 7;
+    display: block;
+    border: 0;
+    background: rgba(30, 25, 18, 0.24);
+    padding: 0;
+  }
+
+  .novel-reading-topbar {
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    gap: 8px;
+  }
+
+  .novel-reading-topbar > div {
+    gap: 6px;
+    padding: 5px;
+  }
+
+  .novel-topbar-actions {
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .novel-panel-sheet {
+    top: auto;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    max-height: min(76vh, 620px);
+    border-top: 1px solid var(--novel-line);
+    border-left: 0;
+    border-radius: 8px 8px 0 0;
+  }
+
+  .novel-panel-backdrop {
+    background: rgba(30, 25, 18, 0.22);
+  }
+
+  .novel-setting-row {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+
+  .novel-page-indicator {
+    right: 10px;
+    bottom: 10px;
+    min-width: 58px;
+    height: 30px;
+    padding: 0 9px;
+  }
+}
+
+@media (max-width: 980px) {
+  .novel-reader-shell[data-page-mode="double"][data-flow="paginated"] .novel-foliate-host::before {
+    display: none;
+  }
+}
+
+@media (orientation: portrait) {
+  .novel-reader-shell[data-page-mode="double"][data-flow="paginated"] .novel-foliate-host::before {
+    display: none;
   }
 }

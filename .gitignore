@@ -16,3 +16,10 @@ qms-strm/
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+cover-cache/
+COS图/
+图库/
+漫画/
+轻小说/
+音声/
+测试strm用/
