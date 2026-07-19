@@ -19,9 +19,10 @@ import {
   Type,
   X
 } from "lucide-react";
-import { BlobReader, BlobWriter, configure, TextWriter, ZipReader, type Entry } from "@zip.js/zip.js";
+import { BlobWriter, configure, HttpReader, TextWriter, ZipReader, type Entry } from "@zip.js/zip.js";
 import { EPUB } from "foliate-js/epub.js";
-import { api, assetUrl, type EpubChapter, type WorkDetail } from "../api";
+import { api, assetUrl, assetVersion, type EpubChapter, type WorkDetail } from "../api";
+import { useProgressQueue } from "../hooks/useProgressQueue";
 
 type NovelReaderSettings = {
   theme: "paper" | "dark" | "sepia";
@@ -34,6 +35,14 @@ type NovelReaderSettings = {
   pageMode: "single" | "double";
   writingMode: "horizontal-tb" | "vertical-rl";
 };
+
+const MAX_EPUB_ENTRIES = 20_000;
+const MAX_EPUB_TEXT_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_EPUB_BLOB_ENTRY_BYTES = 64 * 1024 * 1024;
+const MAX_EPUB_ACTIVE_INFLATE_BYTES = 128 * 1024 * 1024;
+const EPUB_ABORT_SETTLE_MS = 250;
+const EPUB_ABORT_DRAIN_MS = 50;
+const EMPTY_EPUB_DOCUMENT = '<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title></title></head><body></body></html>';
 
 type NovelSearchHit = {
   cfi: string;
@@ -72,6 +81,9 @@ const defaultNovelSettings: NovelReaderSettings = {
 export function NovelReader({ canPersistProgress, detail, onClose, onProgressSaved, resumePosition }: NovelReaderProps) {
   const bookAsset = detail.assets.find((asset) => asset.role === "book" && isEpubAsset(asset));
   const bookAssetId = bookAsset?.id ?? null;
+  const bookVersion = assetVersion(bookAsset, detail.work.updated_at);
+  const coverAsset = detail.assets.find((asset) => asset.id === detail.work.cover_asset_id);
+  const coverAssetUrl = assetUrl(detail.work.cover_asset_id, assetVersion(coverAsset, detail.work.updated_at));
   const [settings, setSettings] = useState<NovelReaderSettings>(loadNovelSettings);
   const [engineError, setEngineError] = useState<string | null>(null);
   const [fallbackMode, setFallbackMode] = useState(false);
@@ -85,23 +97,24 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
   const [searchHits, setSearchHits] = useState<NovelSearchHit[]>([]);
   const [searchStatus, setSearchStatus] = useState<"idle" | "searching" | "done" | "error">("idle");
   const [searchProgress, setSearchProgress] = useState(0);
+  const { flush: flushProgress, schedule: scheduleProgress } = useProgressQueue(
+    detail.work.id,
+    canPersistProgress,
+    onProgressSaved,
+    1200
+  );
   const activeTocIndex = useMemo(() => toc.findIndex((item) => progress.label && item.label === progress.label), [progress.label, toc]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<FoliateView | null>(null);
-  const saveTimerRef = useRef<number | null>(null);
   const chromeTimerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const searchTokenRef = useRef(0);
-  const latestProgressRef = useRef<{ progress: number; position: string } | null>(null);
+  const searchIteratorRef = useRef<AsyncGenerator<FoliateSearchResult> | null>(null);
   const pendingRelocateRef = useRef<FoliateRelocateDetail | null>(null);
   const activePanelRef = useRef<typeof activePanel>(activePanel);
-  const settingsRef = useRef(settings);
+  const settingsRef = useRef<NovelReaderSettings>(settings);
   const wheelTurnRef = useRef(0);
   const pageTurnBusyRef = useRef(false);
-  const saveContextRef = useRef({ canPersistProgress, workId: detail.work.id, onProgressSaved });
-  useEffect(() => {
-    saveContextRef.current = { canPersistProgress, workId: detail.work.id, onProgressSaved };
-  }, [canPersistProgress, detail.work.id, onProgressSaved]);
 
   useEffect(() => {
     settingsRef.current = settings;
@@ -110,6 +123,26 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
   useEffect(() => {
     activePanelRef.current = activePanel;
   }, [activePanel]);
+
+  const cancelSearch = useCallback((resetUi = false) => {
+    const token = searchTokenRef.current + 1;
+    searchTokenRef.current = token;
+    const iterator = searchIteratorRef.current;
+    const view = viewRef.current;
+    view?.clearSearch?.();
+    const stopped = iterator
+      ? iterator.return(undefined).then(
+          () => view?.clearSearch?.(),
+          () => view?.clearSearch?.()
+        )
+      : Promise.resolve();
+    if (resetUi) {
+      setSearchHits([]);
+      setSearchProgress(0);
+      setSearchStatus("idle");
+    }
+    return { stopped, token };
+  }, []);
 
   const clearChromeTimer = useCallback(() => {
     if (chromeTimerRef.current !== null) {
@@ -152,41 +185,10 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
 
   const persistProgress = useCallback(
     (nextProgress: number, position: string, immediate = false) => {
-      const context = saveContextRef.current;
-      if (!context.canPersistProgress) return;
-      const safeProgress = Math.min(1, Math.max(0, nextProgress));
-      latestProgressRef.current = { progress: safeProgress, position };
-      if (saveTimerRef.current !== null) {
-        window.clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
-      const save = () => {
-        const latest = latestProgressRef.current;
-        if (!latest) return;
-        const saveContext = saveContextRef.current;
-        api
-          .updateProgress(saveContext.workId, latest.progress, latest.position)
-          .then((res) => saveContext.onProgressSaved(saveContext.workId, res.progress, res.position ?? latest.position))
-          .catch(() => {});
-      };
-      if (immediate) {
-        save();
-        return;
-      }
-      saveTimerRef.current = window.setTimeout(save, 1200);
+      scheduleProgress(nextProgress, position, immediate);
     },
-    []
+    [scheduleProgress]
   );
-
-  const flushProgress = useCallback(() => {
-    const context = saveContextRef.current;
-    if (!latestProgressRef.current || !context.canPersistProgress) return;
-    const latest = latestProgressRef.current;
-    api
-      .updateProgress(context.workId, latest.progress, latest.position)
-      .then((res) => context.onProgressSaved(context.workId, res.progress, res.position ?? latest.position))
-      .catch(() => {});
-  }, []);
 
   const turnPage = useCallback(
     (direction: "prev" | "next") => {
@@ -243,8 +245,13 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
   }, [settings]);
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
+    let sourceBook: Awaited<ReturnType<typeof openEpubBook>> | null = null;
+    let sourceView: FoliateView | null = null;
     let coverObjectUrl: string | null = null;
+    let disposed = false;
+    let closing = false;
+    let openTask: Promise<void> | null = null;
     setFallbackMode(false);
     setEngineError(null);
     setLoading(true);
@@ -252,27 +259,58 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
     setSearchHits([]);
     setSearchStatus("idle");
     setProgress({ fraction: detail.work.progress || 0, page: 0, total: 0, label: "" });
-    latestProgressRef.current = null;
     pendingRelocateRef.current = null;
+
+    const disposeFoliate = async () => {
+      if (disposed) return;
+      disposed = true;
+      await cancelSearch().stopped;
+      const view = sourceView;
+      sourceView = null;
+      if (viewRef.current === view) viewRef.current = null;
+      try {
+        view?.close?.();
+      } catch {
+        // Continue releasing the book and object URL even if the custom element failed.
+      }
+      view?.remove();
+      const openedBook = sourceBook;
+      sourceBook = null;
+      if (openedBook) await openedBook.close().catch(() => {});
+      const objectUrl = coverObjectUrl;
+      coverObjectUrl = null;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
 
     const open = async () => {
       try {
         if (!bookAssetId) throw new Error("没有找到 EPUB 文件资源");
         await import("foliate-js/view.js");
-        const file = await fetchEpubFile(bookAssetId, detail.work.title);
-        const sourceBook = await openEpubBook(file);
-        if (cancelled) return;
+        if (controller.signal.aborted) return;
+        // Validate server-side ZIP/chapter budgets before zip.js materializes
+        // the ranged archive's client-side entry table.
+        await api.epubManifest(detail.work.id, controller.signal, bookVersion);
+        if (controller.signal.aborted) return;
+        const openedBook = await openEpubBook(assetUrl(bookAssetId, bookVersion), controller.signal);
+        if (controller.signal.aborted) {
+          await openedBook.close().catch(() => {});
+          return;
+        }
+        sourceBook = openedBook;
 
-        const coverBlob = await sourceBook.getCover?.().catch(() => null);
+        const coverBlob = await sourceBook.book.getCover?.().catch(() => null);
+        if (controller.signal.aborted) return;
         if (coverBlob) coverObjectUrl = URL.createObjectURL(coverBlob);
 
         const view = document.createElement("foliate-view") as FoliateView;
         view.className = "foliate-reader-view";
         containerRef.current?.replaceChildren(view);
+        sourceView = view;
         viewRef.current = view;
-        setToc(flattenToc(sourceBook.toc ?? []));
+        setToc(flattenToc(sourceBook.book.toc ?? []));
 
         view.addEventListener("load", (event) => {
+          if (closing) return;
           const detail = (event as CustomEvent<{ doc?: Document; index?: number }>).detail;
           if (detail.doc) {
             applyDocumentSafety(detail.doc);
@@ -299,6 +337,7 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
           }
         });
         view.addEventListener("relocate", (event) => {
+          if (closing) return;
           pendingRelocateRef.current = (event as CustomEvent<FoliateRelocateDetail>).detail;
           if (rafRef.current !== null) return;
           rafRef.current = window.requestAnimationFrame(() => {
@@ -317,35 +356,56 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
           });
         });
 
-        await view.open(sourceBook);
-        applyViewSettings(view, settings);
+        await view.open(sourceBook.book);
+        if (controller.signal.aborted) return;
+        applyViewSettings(view, settingsRef.current);
         const initialTarget = initialFoliateTarget(parseNovelResumeTarget(resumePosition), detail.work.progress || 0);
         if (typeof initialTarget === "string" || typeof initialTarget === "number") {
-          await view.init({ lastLocation: initialTarget });
+          try {
+            await view.init({ lastLocation: initialTarget });
+          } catch {
+            if (controller.signal.aborted) return;
+            await view.goToFraction(Math.min(0.995, Math.max(0, detail.work.progress || 0)));
+          }
         } else {
           await view.goToFraction(initialTarget.fraction);
         }
-        if (!cancelled) setLoading(false);
+        if (!controller.signal.aborted && !closing) setLoading(false);
       } catch (error) {
-        if (cancelled) return;
+        if (controller.signal.aborted || closing) return;
+        await disposeFoliate();
+        void flushProgress();
+        if (controller.signal.aborted) return;
         setEngineError(error instanceof Error ? error.message : String(error));
         setFallbackMode(true);
         setLoading(false);
       }
     };
 
-    open();
+    openTask = open();
     return () => {
-      cancelled = true;
-      flushProgress();
-      if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
+      closing = true;
+      const view = sourceView;
+      if (view) sourceBook?.prepareForAbort();
+      controller.abort();
+      void flushProgress();
       if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
-      viewRef.current?.close?.();
-      viewRef.current?.remove();
-      viewRef.current = null;
-      if (coverObjectUrl) URL.revokeObjectURL(coverObjectUrl);
+      if (!view || !openTask) {
+        void disposeFoliate();
+        return;
+      }
+      // Foliate logs an expected section-load failure if its ZIP signal is
+      // aborted while init() is still awaiting the current section. Detach
+      // immediately, let the soft-abort fallback drain that promise, and only
+      // then destroy the renderer and release the archive.
+      view.remove();
+      void (async () => {
+        await Promise.race([openTask!.catch(() => {}), waitForTimeout(EPUB_ABORT_SETTLE_MS)]);
+        await waitForTimeout(EPUB_ABORT_DRAIN_MS);
+        await disposeFoliate();
+      })();
     };
-  }, [bookAssetId, detail.work.id, detail.work.title, flushProgress, handleWheelTurn, persistProgress, revealChrome, tryEdgePageTurn]);
+  }, [bookAssetId, bookVersion, cancelSearch, detail.work.id, detail.work.title, flushProgress, handleWheelTurn, persistProgress, revealChrome, tryEdgePageTurn]);
 
   useEffect(() => {
     if (!viewRef.current) return;
@@ -382,45 +442,66 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
   };
 
   const closeReader = () => {
+    cancelSearch();
     flushProgress();
     onClose();
   };
 
   const openFloatingPanel = (panel: "search" | "settings") => {
     revealChrome(false);
+    if (activePanelRef.current === "search") cancelSearch(true);
     setActivePanel((value) => (value === panel ? null : panel));
+  };
+
+  const closeFloatingPanel = () => {
+    if (activePanelRef.current === "search") cancelSearch(true);
+    setActivePanel(null);
   };
 
   const runSearch = async (term: string) => {
     const trimmed = term.trim();
+    const cancellation = cancelSearch();
     setSearchTerm(term);
     setSearchHits([]);
     setSearchProgress(0);
-    viewRef.current?.clearSearch?.();
-    const token = searchTokenRef.current + 1;
-    searchTokenRef.current = token;
     if (!trimmed) {
       setSearchStatus("idle");
       return;
     }
+    await cancellation.stopped;
+    const token = cancellation.token;
+    if (searchTokenRef.current !== token) return;
     const view = viewRef.current;
-    if (!view) return;
+    if (!view) {
+      setSearchStatus("idle");
+      return;
+    }
     setSearchStatus("searching");
+    const iterator = view.search({ query: trimmed });
+    searchIteratorRef.current = iterator;
     try {
       const hits: NovelSearchHit[] = [];
-      for await (const result of view.search({ query: trimmed })) {
+      while (hits.length < 120) {
+        const step = await iterator.next();
         if (searchTokenRef.current !== token) return;
+        if (step.done) break;
+        const result = step.value;
         if (result === "done") break;
         if ("progress" in result) {
           setSearchProgress(Math.round(result.progress * 100));
         } else if ("subitems" in result) {
           for (const item of result.subitems) {
+            if (hits.length >= 120) break;
             hits.push({ cfi: item.cfi, label: result.label || "正文", excerpt: formatSearchExcerpt(item.excerpt) });
           }
-          setSearchHits(hits.slice(0, 120));
+          setSearchHits([...hits]);
         } else if ("cfi" in result) {
           hits.push({ cfi: result.cfi, label: "正文", excerpt: formatSearchExcerpt(result.excerpt) });
-          setSearchHits(hits.slice(0, 120));
+          setSearchHits([...hits]);
+        }
+        if (hits.length >= 120) {
+          await iterator.return(undefined).catch(() => {});
+          break;
         }
       }
       if (searchTokenRef.current === token) {
@@ -429,6 +510,9 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
       }
     } catch {
       if (searchTokenRef.current === token) setSearchStatus("error");
+    } finally {
+      await iterator.return(undefined).catch(() => {});
+      if (searchIteratorRef.current === iterator) searchIteratorRef.current = null;
     }
   };
 
@@ -453,6 +537,7 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
         onClose={closeReader}
         onProgressSaved={onProgressSaved}
         resumePosition={resumePosition}
+        scheduleProgress={scheduleProgress}
       />
     );
   }
@@ -485,7 +570,7 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
             key={`${hit.cfi}-${index}`}
             onClick={() => {
               revealChrome();
-              setActivePanel(null);
+              closeFloatingPanel();
               void viewRef.current?.goTo(hit.cfi);
             }}
           >
@@ -587,7 +672,7 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
       <aside className="novel-sidebar" aria-label="小说目录">
         <div className="novel-sidebar-head">
           <div className="novel-book-summary">
-            {detail.work.cover_asset_id ? <img src={assetUrl(detail.work.cover_asset_id)} alt="" /> : <BookOpen size={24} />}
+            {detail.work.cover_asset_id ? <img src={coverAssetUrl} alt="" /> : <BookOpen size={24} />}
             <div>
               <b>{detail.work.title}</b>
               {detail.work.subtitle ? <span>{detail.work.subtitle}</span> : null}
@@ -675,7 +760,7 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
               <Settings size={16} />
             </button>
             {bookAsset && (
-              <a className="novel-icon-link" href={assetUrl(bookAsset.id)} target="_blank" rel="noreferrer" aria-label="下载 EPUB" title="下载 EPUB">
+              <a className="novel-icon-link" href={assetUrl(bookAsset.id, bookVersion)} target="_blank" rel="noreferrer" aria-label="下载 EPUB" title="下载 EPUB">
                 <Download size={16} />
               </a>
             )}
@@ -691,14 +776,14 @@ export function NovelReader({ canPersistProgress, detail, onClose, onProgressSav
       </main>
       {activePanel && (
         <div className="novel-panel-layer">
-          <button className="novel-panel-backdrop" onClick={() => setActivePanel(null)} aria-label="关闭面板" />
+          <button className="novel-panel-backdrop" onClick={closeFloatingPanel} aria-label="关闭面板" />
           <section className="novel-panel-sheet" role="dialog" aria-label={activePanel === "search" ? "书内搜索" : "阅读设置"}>
             <div className="novel-panel-sheet-head">
               <div>
                 <span>{activePanel === "search" ? "书内搜索" : "阅读设置"}</span>
                 <b>{activePanel === "search" ? "在当前 EPUB 中查找正文" : "字体、布局和颜色"}</b>
               </div>
-              <button onClick={() => setActivePanel(null)} aria-label="关闭面板" title="关闭">
+              <button onClick={closeFloatingPanel} aria-label="关闭面板" title="关闭">
                 <X size={16} />
               </button>
             </div>
@@ -736,28 +821,47 @@ function LegacyNovelReader({
   detail,
   engineError,
   onClose,
-  onProgressSaved,
-  resumePosition
-}: NovelReaderProps & { engineError: string | null }) {
+  resumePosition,
+  scheduleProgress
+}: NovelReaderProps & {
+  engineError: string | null;
+  scheduleProgress: (progress: number, position: string, immediate?: boolean, keepalive?: boolean) => void;
+}) {
   const [chapters, setChapters] = useState<EpubChapter[]>([]);
   const [chapter, setChapter] = useState(0);
   const [showCover, setShowCover] = useState(Boolean(detail.work.cover_asset_id));
   const [chapterHtml, setChapterHtml] = useState("");
   const [theme, setTheme] = useState<"paper" | "dark">("paper");
-  const [error, setError] = useState<string | null>(engineError);
+  const [error, setError] = useState<string | null>(null);
+  const bookAsset = detail.assets.find((asset) => asset.role === "book" && isEpubAsset(asset));
+  const bookVersion = assetVersion(bookAsset, detail.work.updated_at);
+  const coverAsset = detail.assets.find((asset) => asset.id === detail.work.cover_asset_id);
+  const coverAssetUrl = assetUrl(detail.work.cover_asset_id, assetVersion(coverAsset, detail.work.updated_at));
   const resumeTarget = useMemo(() => parseNovelResumeTarget(resumePosition), [resumePosition]);
   const appliedRef = useRef(false);
+  const suppressNextProgressRef = useRef(false);
 
   useEffect(() => {
+    const controller = new AbortController();
+    setError(null);
     api
-      .epubManifest(detail.work.id)
-      .then((res) => setChapters(res.chapters))
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [detail.work.id]);
+      .epubManifest(detail.work.id, controller.signal, bookVersion)
+      .then((res) => {
+        setChapters(res.chapters);
+        setError(null);
+      })
+      .catch((err) => {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => controller.abort();
+  }, [bookVersion, detail.work.id]);
 
   useEffect(() => {
     if (chapters.length === 0 || appliedRef.current) return;
     if (resumeTarget.kind === "cover") {
+      suppressNextProgressRef.current = true;
       setShowCover(Boolean(detail.work.cover_asset_id));
     } else {
       const target =
@@ -765,7 +869,8 @@ function LegacyNovelReader({
           ? resumeTarget.index
           : resumeTarget.kind === "start"
             ? 0
-            : Math.floor((detail.work.progress || 0) * Math.max(0, chapters.length - 1));
+             : Math.floor((detail.work.progress || 0) * Math.max(0, chapters.length - 1));
+      suppressNextProgressRef.current = resumeTarget.kind !== null;
       setShowCover(false);
       setChapter(Math.min(Math.max(target, 0), Math.max(0, chapters.length - 1)));
     }
@@ -774,22 +879,33 @@ function LegacyNovelReader({
 
   useEffect(() => {
     if (showCover || chapters.length === 0) return;
+    const controller = new AbortController();
     setChapterHtml("");
+    setError(null);
     api
-      .epubChapterHtml(detail.work.id, chapter)
-      .then(setChapterHtml)
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [chapter, chapters.length, detail.work.id, showCover]);
+      .epubChapterHtml(detail.work.id, chapter, controller.signal, bookVersion)
+      .then((html) => {
+        setChapterHtml(html);
+        setError(null);
+      })
+      .catch((err) => {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => controller.abort();
+  }, [bookVersion, chapter, chapters.length, detail.work.id, showCover]);
 
   useEffect(() => {
     if (!canPersistProgress || chapters.length === 0 || !appliedRef.current) return;
+    if (suppressNextProgressRef.current) {
+      suppressNextProgressRef.current = false;
+      return;
+    }
     const progress = showCover ? 0 : (chapter + 1) / chapters.length;
     const position = showCover ? "cover" : `chapter:${chapter}`;
-    api
-      .updateProgress(detail.work.id, progress, position)
-      .then((res) => onProgressSaved(detail.work.id, res.progress, res.position ?? position))
-      .catch(() => {});
-  }, [canPersistProgress, chapter, chapters.length, detail.work.id, onProgressSaved, showCover]);
+    scheduleProgress(progress, position);
+  }, [canPersistProgress, chapter, chapters.length, scheduleProgress, showCover]);
 
   const moveChapter = (offset: number) => {
     if (showCover && offset > 0) {
@@ -805,8 +921,6 @@ function LegacyNovelReader({
     setChapter((value) => Math.min(Math.max(value + offset, 0), Math.max(0, chapters.length - 1)));
   };
 
-  const bookAsset = detail.assets.find((asset) => asset.role === "book" && isEpubAsset(asset));
-
   return (
     <div className="legacy-novel-shell">
       <div className="legacy-novel-toolbar">
@@ -816,7 +930,7 @@ function LegacyNovelReader({
         <span>{detail.work.title}</span>
         <div>
           {bookAsset && (
-            <a className="icon-btn" href={assetUrl(bookAsset.id)} target="_blank" rel="noreferrer" aria-label="下载 EPUB" title="下载 EPUB">
+            <a className="icon-btn" href={assetUrl(bookAsset.id, bookVersion)} target="_blank" rel="noreferrer" aria-label="下载 EPUB" title="下载 EPUB">
               <Download size={16} />
             </a>
           )}
@@ -855,7 +969,7 @@ function LegacyNovelReader({
             <div className="reader-error">{error}</div>
           ) : showCover && detail.work.cover_asset_id ? (
             <div className="novel-cover-page">
-              <img src={assetUrl(detail.work.cover_asset_id)} alt="" />
+              <img src={coverAssetUrl} alt="" />
             </div>
           ) : chapterHtml ? (
             <iframe title={chapters[chapter]?.title ?? detail.work.title} sandbox="" srcDoc={applyLegacyNovelTheme(chapterHtml, theme)} />
@@ -868,37 +982,99 @@ function LegacyNovelReader({
   );
 }
 
-async function fetchEpubFile(assetId: number, title: string) {
-  const res = await fetch(assetUrl(assetId), { credentials: "same-origin" });
-  if (!res.ok) throw new Error(`EPUB 下载失败：${res.status} ${res.statusText}`);
-  const blob = await res.blob();
-  return new File([blob], `${sanitizeFileName(title) || "book"}.epub`, { type: "application/epub+zip" });
+async function openEpubBook(url: string, signal: AbortSignal) {
+  configure({ useWebWorkers: true });
+  let softAbort = false;
+  const reader = new ZipReader(
+    new HttpReader(url, {
+      useRangeHeader: true,
+      forceRangeRequests: true,
+      combineSizeEocd: true,
+      preventHeadRequest: true
+    }),
+    { signal }
+  );
+  try {
+    const entries = await reader.getEntries();
+    if (entries.length > MAX_EPUB_ENTRIES) {
+      throw new Error(`EPUB 条目过多（${entries.length}），上限为 ${MAX_EPUB_ENTRIES}`);
+    }
+    const map = new Map(entries.map((entry) => [entry.filename, entry]));
+    const lowerMap = new Map<string, Entry | null>();
+    for (const entry of entries) {
+      const key = entry.filename.toLowerCase();
+      lowerMap.set(key, lowerMap.has(key) ? null : entry);
+    }
+    const getEntry = (name: string) => map.get(name) ?? lowerMap.get(name.toLowerCase()) ?? null;
+    let activeInflateBytes = 0;
+    const extractWithBudget = async <T,>(entry: Entry, perEntryLimit: number, extract: () => Promise<T | undefined>) => {
+      const size = entry.uncompressedSize;
+      if (!Number.isSafeInteger(size) || size < 0 || size > perEntryLimit) {
+        throw new Error(`EPUB 条目 ${entry.filename} 解压后大小 ${size} 超过安全上限 ${perEntryLimit}`);
+      }
+      if (activeInflateBytes + size > MAX_EPUB_ACTIVE_INFLATE_BYTES) {
+        throw new Error("EPUB 同时解压的数据量超过安全上限，请稍后重试");
+      }
+      activeInflateBytes += size;
+      try {
+        return await extract();
+      } finally {
+        activeInflateBytes -= size;
+      }
+    };
+    const loader = {
+      entries,
+      loadText: async (name: string) => {
+        try {
+          const entry = getEntry(name);
+          return entry && !entry.directory
+            ? (await extractWithBudget(entry, MAX_EPUB_TEXT_ENTRY_BYTES, () => entry.getData?.(new TextWriter(), { signal }))) ?? null
+            : null;
+        } catch (error) {
+          if (softAbort && signal.aborted) return abortedEpubText(name);
+          throw error;
+        }
+      },
+      loadBlob: async (name: string, type?: string) => {
+        try {
+          const entry = getEntry(name);
+          return entry && !entry.directory
+            ? (await extractWithBudget(entry, MAX_EPUB_BLOB_ENTRY_BYTES, () => entry.getData?.(new BlobWriter(type), { signal }))) ?? null
+            : null;
+        } catch (error) {
+          if (softAbort && signal.aborted) return abortedEpubBlob(name, type);
+          throw error;
+        }
+      },
+      getSize: (name: string) => getEntry(name)?.uncompressedSize ?? 0
+    };
+    const book = await new EPUB(loader).init();
+    return {
+      book,
+      close: () => reader.close(),
+      prepareForAbort: () => {
+        softAbort = true;
+      }
+    };
+  } catch (error) {
+    await reader.close().catch(() => {});
+    throw error;
+  }
 }
 
-async function openEpubBook(file: File) {
-  configure({ useWebWorkers: false });
-  const reader = new ZipReader(new BlobReader(file));
-  const entries = await reader.getEntries();
-  const map = new Map(entries.map((entry) => [entry.filename, entry]));
-  const lowerMap = new Map<string, Entry | null>();
-  for (const entry of entries) {
-    const key = entry.filename.toLowerCase();
-    lowerMap.set(key, lowerMap.has(key) ? null : entry);
-  }
-  const getEntry = (name: string) => map.get(name) ?? lowerMap.get(name.toLowerCase()) ?? null;
-  const loader = {
-    entries,
-    loadText: async (name: string) => {
-      const entry = getEntry(name);
-      return entry && !entry.directory ? entry.getData?.(new TextWriter()) ?? null : null;
-    },
-    loadBlob: async (name: string, type?: string) => {
-      const entry = getEntry(name);
-      return entry && !entry.directory ? entry.getData?.(new BlobWriter(type)) ?? null : null;
-    },
-    getSize: (name: string) => getEntry(name)?.uncompressedSize ?? 0
-  };
-  return new EPUB(loader).init();
+function abortedEpubText(name: string) {
+  return isEpubMarkup(name) ? EMPTY_EPUB_DOCUMENT : "";
+}
+
+function abortedEpubBlob(name: string, type?: string) {
+  const markup = isEpubMarkup(name) || /(?:html|xml)/i.test(type ?? "");
+  return new Blob([markup ? EMPTY_EPUB_DOCUMENT : ""], {
+    type: type || (markup ? "application/xhtml+xml" : "application/octet-stream")
+  });
+}
+
+function isEpubMarkup(name: string) {
+  return /\.(?:xhtml?|html?|xml|opf|ncx)$/i.test(name);
 }
 
 function preparePrimaryVisualPage(body: HTMLElement) {
@@ -944,7 +1120,7 @@ function isReaderInteractiveTarget(target: EventTarget | null) {
 }
 
 async function runFoliateMove(move: () => Promise<void>) {
-  await Promise.race([move(), waitForTimeout(700)]);
+  await Promise.race([move(), waitForTimeout(1500)]);
 }
 
 function waitForTimeout(ms: number) {
@@ -1185,10 +1361,6 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 function safeIndex(value?: string) {
   const parsed = Number.parseInt(value ?? "0", 10);
   return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-}
-
-function sanitizeFileName(value: string) {
-  return value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").trim();
 }
 
 function isEpubAsset(asset: { mime?: string | null; path?: string | null }) {

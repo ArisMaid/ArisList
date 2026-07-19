@@ -19,7 +19,10 @@ services:
     # 端口映射：左侧是宿主机/NAS 端口，右侧是容器内端口。
     # 访问地址通常是 http://NAS_IP:8787/
     ports:
-      - "8787:8787"
+      - "${APP_PORT:-8787}:8787"
+
+    # 使用独立 init 进程转发信号并回收子进程，避免扫描/转码任务残留。
+    init: true
 
     # 可选 .env 文件。需要覆盖密码、qmediasync 地址等配置时，优先改 .env。
     env_file:
@@ -27,6 +30,10 @@ services:
         required: false
 
     environment:
+      # APP_BIND is public inside the container, so explicit strong credentials are required.
+      APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD:?set APP_ADMIN_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET (at least 32 random characters) in .env}
+
       # SQLite 数据库位置，保存索引、历史、阅读进度、设置等应用数据。
       DATABASE_URL: sqlite:///app/data/library.sqlite
 
@@ -44,14 +51,16 @@ services:
       # 派生文件目录，例如封面、缩略图等生成内容。
       GENERATED_DIR: /app/generated
       COVER_CACHE_DIR: /app/cover-cache
+      CLOUD_CACHE_MAX_BYTES: ${CLOUD_CACHE_MAX_BYTES:-68719476736}
+      THUMBNAIL_CACHE_MAX_BYTES_PER_DIR: ${THUMBNAIL_CACHE_MAX_BYTES_PER_DIR:-8589934592}
 
       # qmediasync 服务地址，可在 .env 中设置，例如：
       # QMEDIASYNC_BASE_URL=http://192.168.31.39:8095
       QMEDIASYNC_BASE_URL: ${QMEDIASYNC_BASE_URL:-}
 
       # NAS/Docker 部署建议关闭文件监听，新增资源后在网页里手动“重新扫描并重建索引”。
-      ENABLE_FILE_WATCHER: "false"
-      WATCH_DEBOUNCE_SECONDS: "20"
+      ENABLE_FILE_WATCHER: ${ENABLE_FILE_WATCHER:-false}
+      WATCH_DEBOUNCE_SECONDS: ${WATCH_DEBOUNCE_SECONDS:-20}
 
     volumes:
       # 本地/NAS 媒体目录挂载。
@@ -79,6 +88,24 @@ services:
 
       # 封面缓存目录：按媒体库类型分子目录保存，需要可写并持久化。
       - ./cover-cache:/app/cover-cache
+
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "3", "http://127.0.0.1:8787/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    stop_grace_period: 30s
 
     # 容器异常退出或 NAS 重启后自动恢复。
     restart: unless-stopped

@@ -13,6 +13,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY vendor ./vendor
 RUN cargo build --release -p media-shelf-server
 
 FROM mcr.microsoft.com/devcontainers/base:bookworm

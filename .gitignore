@@ -11,6 +11,7 @@ qms-strm/
 音声/
 图库/
 .env
+.codex/
 .DS_Store
 *.log
 *.tsbuildinfo

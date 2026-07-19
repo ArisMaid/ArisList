@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 
 use crate::error::{AppError, Result};
+use crate::settings;
 use crate::AppState;
 
 pub fn spawn_library_watcher(state: Arc<AppState>) {
@@ -21,31 +23,17 @@ pub fn spawn_library_watcher(state: Arc<AppState>) {
 async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
     let (tx, mut rx) = mpsc::channel(128);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-        let _ = tx.blocking_send(event);
+        let _ = tx.try_send(event);
     })
     .map_err(watch_error)?;
-
-    for root in [
-        state.config.comics_dir.as_path(),
-        state.config.novels_dir.as_path(),
-        state.config.audio_dir.as_path(),
-        state.config.gallery_dir.as_path(),
-        state.config.coser_picture_dir.as_path(),
-    ] {
-        if root.exists() {
-            watcher
-                .watch(root, RecursiveMode::Recursive)
-                .map_err(watch_error)?;
-            tracing::info!(path = %root.display(), "watching library path");
-        }
-    }
 
     let debounce = Duration::from_secs(state.config.watch_debounce_seconds.max(3));
     let mut last_event: Option<Instant> = None;
     let mut ticker = interval(Duration::from_secs(2));
+    let mut watched_roots = HashSet::new();
+    let mut watcher_enabled = false;
 
     loop {
-        let _ = &watcher;
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else {
@@ -60,8 +48,26 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
                 }
             }
             _ = ticker.tick() => {
-                if last_event.map(|instant| instant.elapsed() >= debounce).unwrap_or(false) {
-                    queue_scan(&state).await?;
+                match settings::load_settings(&state.config).await {
+                    Ok(app_settings) => {
+                        watcher_enabled = app_settings.scan.file_watcher;
+                        let roots = if watcher_enabled {
+                            app_settings.all_media_roots()
+                        } else {
+                            Vec::new()
+                        };
+                        reconcile_watched_roots(
+                            &mut watcher,
+                            &mut watched_roots,
+                            roots,
+                        );
+                    }
+                    Err(err) => tracing::warn!(error = %err, "failed to refresh watcher settings"),
+                }
+                if watcher_enabled && last_event.map(|instant| instant.elapsed() >= debounce).unwrap_or(false) {
+                    if let Err(err) = queue_scan(&state).await {
+                        tracing::warn!(error = %err, "failed to queue watcher scan");
+                    }
                     last_event = None;
                 }
             }
@@ -70,19 +76,50 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
 }
 
 async fn queue_scan(state: &AppState) -> Result<()> {
-    let id = state
+    let (id, created) = state
         .db
-        .create_job(
+        .create_job_if_absent(
             "scan-library",
             "queued",
             json!({ "source": "watcher", "enqueue_enrichment": false }),
         )
         .await?;
-    state
-        .db
-        .audit("watch.scan", "queued", json!({ "job_id": id }))
-        .await?;
+    if created {
+        state
+            .db
+            .audit("watch.scan", "queued", json!({ "job_id": id }))
+            .await?;
+    }
     Ok(())
+}
+
+fn reconcile_watched_roots(
+    watcher: &mut impl Watcher,
+    watched: &mut HashSet<PathBuf>,
+    desired: Vec<PathBuf>,
+) {
+    let desired = desired
+        .into_iter()
+        .filter(|root| root.exists() && root.is_dir())
+        .collect::<HashSet<_>>();
+
+    for root in watched.difference(&desired).cloned().collect::<Vec<_>>() {
+        if let Err(err) = watcher.unwatch(&root) {
+            tracing::warn!(path = %root.display(), error = %err, "failed to stop watching library path");
+        }
+        watched.remove(&root);
+    }
+    for root in desired.difference(watched).cloned().collect::<Vec<_>>() {
+        match watcher.watch(&root, RecursiveMode::Recursive) {
+            Ok(()) => {
+                tracing::info!(path = %root.display(), "watching library path");
+                watched.insert(root);
+            }
+            Err(err) => {
+                tracing::warn!(path = %root.display(), error = %err, "failed to watch library path")
+            }
+        }
+    }
 }
 
 fn is_media_event(event: &Event) -> bool {
@@ -92,7 +129,7 @@ fn is_media_event(event: &Event) -> bool {
     ) {
         return false;
     }
-    event.paths.iter().any(|path| is_media_path(path))
+    matches!(event.kind, EventKind::Remove(_)) || event.paths.iter().any(|path| is_media_path(path))
 }
 
 fn is_media_path(path: &Path) -> bool {
@@ -113,7 +150,11 @@ fn is_media_path(path: &Path) -> bool {
                     | "jpeg"
                     | "png"
                     | "webp"
+                    | "gif"
+                    | "avif"
+                    | "bmp"
                     | "zip"
+                    | "strm"
                     | "txt"
             )
         })
@@ -122,4 +163,36 @@ fn is_media_path(path: &Path) -> bool {
 
 fn watch_error(error: notify::Error) -> AppError {
     AppError::Other(format!("library watcher error: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_scanner_media_extensions() {
+        for name in [
+            "book.cbz",
+            "book.epub",
+            "remote.strm",
+            "image.gif",
+            "image.avif",
+            "image.bmp",
+            "audio.flac",
+        ] {
+            assert!(is_media_path(Path::new(name)), "missed {name}");
+        }
+        assert!(!is_media_path(Path::new("notes.md")));
+    }
+
+    #[test]
+    fn remove_events_trigger_reconciliation_even_without_an_extension() {
+        let event = Event {
+            kind: EventKind::Remove(notify::event::RemoveKind::Folder),
+            paths: vec![PathBuf::from("gallery/deleted-folder")],
+            attrs: Default::default(),
+        };
+
+        assert!(is_media_event(&event));
+    }
 }

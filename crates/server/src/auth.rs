@@ -9,6 +9,8 @@ use chrono::{Duration, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::atomic::Ordering;
+use tokio::io::AsyncReadExt;
 
 use crate::error::{AppError, Result};
 use crate::security::{decrypt_secret, encrypt_secret};
@@ -16,6 +18,8 @@ use crate::AppState;
 
 const SESSION_COOKIE: &str = "media_shelf_session";
 const CSRF_HEADER: &str = "x-csrf-token";
+const MAX_ADMIN_PASSWORD_BYTES: usize = 256;
+const MAX_ADMIN_PASSWORD_FILE_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
@@ -32,6 +36,7 @@ pub struct SessionClaims {
     pub user: String,
     pub csrf: String,
     pub exp: i64,
+    pub auth_epoch: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,7 +50,7 @@ pub async fn session(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SessionResponse>> {
-    match read_session(&state, &headers) {
+    match read_session(&state, &headers).await {
         Ok(claims) => Ok(Json(SessionResponse {
             authenticated: true,
             csrf: Some(claims.csrf),
@@ -63,7 +68,17 @@ pub async fn login(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Json(input): Json<LoginRequest>,
 ) -> Result<Response> {
-    if input.password != admin_password(&state).await? {
+    // Keep the credential read and epoch snapshot under one lock. Otherwise a
+    // password change between those two operations could issue a session with
+    // the new epoch after authenticating the old password.
+    let (password_matches, auth_epoch) = {
+        let auth_epoch = state.auth_epoch.read().await;
+        (
+            input.password == admin_password(&state).await?,
+            auth_epoch.clone(),
+        )
+    };
+    if !password_matches {
         state
             .db
             .audit("auth.login", "denied", json!({ "reason": "bad-password" }))
@@ -75,6 +90,7 @@ pub async fn login(
         user: "admin".to_string(),
         csrf: random_token(),
         exp: (Utc::now() + Duration::hours(12)).timestamp(),
+        auth_epoch,
     };
     let encrypted = encrypt_secret(
         &state.config.session_secret,
@@ -109,41 +125,27 @@ pub async fn change_password(
 ) -> Result<Json<serde_json::Value>> {
     require_csrf(&state, &headers, "auth.password").await?;
     let password = normalized_password(&input.password)?;
+    // A login holds the read side of this lock while reading the password and
+    // epoch. Holding the write side across publication makes the two values a
+    // single credential generation from the point of view of every login.
+    let mut auth_epoch = state.auth_epoch.write().await;
     save_admin_password(&state, &password).await?;
     state
+        .admin_password_persisted
+        .store(true, Ordering::Release);
+    *auth_epoch = random_token();
+    drop(auth_epoch);
+    // The credential has already been durably published and all old sessions
+    // invalidated. An audit sink failure must not report the password change as
+    // failed after that irreversible point.
+    if let Err(err) = state
         .db
         .audit("auth.password", "changed", json!({ "user": "admin" }))
-        .await?;
-    Ok(Json(json!({ "status": "saved" })))
-}
-
-pub async fn reset_password(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>> {
-    if !is_private_host(&headers) {
-        state
-            .db
-            .audit(
-                "auth.password-reset",
-                "denied",
-                json!({ "reason": "not-private-host" }),
-            )
-            .await?;
-        return Err(AppError::Unauthorized(
-            "password reset is only available from local or intranet access".to_string(),
-        ));
+        .await
+    {
+        tracing::warn!(error = %err, "password changed but audit logging failed");
     }
-    save_admin_password(&state, "admin").await?;
-    state
-        .db
-        .audit(
-            "auth.password-reset",
-            "reset",
-            json!({ "value": "default" }),
-        )
-        .await?;
-    Ok(Json(json!({ "status": "reset", "password": "admin" })))
+    Ok(Json(json!({ "status": "saved" })))
 }
 
 pub async fn logout(
@@ -163,7 +165,7 @@ pub async fn require_csrf(
     headers: &HeaderMap,
     action: &str,
 ) -> Result<SessionClaims> {
-    let claims = read_session(state, headers)?;
+    let claims = read_session(state, headers).await?;
     let header = headers
         .get(CSRF_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -180,7 +182,7 @@ pub async fn require_csrf(
     Ok(claims)
 }
 
-fn read_session(state: &AppState, headers: &HeaderMap) -> Result<SessionClaims> {
+async fn read_session(state: &AppState, headers: &HeaderMap) -> Result<SessionClaims> {
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -191,6 +193,11 @@ fn read_session(state: &AppState, headers: &HeaderMap) -> Result<SessionClaims> 
         .map_err(|e| AppError::Unauthorized(format!("invalid session: {e}")))?;
     if claims.exp < Utc::now().timestamp() {
         return Err(AppError::Unauthorized("session expired".to_string()));
+    }
+    if claims.auth_epoch != *state.auth_epoch.read().await {
+        return Err(AppError::Unauthorized(
+            "session was invalidated by an administrator credential change".to_string(),
+        ));
     }
     Ok(claims)
 }
@@ -203,7 +210,7 @@ fn cookie_lookup(header: &str, name: &str) -> Option<String> {
 }
 
 fn cookie_value(value: &str) -> String {
-    value.replace(';', "").replace(',', "")
+    value.replace([';', ','], "")
 }
 
 fn random_token() -> String {
@@ -214,19 +221,71 @@ fn random_token() -> String {
 
 async fn admin_password(state: &AppState) -> Result<String> {
     let path = admin_password_path(state);
-    if path.exists() {
-        let password = tokio::fs::read_to_string(path).await?;
-        let password = password.trim().to_string();
-        if !password.is_empty() {
-            return Ok(password);
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if !state.admin_password_persisted.load(Ordering::Acquire) {
+                return Ok(state.config.app_admin_password.clone());
+            }
+            return Err(AppError::Other(
+                "persisted admin password file is temporarily unavailable".to_string(),
+            ));
         }
+        Err(err) if allow_loopback_password_fallback(state) => {
+            tracing::warn!(error = %err, "using the validated in-memory admin password on loopback");
+            return Ok(state.config.app_admin_password.clone());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take(MAX_ADMIN_PASSWORD_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+    {
+        if allow_loopback_password_fallback(state) {
+            tracing::warn!(error = %err, "using the validated in-memory admin password on loopback");
+            return Ok(state.config.app_admin_password.clone());
+        }
+        return Err(err.into());
     }
-    Ok(state.config.app_admin_password.clone())
+    if bytes.len() as u64 > MAX_ADMIN_PASSWORD_FILE_BYTES {
+        return invalid_password_file(state, "admin password file is too large");
+    }
+    let password = match std::str::from_utf8(&bytes) {
+        Ok(password) => password.trim().to_string(),
+        Err(_) => return invalid_password_file(state, "admin password file is not valid UTF-8"),
+    };
+    if !password.is_empty() {
+        return Ok(password);
+    }
+    invalid_password_file(state, "admin password file is empty")
+}
+
+fn invalid_password_file(state: &AppState, reason: &str) -> Result<String> {
+    if allow_loopback_password_fallback(state) {
+        tracing::warn!(
+            reason,
+            "using the validated in-memory admin password on loopback"
+        );
+        return Ok(state.config.app_admin_password.clone());
+    }
+    Err(AppError::Other(reason.to_string()))
+}
+
+fn allow_loopback_password_fallback(state: &AppState) -> bool {
+    allow_password_fallback(
+        state.config.is_loopback_bind(),
+        state.admin_password_persisted.load(Ordering::Acquire),
+    )
+}
+
+fn allow_password_fallback(loopback: bool, persisted: bool) -> bool {
+    loopback && !persisted
 }
 
 async fn save_admin_password(state: &AppState, password: &str) -> Result<()> {
-    tokio::fs::create_dir_all(&state.config.data_dir).await?;
-    tokio::fs::write(admin_password_path(state), password).await?;
+    crate::atomic_file::write(&admin_password_path(state), password.as_bytes()).await?;
     Ok(())
 }
 
@@ -236,45 +295,43 @@ fn admin_password_path(state: &AppState) -> std::path::PathBuf {
 
 fn normalized_password(value: &str) -> Result<String> {
     let value = value.trim();
-    if value.len() < 4 {
+    if value.len() < 8 {
         return Err(AppError::BadRequest(
-            "admin password must be at least 4 characters".to_string(),
+            "admin password must be at least 8 characters".to_string(),
+        ));
+    }
+    if value.len() > MAX_ADMIN_PASSWORD_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "password must not exceed {MAX_ADMIN_PASSWORD_BYTES} bytes"
+        )));
+    }
+    if crate::config::is_weak_admin_password(value) {
+        return Err(AppError::BadRequest(
+            "admin password must not be a common, repetitive, or all-numeric password".to_string(),
         ));
     }
     Ok(value.to_string())
 }
 
-fn is_private_host(headers: &HeaderMap) -> bool {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .rsplit_once(':')
-        .map(|(host, _)| host)
-        .unwrap_or_else(|| {
-            headers
-                .get(header::HOST)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        })
-        .trim_matches(['[', ']'])
-        .to_ascii_lowercase();
-    host == "localhost"
-        || host == "host.docker.internal"
-        || host.starts_with("127.")
-        || host == "::1"
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || private_172_host(&host)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn private_172_host(host: &str) -> bool {
-    let mut parts = host.split('.');
-    if parts.next() != Some("172") {
-        return false;
+    #[test]
+    fn password_change_requires_at_least_eight_characters() {
+        assert!(normalized_password("1234567").is_err());
+        assert!(normalized_password(" 12345678 ").is_err());
+        assert_eq!(
+            normalized_password(" correct horse battery staple ").unwrap(),
+            "correct horse battery staple"
+        );
     }
-    parts
-        .next()
-        .and_then(|value| value.parse::<u8>().ok())
-        .is_some_and(|value| (16..=31).contains(&value))
+
+    #[test]
+    fn persisted_password_is_authoritative_even_on_loopback() {
+        assert!(allow_password_fallback(true, false));
+        assert!(!allow_password_fallback(true, true));
+        assert!(!allow_password_fallback(false, false));
+        assert!(!allow_password_fallback(false, true));
+    }
 }

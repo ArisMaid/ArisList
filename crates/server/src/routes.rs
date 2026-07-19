@@ -1,16 +1,19 @@
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_stream::stream;
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
 use crate::assets;
@@ -18,12 +21,32 @@ use crate::auth;
 use crate::enrich;
 use crate::error::{AppError, Result};
 use crate::models::{
-    Asset, HistoryRecord, LibraryResponse, ScanRequest, ScanResponse, Tag, WorkDetail, WorkKind,
+    Asset, HistoryRecord, LibraryResponse, ScanRequest, Tag, WorkDetail, WorkKind,
 };
-use crate::scanner;
 use crate::search;
 use crate::settings;
 use crate::AppState;
+
+static FILESYSTEM_INSPECTION_LIMIT: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(2)));
+
+async fn run_filesystem_inspection<T, F>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = FILESYSTEM_INSPECTION_LIMIT
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| AppError::Other("filesystem inspection worker closed".to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|err| AppError::Other(format!("filesystem inspection task failed: {err}")))
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -32,7 +55,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/password", patch(auth::change_password))
-        .route("/auth/password/reset", post(auth::reset_password))
         .route("/library", get(library))
         .route("/history", get(history))
         .route(
@@ -44,61 +66,113 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/cloud/status", get(cloud_status))
         .route("/cloud/qmediasync/test-strm-root", post(test_qms_strm_root))
         .route("/works/{id}", get(work_detail))
-        .route("/works/{id}/cover", get(assets::work_cover))
+        .route("/works/{id}/history", get(work_history))
+        .route(
+            "/works/{id}/cover",
+            get(assets::work_cover).head(assets::reject_expensive_head),
+        )
         .route("/works/{id}/gallery", get(gallery_assets))
         .route("/works/{id}/progress", patch(update_progress))
-        .route("/works/{id}/pages", get(assets::comic_pages))
+        .route(
+            "/works/{id}/pages",
+            get(assets::comic_pages).head(assets::reject_expensive_head),
+        )
         .route(
             "/works/{id}/pages/{page}/stream",
-            get(assets::stream_comic_page),
+            get(assets::stream_comic_page).head(assets::reject_expensive_head),
         )
-        .route("/works/{id}/epub", get(assets::epub_manifest))
+        .route(
+            "/works/{id}/epub",
+            get(assets::epub_manifest).head(assets::reject_expensive_head),
+        )
         .route(
             "/works/{id}/epub/{chapter}/html",
-            get(assets::epub_chapter_html),
+            get(assets::epub_chapter_html).head(assets::reject_expensive_head),
         )
-        .route("/works/{id}/epub/image", get(assets::stream_epub_image))
+        .route(
+            "/works/{id}/epub/image",
+            get(assets::stream_epub_image).head(assets::reject_expensive_head),
+        )
         .route("/scan", post(scan))
         .route("/enrich", post(enrich::enqueue_enrich))
         .route("/tags", get(tags))
-        .route("/assets/{id}/stream", get(assets::stream_asset))
+        .route(
+            "/assets/{id}/stream",
+            get(assets::stream_asset).head(assets::head_asset),
+        )
         .route("/assets/{id}/route", get(assets::asset_route))
-        .route("/assets/{id}/thumb", get(assets::thumb_asset))
+        .route(
+            "/assets/{id}/thumb",
+            get(assets::thumb_asset).head(assets::reject_expensive_head),
+        )
         .route("/assets/generate", post(assets::generate_asset_job))
         .route("/events", get(events))
         .with_state(state)
 }
 
-async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let dir_state = |path: &std::path::Path| {
-        json!({
-            "path": path.to_string_lossy(),
-            "exists": path.exists(),
-            "is_dir": path.is_dir(),
-        })
-    };
-    Json(json!({
+async fn health(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
+    let paths = [
+        ("comics", state.config.comics_dir.clone()),
+        ("novels", state.config.novels_dir.clone()),
+        ("audio", state.config.audio_dir.clone()),
+        ("gallery", state.config.gallery_dir.clone()),
+        ("coser_picture", state.config.coser_picture_dir.clone()),
+        ("generated", state.config.generated_dir.clone()),
+    ];
+    let media = run_filesystem_inspection(move || {
+        paths
+            .into_iter()
+            .map(|(name, path)| {
+                let metadata = std::fs::metadata(&path).ok();
+                (
+                    name.to_string(),
+                    json!({
+                        "path": path.to_string_lossy(),
+                        "exists": metadata.is_some(),
+                        "is_dir": metadata.is_some_and(|value| value.is_dir()),
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+    })
+    .await?;
+    Ok(Json(json!({
         "status": "ok",
         "mode": "single-user-private",
-        "media": {
-            "comics": dir_state(&state.config.comics_dir),
-            "novels": dir_state(&state.config.novels_dir),
-            "audio": dir_state(&state.config.audio_dir),
-            "gallery": dir_state(&state.config.gallery_dir),
-            "coser_picture": dir_state(&state.config.coser_picture_dir),
-            "generated": dir_state(&state.config.generated_dir),
-        },
+        "media": media,
         "features": {
             "file_watcher": state.config.enable_file_watcher,
             "enrichment_concurrency": state.config.enrichment_concurrency.clamp(1, 8),
             "openai_image_model": state.config.openai_image_model,
             "openai_image_configured": state.config.openai_api_key.is_some(),
         }
-    }))
+    })))
 }
 
-async fn library(State(state): State<Arc<AppState>>) -> Result<Json<LibraryResponse>> {
-    Ok(Json(state.db.library().await?))
+#[derive(Debug, Deserialize)]
+struct LibraryQuery {
+    cursor: Option<String>,
+    limit: Option<i64>,
+    include_context: Option<bool>,
+}
+
+async fn library(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LibraryQuery>,
+) -> Result<Json<LibraryResponse>> {
+    let include_context = query
+        .include_context
+        .unwrap_or_else(|| query.cursor.is_none());
+    Ok(Json(
+        state
+            .db
+            .library_page(
+                query.cursor.as_deref(),
+                query.limit.unwrap_or(100).clamp(1, 500),
+                include_context,
+            )
+            .await?,
+    ))
 }
 
 async fn work_detail(
@@ -112,6 +186,7 @@ async fn work_detail(
 struct GalleryQuery {
     cursor: Option<i64>,
     limit: Option<i64>,
+    v: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,38 +200,38 @@ async fn gallery_assets(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Query(query): Query<GalleryQuery>,
-) -> Result<Json<GalleryAssetsResponse>> {
-    let (kind, meta_json) = state.db.work_kind_and_meta(id).await?;
+) -> Result<Response> {
+    let (kind, _) = state.db.work_kind_and_meta(id).await?;
     if kind != WorkKind::Gallery.as_str() {
         return Err(AppError::BadRequest("work is not a gallery".to_string()));
     }
     let offset = query.cursor.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(120).clamp(1, 240);
-    let total_hint = serde_json::from_str::<serde_json::Value>(&meta_json)
-        .ok()
-        .and_then(|value| value.get("image_count").and_then(|count| count.as_i64()))
-        .filter(|count| *count >= 0);
-    let total = match total_hint {
-        Some(count) => count,
-        None => state.db.gallery_asset_count(id).await?,
-    };
+    let total = state.db.gallery_asset_count(id).await?;
     let items = if offset >= total {
         Vec::new()
     } else {
         state.db.gallery_assets(id, offset, limit).await?
     };
     let next = offset + items.len() as i64;
-    Ok(Json(GalleryAssetsResponse {
+    let mut response = Json(GalleryAssetsResponse {
         items,
         next_cursor: (next < total).then_some(next),
         total,
-    }))
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(assets::media_cache_control(query.v.as_deref())),
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
 struct ProgressRequest {
     progress: f64,
     position: Option<String>,
+    update_token: Option<i64>,
 }
 
 async fn update_progress(
@@ -164,21 +239,30 @@ async fn update_progress(
     Path(id): Path<i64>,
     Json(input): Json<ProgressRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    state
+    const MAX_PROGRESS_POSITION_BYTES: usize = 64 * 1024;
+    if input
+        .position
+        .as_ref()
+        .is_some_and(|position| position.len() > MAX_PROGRESS_POSITION_BYTES)
+    {
+        return Err(AppError::BadRequest(format!(
+            "progress position exceeds {MAX_PROGRESS_POSITION_BYTES} bytes"
+        )));
+    }
+    let update_token = input
+        .update_token
+        .filter(|token| *token > 0)
+        .unwrap_or_else(|| Utc::now().timestamp_micros());
+    let saved = state
         .db
-        .update_work_progress(id, input.progress, input.position.as_deref())
+        .update_work_progress(id, input.progress, input.position.as_deref(), update_token)
         .await?;
-    state
-        .db
-        .audit(
-            "works.progress",
-            "saved",
-            json!({ "work_id": id, "progress": input.progress, "position": input.position }),
-        )
-        .await?;
-    Ok(Json(
-        json!({ "status": "saved", "progress": input.progress.clamp(0.0, 1.0), "position": input.position }),
-    ))
+    Ok(Json(json!({
+        "status": if saved.accepted { "saved" } else { "stale" },
+        "accepted": saved.accepted,
+        "progress": saved.progress,
+        "position": saved.position,
+    })))
 }
 
 async fn tags(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Tag>>> {
@@ -187,6 +271,13 @@ async fn tags(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Tag>>> {
 
 async fn history(State(state): State<Arc<AppState>>) -> Result<Json<Vec<HistoryRecord>>> {
     Ok(Json(state.db.history(50).await?))
+}
+
+async fn work_history(
+    State(state): State<Arc<AppState>>,
+    Path(work_id): Path<i64>,
+) -> Result<Json<Option<HistoryRecord>>> {
+    Ok(Json(state.db.work_history(work_id).await?))
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,52 +297,58 @@ async fn test_qms_strm_root(
     if input.root.trim().is_empty() {
         return Err(AppError::BadRequest("STRM root is required".to_string()));
     }
-    if !root.exists() || !root.is_dir() {
-        return Err(AppError::BadRequest(format!(
-            "STRM root is not a readable directory: {}",
-            root.to_string_lossy()
-        )));
-    }
     let max_depth = input.scan_depth.unwrap_or(12).clamp(1, 64);
-    let mut strm_files = 0_u64;
-    let mut work_dirs = std::collections::BTreeSet::new();
-    let mut samples = Vec::new();
-    for entry in WalkDir::new(&root)
-        .min_depth(1)
-        .max_depth(max_depth)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let path = entry.path();
-        let lower = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let is_strm = lower.ends_with(".strm");
-        let is_kind_match = match input.kind.as_deref().unwrap_or("comic") {
-            "comic" => lower.ends_with(".cbz") || is_strm,
-            "coser-picture" => lower.ends_with(".zip") || is_strm,
-            _ => is_strm,
-        };
-        if !is_kind_match {
-            continue;
+    let kind = input.kind.unwrap_or_else(|| "comic".to_string());
+    let scan_root = root.clone();
+    let (strm_files, work_count, samples) = run_filesystem_inspection(move || {
+        if !scan_root.is_dir() || std::fs::read_dir(&scan_root).is_err() {
+            return Err(AppError::BadRequest(format!(
+                "STRM root is not a readable directory: {}",
+                scan_root.to_string_lossy()
+            )));
         }
-        if is_strm {
-            strm_files += 1;
+        let mut strm_files = 0_u64;
+        let mut work_dirs = std::collections::BTreeSet::new();
+        let mut samples = Vec::new();
+        for entry in WalkDir::new(&scan_root)
+            .min_depth(1)
+            .max_depth(max_depth)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+        {
+            let path = entry.path();
+            let lower = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_strm = lower.ends_with(".strm");
+            let is_kind_match = match kind.as_str() {
+                "comic" => lower.ends_with(".cbz") || is_strm,
+                "coser-picture" => lower.ends_with(".zip") || is_strm,
+                _ => is_strm,
+            };
+            if !is_kind_match {
+                continue;
+            }
+            if is_strm {
+                strm_files += 1;
+            }
+            if let Some(parent) = path.parent() {
+                work_dirs.insert(parent.to_string_lossy().to_string());
+            }
+            if samples.len() < 5 {
+                samples.push(path.to_string_lossy().to_string());
+            }
         }
-        if let Some(parent) = path.parent() {
-            work_dirs.insert(parent.to_string_lossy().to_string());
-        }
-        if samples.len() < 5 {
-            samples.push(path.to_string_lossy().to_string());
-        }
-    }
+        Ok((strm_files, work_dirs.len(), samples))
+    })
+    .await??;
     Ok(Json(json!({
         "status": "ok",
         "root": root.to_string_lossy(),
-        "works": work_dirs.len(),
+        "works": work_count,
         "strm_files": strm_files,
         "samples": samples,
     })))
@@ -260,21 +357,25 @@ async fn test_qms_strm_root(
 async fn cloud_status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let settings = settings::load_settings(&state.config).await?;
     let cache_dir = state.config.data_dir.join("cloud-cache");
-    let mut cache_bytes = 0_u64;
-    let mut cache_files = 0_u64;
-    if cache_dir.exists() {
-        for entry in WalkDir::new(&cache_dir)
-            .min_depth(1)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-        {
-            if let Ok(meta) = entry.metadata() {
-                cache_bytes += meta.len();
-                cache_files += 1;
+    let (cache_bytes, cache_files) = run_filesystem_inspection(move || {
+        let mut cache_bytes = 0_u64;
+        let mut cache_files = 0_u64;
+        if cache_dir.exists() {
+            for entry in WalkDir::new(&cache_dir)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_file())
+            {
+                if let Ok(meta) = entry.metadata() {
+                    cache_bytes = cache_bytes.saturating_add(meta.len());
+                    cache_files = cache_files.saturating_add(1);
+                }
             }
         }
-    }
+        (cache_bytes, cache_files)
+    })
+    .await?;
     Ok(Json(json!({
         "qmediasync": {
             "enabled": settings.qmediasync.enabled,
@@ -288,6 +389,7 @@ async fn cloud_status(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
         "cache": {
             "bytes": cache_bytes,
             "files": cache_files,
+            "quota_bytes": state.config.cloud_cache_max_bytes,
         }
     })))
 }
@@ -296,15 +398,32 @@ async fn scan(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(input): Json<ScanRequest>,
-) -> Result<Json<ScanResponse>> {
+) -> Result<Json<serde_json::Value>> {
     auth::require_csrf(&state, &headers, "scan").await?;
+    let configured = settings::load_settings(&state.config).await?;
+    let enqueue_enrichment = input
+        .enqueue_enrichment
+        .unwrap_or(configured.scan.enqueue_enrichment);
+    let payload = json!({ "enqueue_enrichment": enqueue_enrichment });
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent("scan-library", "queued", payload.clone())
+        .await?;
     state
         .db
-        .audit("scan", "queued", json!({ "enqueue_enrichment": false }))
+        .audit(
+            "scan",
+            if created { "queued" } else { "coalesced" },
+            json!({
+                "job_id": job_id,
+                "enqueue_enrichment": enqueue_enrichment,
+            }),
+        )
         .await?;
-    Ok(Json(
-        scanner::scan_all(&state, input.enqueue_enrichment.unwrap_or(false)).await?,
-    ))
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-queued" },
+    })))
 }
 
 async fn events(

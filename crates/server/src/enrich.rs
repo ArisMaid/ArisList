@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -9,14 +9,18 @@ use futures::{SinkExt, StreamExt};
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth;
+use crate::db::{EnrichmentExternalIdInput, EnrichmentTagInput, ScannerEnrichmentInput};
 use crate::error::{AppError, Result};
 use crate::scanner;
 use crate::search;
 use crate::AppState;
+
+static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 
 #[derive(Debug, Deserialize)]
 pub struct EnrichRequest {
@@ -58,7 +62,8 @@ pub async fn run_job(state: Arc<AppState>, id: i64, job_type: &str, payload: Val
                 .unwrap_or(true);
             scanner::scan_all(&state, enqueue).await.map(|_| ())
         }
-        "enrich-asmr-work" | "enrich-lightnovel-work" => Ok(()),
+        "enrich-asmr-work" => enrich_asmr_work(state, payload).await,
+        "enrich-lightnovel-work" => enrich_lightnovel_work(state, payload).await,
         "generate-image-asset" => generate_image_asset(state, id, payload).await,
         "rebuild-search-index" => search::rebuild_search_index(state).await.map(|_| ()),
         _ => Err(AppError::BadRequest(format!(
@@ -76,6 +81,20 @@ async fn enrich_asmr_work(state: Arc<AppState>, payload: Value) -> Result<()> {
         .get("rj")
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::BadRequest("enrich-asmr-work requires rj".to_string()))?;
+    let fingerprint = payload
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::BadRequest("enrich-asmr-work requires fingerprint".to_string()))?
+        .to_string();
+    if !state
+        .db
+        .scanner_fingerprint_matches(work_id, &fingerprint)
+        .await?
+    {
+        tracing::info!(work_id, "skipping stale ASMR enrichment job");
+        return Ok(());
+    }
+    let (_, existing_meta) = state.db.work_kind_and_meta(work_id).await?;
 
     let metadata_url = format!("https://asmr.one/api/workInfo/{rj}");
     let details_url = format!("https://asmr.one/api/work/{rj}");
@@ -108,49 +127,60 @@ async fn enrich_asmr_work(state: Arc<AppState>, payload: Value) -> Result<()> {
         )
     };
 
-    state
-        .db
-        .update_work_enrichment(
-            work_id,
-            title.as_deref(),
-            Some("Audio"),
-            description.as_deref(),
-            rating,
-            json!({
-                "rj": rj,
-                "asmr_metadata": metadata,
-                "asmr_details": details,
-                "asmr_tracks": tracks,
-                "cover_url": cover,
-                "circle": circle.clone(),
-            }),
-        )
-        .await?;
-
+    let merged_meta = merge_work_meta(
+        &existing_meta,
+        json!({
+            "rj": rj,
+            "asmr_metadata": metadata,
+            "asmr_details": details,
+            "asmr_tracks": tracks,
+            "cover_url": cover,
+            "circle": circle.clone(),
+        }),
+    );
+    let mut enrichment_tags = Vec::new();
     if let Some(circle) = circle.as_deref() {
-        link_tag(
-            &state,
-            work_id,
-            "circle",
-            &normalize_key(circle),
-            circle,
-            "asmr.one",
-        )
-        .await?;
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "circle".to_string(),
+            key: normalize_key(circle),
+            label: circle.to_string(),
+            source: "asmr.one".to_string(),
+        });
     }
     for tag in named_tags {
-        link_tag(
-            &state,
-            work_id,
-            "audio",
-            &normalize_key(&tag),
-            &tag,
-            "asmr.one",
-        )
-        .await?;
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "audio".to_string(),
+            key: normalize_key(&tag),
+            label: tag,
+            source: "asmr.one".to_string(),
+        });
     }
     for va in vas {
-        link_tag(&state, work_id, "va", &normalize_key(&va), &va, "asmr.one").await?;
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "va".to_string(),
+            key: normalize_key(&va),
+            label: va,
+            source: "asmr.one".to_string(),
+        });
+    }
+    if !state
+        .db
+        .apply_scanner_enrichment(
+            work_id,
+            &fingerprint,
+            ScannerEnrichmentInput {
+                title,
+                category: Some("Audio".to_string()),
+                description,
+                rating,
+                meta: merged_meta,
+                tags: enrichment_tags,
+                external_ids: Vec::new(),
+            },
+        )
+        .await?
+    {
+        tracing::info!(work_id, "discarded stale ASMR enrichment response");
     }
     Ok(())
 }
@@ -162,6 +192,21 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
         .ok_or_else(|| {
             AppError::BadRequest("enrich-lightnovel-work requires work_id".to_string())
         })?;
+    let fingerprint = payload
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AppError::BadRequest("enrich-lightnovel-work requires fingerprint".to_string())
+        })?
+        .to_string();
+    if !state
+        .db
+        .scanner_fingerprint_matches(work_id, &fingerprint)
+        .await?
+    {
+        tracing::info!(work_id, "skipping stale light-novel enrichment job");
+        return Ok(());
+    }
     let detail = state.db.work_detail(work_id).await?;
     let title = payload
         .get("title")
@@ -196,10 +241,7 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
     if let Some(series) = series {
         push_unique(&mut queries, series);
     }
-    if let Some(cleaned) = title
-        .split(|ch| matches!(ch, '-' | '：' | ':' | '（' | '('))
-        .next()
-    {
+    if let Some(cleaned) = title.split(['-', '：', ':', '（', '(']).next() {
         push_unique(&mut queries, cleaned);
     }
 
@@ -216,10 +258,25 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
                 }
             }),
         );
-        state
+        if !state
             .db
-            .update_work_enrichment(work_id, None, Some("Light Novel"), None, None, meta)
-            .await?;
+            .apply_scanner_enrichment(
+                work_id,
+                &fingerprint,
+                ScannerEnrichmentInput {
+                    title: None,
+                    category: Some("Light Novel".to_string()),
+                    description: None,
+                    rating: None,
+                    meta,
+                    tags: Vec::new(),
+                    external_ids: Vec::new(),
+                },
+            )
+            .await?
+        {
+            tracing::info!(work_id, "discarded stale light-novel not-found response");
+        }
         return Ok(());
     };
 
@@ -265,71 +322,64 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
             }
         }),
     );
-    state
-        .db
-        .update_work_enrichment(
-            work_id,
-            remote_title.as_deref(),
-            Some("Light Novel"),
-            description.as_deref(),
-            rating,
-            meta,
-        )
-        .await?;
-
+    let mut enrichment_tags = Vec::new();
+    let mut external_ids = Vec::new();
     if let Some(id) = remote_id.as_deref() {
-        state
-            .db
-            .upsert_external_id(
-                work_id,
-                "lightnovel",
-                id,
-                None,
-                Some(&format!("https://www.lightnovel.app/book/info/{id}")),
-            )
-            .await?;
-        link_tag(
-            &state,
-            work_id,
-            "source",
-            "lightnovel.app",
-            "LightNovel.app",
-            "lightnovel.app",
-        )
-        .await?;
+        external_ids.push(EnrichmentExternalIdInput {
+            source: "lightnovel".to_string(),
+            external_id: id.to_string(),
+            token: None,
+            url: Some(format!("https://www.lightnovel.app/book/info/{id}")),
+        });
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "source".to_string(),
+            key: "lightnovel.app".to_string(),
+            label: "LightNovel.app".to_string(),
+            source: "lightnovel.app".to_string(),
+        });
     }
     if let Some(author) = user_name.as_deref() {
-        link_tag(
-            &state,
-            work_id,
-            "artist",
-            &normalize_key(author),
-            author,
-            "lightnovel.app",
-        )
-        .await?;
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "artist".to_string(),
+            key: normalize_key(author),
+            label: author.to_string(),
+            source: "lightnovel.app".to_string(),
+        });
     }
     if let Some(series) = remote_series.as_deref().or(series) {
-        link_tag(
-            &state,
-            work_id,
-            "series",
-            &normalize_key(series),
-            series,
-            "lightnovel.app",
-        )
-        .await?;
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "series".to_string(),
+            key: normalize_key(series),
+            label: series.to_string(),
+            source: "lightnovel.app".to_string(),
+        });
     }
     for tag in tags {
-        link_tag(
-            &state,
+        enrichment_tags.push(EnrichmentTagInput {
+            namespace: "ln".to_string(),
+            key: normalize_key(&tag),
+            label: tag,
+            source: "lightnovel.app".to_string(),
+        });
+    }
+    if !state
+        .db
+        .apply_scanner_enrichment(
             work_id,
-            "ln",
-            &normalize_key(&tag),
-            &tag,
-            "lightnovel.app",
+            &fingerprint,
+            ScannerEnrichmentInput {
+                title: remote_title,
+                category: Some("Light Novel".to_string()),
+                description,
+                rating,
+                meta,
+                tags: enrichment_tags,
+                external_ids,
+            },
         )
-        .await?;
+        .await?
+    {
+        tracing::info!(work_id, "discarded stale light-novel enrichment response");
     }
     Ok(())
 }
@@ -414,32 +464,40 @@ fn extract_lightnovel_books(value: &Value) -> Vec<Value> {
 
 fn choose_lightnovel_book(books: Vec<Value>, query: &str, creator: Option<&str>) -> Option<Value> {
     let query_key = normalize_key(query);
+    if query_key.is_empty() {
+        return None;
+    }
     let creator_key = creator.map(normalize_key);
-    books.into_iter().max_by_key(|book| {
-        let title =
-            string_field(book, &["Title", "Name", "BookName", "OriginalName"]).unwrap_or_default();
-        let title_key = normalize_key(&title);
-        let mut score = 0;
-        if !query_key.is_empty() && title_key == query_key {
-            score += 100;
-        }
-        if !query_key.is_empty()
-            && (title_key.contains(&query_key) || query_key.contains(&title_key))
-        {
-            score += 50;
-        }
-        if let Some(creator_key) = creator_key.as_deref() {
-            let author = book
-                .get("User")
-                .and_then(|user| string_field(user, &["UserName", "Name"]))
-                .or_else(|| string_field(book, &["Author", "AuthorName", "Writer"]))
+    books
+        .into_iter()
+        .filter_map(|book| {
+            let title = string_field(&book, &["Title", "Name", "BookName", "OriginalName"])
                 .unwrap_or_default();
-            if normalize_key(&author).contains(creator_key) {
-                score += 20;
+            let title_key = normalize_key(&title);
+            if title_key.is_empty() {
+                return None;
             }
-        }
-        score
-    })
+            let mut score = 0;
+            if title_key == query_key {
+                score += 100;
+            }
+            if title_key.contains(&query_key) || query_key.contains(&title_key) {
+                score += 50;
+            }
+            if let Some(creator_key) = creator_key.as_deref() {
+                let author = book
+                    .get("User")
+                    .and_then(|user| string_field(user, &["UserName", "Name"]))
+                    .or_else(|| string_field(&book, &["Author", "AuthorName", "Writer"]))
+                    .unwrap_or_default();
+                if normalize_key(&author).contains(creator_key) {
+                    score += 20;
+                }
+            }
+            (score >= 50).then_some((score, book))
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, book)| book)
 }
 
 #[derive(Debug, Deserialize)]
@@ -700,11 +758,48 @@ async fn generate_image_asset(state: Arc<AppState>, job_id: i64, payload: Value)
     let variant = style.clone().unwrap_or_else(|| "ui".to_string());
     let sanitized_asset_id = payload.get("sanitized_asset_id").and_then(Value::as_i64);
     let model = state.config.openai_image_model.clone();
+    let filename = format!("generated-job-{job_id}.png");
+    let path = state.config.generated_dir.join(&filename);
+    let path_string = path.to_string_lossy().to_string();
+    let work_id = state.db.generated_assets_work().await?;
+
+    if let Some(size) = valid_png_size(&path).await? {
+        if let Some(asset_id) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM assets WHERE work_id = ?1 AND path = ?2 AND role = 'generated' LIMIT 1",
+        )
+        .bind(work_id)
+        .bind(&path_string)
+        .fetch_optional(state.db.pool())
+        .await?
+        {
+            state.db.set_work_cover(work_id, asset_id).await?;
+            return Ok(());
+        }
+        register_generated_image(
+            &state,
+            job_id,
+            work_id,
+            &path,
+            &path_string,
+            size,
+            prompt,
+            style.as_deref(),
+            &variant,
+            &model,
+            sanitized_asset_id,
+        )
+        .await?;
+        return Ok(());
+    }
+    if tokio::fs::try_exists(&path).await? {
+        tokio::fs::remove_file(&path).await?;
+    }
 
     let response: Value = state
         .http
         .post("https://api.openai.com/v1/images/generations")
         .bearer_auth(api_key)
+        .header("Idempotency-Key", format!("media-shelf-image-job-{job_id}"))
         .json(&json!({
             "model": model,
             "prompt": prompt,
@@ -730,28 +825,58 @@ async fn generate_image_asset(state: Arc<AppState>, job_id: i64, payload: Value)
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| AppError::Other(format!("image decode failed: {e}")))?;
+    if !is_png(&bytes) {
+        return Err(AppError::Other(
+            "OpenAI image response was not a valid PNG payload".to_string(),
+        ));
+    }
     let size = bytes.len() as i64;
-    let filename = format!("generated-{}.png", uuid::Uuid::new_v4());
-    let path = state.config.generated_dir.join(filename);
-    tokio::fs::write(&path, &bytes).await?;
+    atomic_write_generated_image(&path, &bytes).await?;
+    register_generated_image(
+        &state,
+        job_id,
+        work_id,
+        &path,
+        &path_string,
+        size,
+        prompt,
+        style.as_deref(),
+        &variant,
+        &model,
+        sanitized_asset_id,
+    )
+    .await
+}
 
-    let path_string = path.to_string_lossy().to_string();
-    let work_id = state.db.generated_assets_work().await?;
+#[allow(clippy::too_many_arguments)]
+async fn register_generated_image(
+    state: &AppState,
+    job_id: i64,
+    work_id: i64,
+    path: &std::path::Path,
+    path_string: &str,
+    size: i64,
+    prompt: &str,
+    style: Option<&str>,
+    variant: &str,
+    model: &str,
+    sanitized_asset_id: Option<i64>,
+) -> Result<()> {
     let asset_id = state
         .db
         .upsert_asset(
             work_id,
-            &path_string,
+            path_string,
             "image/png",
             "generated",
-            Some(&variant),
+            Some(variant),
             None,
             Some(size),
             json!({
                 "job_id": job_id,
                 "prompt": prompt,
                 "style": style,
-                "model": model.clone(),
+                "model": model,
                 "sanitized_asset_id": sanitized_asset_id,
                 "filename": path.file_name().and_then(|name| name.to_str()),
             }),
@@ -759,7 +884,7 @@ async fn generate_image_asset(state: Arc<AppState>, job_id: i64, payload: Value)
         .await?;
     state.db.set_work_cover(work_id, asset_id).await?;
     link_tag(
-        &state,
+        state,
         work_id,
         "asset",
         "generated-ui",
@@ -768,11 +893,11 @@ async fn generate_image_asset(state: Arc<AppState>, job_id: i64, payload: Value)
     )
     .await?;
     link_tag(
-        &state,
+        state,
         work_id,
         "source",
-        &normalize_key(&model),
-        &model,
+        &normalize_key(model),
+        model,
         "OpenAI",
     )
     .await?;
@@ -794,9 +919,53 @@ async fn generate_image_asset(state: Arc<AppState>, job_id: i64, payload: Value)
     Ok(())
 }
 
+fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+async fn valid_png_size(path: &std::path::Path) -> Result<Option<i64>> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let size = file.metadata().await?.len();
+    if size < 8 {
+        return Ok(None);
+    }
+    let mut signature = [0_u8; 8];
+    tokio::io::AsyncReadExt::read_exact(&mut file, &mut signature).await?;
+    Ok(is_png(&signature).then_some(size as i64))
+}
+
+async fn atomic_write_generated_image(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Other("generated image path has no parent".to_string()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temp = path.with_extension(format!("png.part-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp, path).await?;
+        Result::<()>::Ok(())
+    }
+    .await;
+    if result.is_err() && tokio::fs::try_exists(&temp).await.unwrap_or(false) {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    result
+}
+
 fn strip_html(value: &str) -> String {
-    let tag_re = Regex::new(r"<[^>]+>").unwrap();
-    html_escape::decode_html_entities(tag_re.replace_all(value, "").trim()).to_string()
+    html_escape::decode_html_entities(HTML_TAG_RE.replace_all(value, "").trim()).to_string()
 }
 
 fn translated_namespace(namespace: &str) -> Option<&'static str> {

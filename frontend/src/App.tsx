@@ -1,4 +1,5 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type UIEvent } from "react";
+﻿import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type UIEvent } from "react";
+import { lazy, Suspense } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import type { WheelEvent } from "react";
 import { createPortal } from "react-dom";
@@ -48,9 +49,10 @@ import {
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { api, assetUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
+import { api, assetUrl, assetVersion, comicPageUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
 import { GlassFilterProvider, GlassSurface } from "./components/material";
-import { NovelReader } from "./components/NovelReader";
+import { useProgressQueue } from "./hooks/useProgressQueue";
+const NovelReader = lazy(() => import("./components/NovelReader").then((module) => ({ default: module.NovelReader })));
 
 type KindFilter = "history" | "comic" | "novel" | "audio" | "gallery" | "coser-picture";
 type ViewMode = "grid" | "compact" | "list" | "cover";
@@ -73,11 +75,18 @@ type ActiveAudioState = {
   work: WorkDetail["work"];
   asset: Asset;
   playlist: Asset[];
+  resumePosition: string | null;
+  sessionId: number;
+};
+type OpenCollectionDescriptor = {
+  collectionKey: string;
+  kind: WorkSummary["kind"];
 };
 type AudioRepeatMode = "none" | "all" | "one";
 
 const COMIC_DEFAULT_ASPECT = 0.72;
 const COMIC_HORIZONTAL_OVERSCAN = 4;
+const COMIC_VERTICAL_OVERSCAN = 4;
 
 const kindLabels: Record<string, string> = {
   comic: "漫画",
@@ -147,6 +156,7 @@ export function App() {
   const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [readerOpen, setReaderOpen] = useState(false);
+  const [pendingReaderId, setPendingReaderId] = useState<number | null>(null);
   const [readerResume, setReaderResume] = useState(true);
   const [readerPositionOverride, setReaderPositionOverride] = useState<string | null | undefined>(undefined);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -162,13 +172,101 @@ export function App() {
   const [novelDisplayMode, setNovelDisplayMode] = useState<ShelfDisplayMode>("collections");
   const [coserPictureDisplayMode, setCoserPictureDisplayMode] = useState<ShelfDisplayMode>("collections");
   const [activeAudio, setActiveAudio] = useState<ActiveAudioState | null>(null);
+  const audioSessionIdRef = useRef(0);
+  const selectedIdRef = useRef<number | null>(null);
+  const libraryRequestRef = useRef<AbortController | null>(null);
+  const libraryGenerationRef = useRef(0);
+  const jobsSnapshotRef = useRef<Job[]>([]);
+  const seenLibraryTerminalJobIdsRef = useRef(new Set<number>());
+  const detailRequestRef = useRef<AbortController | null>(null);
+  const detailGenerationRef = useRef(0);
+  const detailRef = useRef<WorkDetail | null>(null);
+  const openCollectionRef = useRef<OpenCollectionDescriptor | null>(null);
+  const historyRequestRef = useRef<AbortController | null>(null);
+  const historyGenerationRef = useRef(0);
 
-  const refresh = async () => {
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    detailRef.current = detail;
+    if (detail && pendingReaderId === detail.work.id) {
+      setPendingReaderId(null);
+      setReaderOpen(true);
+    }
+  }, [detail, pendingReaderId]);
+
+  const refresh = useCallback(async () => {
+    libraryRequestRef.current?.abort();
+    const controller = new AbortController();
+    const generation = ++libraryGenerationRef.current;
+    libraryRequestRef.current = controller;
     setError(null);
-    const data = await api.library();
-    setLibrary(data);
-    if (!selectedId && data.works[0]) setSelectedId(data.works[0].id);
-  };
+    let firstPage: LibraryResponse;
+    try {
+      firstPage = await api.library({ limit: 100, includeContext: true, signal: controller.signal });
+    } catch (error) {
+      if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+      if (libraryRequestRef.current === controller) libraryRequestRef.current = null;
+      throw error;
+    }
+    if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+    markLibraryTerminalJobsSeen(firstPage.jobs, seenLibraryTerminalJobIdsRef.current);
+    jobsSnapshotRef.current = firstPage.jobs;
+    setLibrary((current) => (
+      !controller.signal.aborted && generation === libraryGenerationRef.current ? firstPage : current
+    ));
+    if (firstPage.works[0]) setSelectedId((current) => current ?? firstPage.works[0].id);
+
+    const loadRemainingPages = async () => {
+      let cursor = firstPage.next_cursor ?? null;
+      const seenCursors = new Set<string>();
+      try {
+        while (cursor && !seenCursors.has(cursor)) {
+          if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+          seenCursors.add(cursor);
+          const page = await api.library({
+            cursor,
+            limit: 500,
+            includeContext: false,
+            signal: controller.signal
+          });
+          if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+          setLibrary((current) => {
+            if (controller.signal.aborted || generation !== libraryGenerationRef.current) return current;
+            const knownIds = new Set(current.works.map((work) => work.id));
+            const appended = page.works.filter((work) => {
+              if (knownIds.has(work.id)) return false;
+              knownIds.add(work.id);
+              return true;
+            });
+            return {
+              ...current,
+              works: appended.length > 0
+                ? [...current.works, ...appended].sort(compareWorksByUpdatedAt)
+                : current.works,
+              next_cursor: page.next_cursor
+            };
+          });
+          cursor = page.next_cursor ?? null;
+        }
+      } catch (error) {
+        if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+        setError(`后台加载作品列表失败：${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        if (libraryRequestRef.current === controller && generation === libraryGenerationRef.current) {
+          libraryRequestRef.current = null;
+        }
+      }
+    };
+
+    if (firstPage.next_cursor) {
+      void loadRemainingPages();
+    } else if (libraryRequestRef.current === controller) {
+      libraryRequestRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -197,30 +295,84 @@ export function App() {
       })
       .catch((err) => setError(err.message));
     refresh().catch((err) => setError(err.message));
-    const events = new EventSource("/api/events");
-    events.addEventListener("jobs", (event) => {
-      try {
-        const payload = JSON.parse((event as MessageEvent).data) as { jobs?: Job[] };
-        if (payload.jobs) {
-          setLibrary((prev) => ({
-            ...prev,
-            jobs: payload.jobs ?? prev.jobs
-          }));
+    let disposed = false;
+    let events: EventSource | null = null;
+    let retryTimer: number | null = null;
+    let retryMs = 1000;
+    const connectEvents = () => {
+      if (disposed) return;
+      events = new EventSource("/api/events");
+      events.addEventListener("open", () => {
+        retryMs = 1000;
+      });
+      events.addEventListener("jobs", (event) => {
+        try {
+          const payload = JSON.parse((event as MessageEvent).data) as { jobs?: Job[] };
+          if (!payload.jobs) return;
+          const previousJobs = jobsSnapshotRef.current;
+          const nextJobs = payload.jobs;
+          const refreshAfterTerminalJob = markLibraryTerminalJobsSeen(nextJobs, seenLibraryTerminalJobIdsRef.current);
+          const snapshotChanged = !jobsEqual(previousJobs, nextJobs);
+          jobsSnapshotRef.current = nextJobs;
+          if (snapshotChanged) {
+            setLibrary((prev) => jobsEqual(prev.jobs, nextJobs) ? prev : { ...prev, jobs: nextJobs });
+          }
+          if (refreshAfterTerminalJob) {
+            void refresh().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+          }
+        } catch {
+          // Library refresh remains the source of truth when an event is malformed.
         }
-      } catch {
-        // SSE is opportunistic; library refresh remains the source of truth.
-      }
-    });
-    events.onerror = () => events.close();
-    return () => events.close();
-  }, []);
+      });
+      events.onerror = () => {
+        events?.close();
+        events = null;
+        if (disposed || retryTimer !== null) return;
+        const delay = retryMs;
+        retryMs = Math.min(retryMs * 2, 30000);
+        retryTimer = window.setTimeout(() => {
+          retryTimer = null;
+          connectEvents();
+        }, delay);
+      };
+    };
+    connectEvents();
+    return () => {
+      disposed = true;
+      libraryGenerationRef.current += 1;
+      libraryRequestRef.current?.abort();
+      libraryRequestRef.current = null;
+      historyGenerationRef.current += 1;
+      historyRequestRef.current?.abort();
+      historyRequestRef.current = null;
+      events?.close();
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [refresh]);
 
   useEffect(() => {
+    detailRequestRef.current?.abort();
     if (!selectedId) {
       setDetail(null);
       return;
     }
-    api.work(selectedId).then(setDetail).catch((err) => setError(err.message));
+    const controller = new AbortController();
+    const generation = ++detailGenerationRef.current;
+    detailRequestRef.current = controller;
+    if (detailRef.current?.work.id !== selectedId) setDetail(null);
+    api
+      .work(selectedId, controller.signal)
+      .then((next) => {
+        if (generation === detailGenerationRef.current && selectedIdRef.current === selectedId) setDetail(next);
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (generation === detailGenerationRef.current) {
+          setPendingReaderId((current) => (current === selectedId ? null : current));
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => controller.abort();
   }, [selectedId]);
 
   useEffect(() => {
@@ -231,10 +383,11 @@ export function App() {
     }
 
     let cancelled = false;
+    const controller = new AbortController();
     const handle = window.setTimeout(async () => {
       setLocalSearch((prev) => ({ ...prev, query: needle, status: "loading" }));
       try {
-        const result = await api.search(needle, 200);
+        const result = await api.search(needle, 200, controller.signal);
         if (!cancelled) {
           setLocalSearch({
             query: result.query,
@@ -252,6 +405,7 @@ export function App() {
 
     return () => {
       cancelled = true;
+      controller.abort();
       window.clearTimeout(handle);
     };
   }, [query, kind]);
@@ -319,10 +473,55 @@ export function App() {
 
   const historyByWorkId = useMemo(() => new Map(library.history.map((record) => [record.work_id, record])), [library.history]);
 
+  const cancelHistoryLookup = () => {
+    historyGenerationRef.current += 1;
+    historyRequestRef.current?.abort();
+    historyRequestRef.current = null;
+  };
+
+  const resolveExactHistoryPosition = async (workId: number, fallback: string | null) => {
+    historyRequestRef.current?.abort();
+    const controller = new AbortController();
+    const generation = ++historyGenerationRef.current;
+    historyRequestRef.current = controller;
+    try {
+      const record = await api.workHistory(workId, controller.signal);
+      if (controller.signal.aborted || generation !== historyGenerationRef.current) {
+        return { current: false, position: fallback };
+      }
+      setLibrary((prev) => ({
+        ...prev,
+        history: record
+          ? [record, ...prev.history.filter((item) => item.work_id !== workId)]
+          : prev.history.filter((item) => item.work_id !== workId)
+      }));
+      return { current: true, position: record?.position ?? null };
+    } catch {
+      return {
+        current: !controller.signal.aborted && generation === historyGenerationRef.current,
+        position: fallback
+      };
+    } finally {
+      if (historyRequestRef.current === controller) historyRequestRef.current = null;
+    }
+  };
+
   const openReader = (resume = true) => {
-    setReaderPositionOverride(undefined);
+    setPendingReaderId(null);
     setReaderResume(resume);
-    setReaderOpen(true);
+    const workId = detailRef.current?.work.id;
+    if (!resume || !workId) {
+      cancelHistoryLookup();
+      setReaderPositionOverride(resume ? undefined : "start");
+      setReaderOpen(true);
+      return;
+    }
+    const fallback = historyByWorkId.get(workId)?.position ?? null;
+    void resolveExactHistoryPosition(workId, fallback).then((result) => {
+      if (!result.current || detailRef.current?.work.id !== workId) return;
+      setReaderPositionOverride(result.position);
+      setReaderOpen(true);
+    });
   };
 
   const runScan = async () => {
@@ -391,21 +590,6 @@ export function App() {
     }
   };
 
-  const resetAdminPassword = async () => {
-    setAuthBusy(true);
-    setPasswordMessage(null);
-    setError(null);
-    try {
-      const res = await api.resetPassword();
-      setLoginPassword(res.password || "admin");
-      setPasswordMessage("密码已重置为 admin");
-    } catch (err) {
-      setPasswordMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
   const logout = async () => {
     setAuthBusy(true);
     setError(null);
@@ -456,9 +640,14 @@ export function App() {
     });
   };
 
-  useEffect(() => {
+  const closeCollection = useCallback(() => {
+    openCollectionRef.current = null;
     setCollectionStack(null);
-  }, [comicDisplayMode, coserPictureDisplayMode, kind, novelDisplayMode, query, tagFilters]);
+  }, []);
+
+  useEffect(() => {
+    closeCollection();
+  }, [closeCollection, comicDisplayMode, coserPictureDisplayMode, kind, novelDisplayMode, query, tagFilters]);
 
   const syncProgress = (id: number, progress: number, position?: string | null) => {
     setLibrary((prev) => ({
@@ -470,74 +659,114 @@ export function App() {
   };
 
   const playTrackInDock = (work: WorkDetail["work"], asset: Asset, playlist?: Asset[]) => {
-    setActiveAudio({ work, asset, playlist: playlist && playlist.length > 0 ? playlist : [asset] });
+    const fallback = historyByWorkId.get(work.id)?.position ?? null;
+    void resolveExactHistoryPosition(work.id, fallback).then((result) => {
+      if (!result.current) return;
+      setActiveAudio({
+        work,
+        asset,
+        playlist: playlist && playlist.length > 0 ? playlist : [asset],
+        resumePosition: result.position,
+        sessionId: ++audioSessionIdRef.current
+      });
+    });
   };
 
-  const displayedWorks = useMemo(() => {
-    if (collectionStack) return collectionStack;
+  const collectionShelfWorks = useMemo(() => {
     if (kind === "comic" && comicDisplayMode === "collections") return buildComicCollections(filteredWorks);
     if (kind === "novel" && novelDisplayMode === "collections") return buildNovelCollections(filteredWorks);
     if (kind === "coser-picture" && coserPictureDisplayMode === "collections") return buildCoserPictureCollections(filteredWorks);
     return filteredWorks;
-  }, [collectionStack, comicDisplayMode, coserPictureDisplayMode, filteredWorks, kind, novelDisplayMode]);
+  }, [comicDisplayMode, coserPictureDisplayMode, filteredWorks, kind, novelDisplayMode]);
+
+  const displayedWorks = useMemo(
+    () => collectionStack ?? collectionShelfWorks,
+    [collectionShelfWorks, collectionStack]
+  );
+
+  useEffect(() => {
+    const descriptor = openCollectionRef.current;
+    if (!descriptor) return;
+    const collection = collectionShelfWorks.find((work) => {
+      if (work.kind !== descriptor.kind) return false;
+      return parseMeta<{ collection_key?: string }>(work.meta_json).collection_key === descriptor.collectionKey;
+    });
+    if (!collection) return;
+    const meta = parseMeta<{ volume_ids?: number[] }>(collection.meta_json);
+    const workById = new Map(filteredWorks.map((work) => [work.id, work]));
+    const volumes = (meta.volume_ids ?? [])
+      .map((id) => workById.get(id))
+      .filter((work): work is WorkSummary => Boolean(work));
+    if (volumes.length === 0) return;
+    setCollectionStack((current) => {
+      if (
+        current?.length === volumes.length &&
+        current.every((work, index) => work === volumes[index])
+      ) {
+        return current;
+      }
+      return volumes;
+    });
+  }, [collectionShelfWorks, filteredWorks]);
 
   const openWorkPreview = (work: WorkSummary) => {
+    cancelHistoryLookup();
+    setPendingReaderId(null);
     setSelectedId(work.id);
     if (detailMode === "modal") setDetailModalOpen(true);
   };
 
-  const openGalleryReader = async (work: WorkSummary) => {
-    setSelectedId(work.id);
-    setDetailModalOpen(false);
-    setReaderResume(true);
-    let resumePosition = historyByWorkId.get(work.id)?.position ?? null;
-    try {
-      const history = await api.history();
-      setLibrary((prev) => ({ ...prev, history }));
-      resumePosition = history.find((item) => item.work_id === work.id)?.position ?? resumePosition;
-    } catch {
-      // Local history in memory is still good enough when the server refresh fails.
-    }
-    setReaderPositionOverride(resumePosition);
-    if (detail?.work.id === work.id) {
-      setReaderOpen(true);
-      return;
-    }
-    try {
-      const next = await api.work(work.id);
-      setDetail(next);
-      setReaderOpen(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
+  const openGalleryReader = (work: WorkSummary) => {
+    const fallback = historyByWorkId.get(work.id)?.position ?? null;
+    void resolveExactHistoryPosition(work.id, fallback).then((result) => {
+      if (!result.current) return;
+      setSelectedId(work.id);
+      setDetailModalOpen(false);
+      setReaderResume(true);
+      setReaderPositionOverride(result.position);
+      if (detailRef.current?.work.id === work.id) {
+        setPendingReaderId(null);
+        setReaderOpen(true);
+      } else {
+        setPendingReaderId(work.id);
+      }
+    });
   };
 
   const openComicReader = async (work: WorkSummary, resume = true, position?: string | null) => {
+    let resolvedPosition = position;
+    if (resume && position === undefined) {
+      const result = await resolveExactHistoryPosition(work.id, historyByWorkId.get(work.id)?.position ?? null);
+      if (!result.current) return;
+      resolvedPosition = result.position;
+    } else {
+      cancelHistoryLookup();
+    }
     setSelectedId(work.id);
     setDetailModalOpen(false);
     setReaderResume(resume);
-    setReaderPositionOverride(position);
-    if (detail?.work.id === work.id) {
+    setReaderPositionOverride(resume ? resolvedPosition : "start");
+    if (detailRef.current?.work.id === work.id) {
+      setPendingReaderId(null);
       setReaderOpen(true);
-      return;
-    }
-    try {
-      const next = await api.work(work.id);
-      setDetail(next);
-      setReaderOpen(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    } else {
+      setPendingReaderId(work.id);
     }
   };
 
   const openCollection = (work: WorkSummary) => {
-    const meta = parseMeta<{ first_work_id?: number; volume_ids?: number[] }>(work.meta_json);
+    cancelHistoryLookup();
+    setPendingReaderId(null);
+    const meta = parseMeta<{ collection_key?: string; first_work_id?: number; volume_ids?: number[] }>(work.meta_json);
     const volumes = (meta.volume_ids ?? [])
       .map((id) => filteredWorks.find((item) => item.id === id))
       .filter((item): item is WorkSummary => Boolean(item));
     if (volumes.length === 0) {
       openWorkPreview(filteredWorks.find((item) => item.id === meta.first_work_id) ?? work);
       return;
+    }
+    if (meta.collection_key) {
+      openCollectionRef.current = { collectionKey: meta.collection_key, kind: work.kind };
     }
     setCollectionStack(volumes);
     setSelectedId(volumes[0].id);
@@ -609,7 +838,7 @@ export function App() {
             novelDisplayMode={novelDisplayMode}
             query={query}
             viewMode={viewMode}
-            onCollectionBack={() => setCollectionStack(null)}
+            onCollectionBack={closeCollection}
             onComicDisplayModeChange={setComicDisplayMode}
             onCoserPictureDisplayModeChange={setCoserPictureDisplayMode}
             onOpenRandomComic={openRandomComic}
@@ -631,7 +860,7 @@ export function App() {
             novelDisplayMode={novelDisplayMode}
             query={query}
             viewMode={viewMode}
-            onCollectionBack={() => setCollectionStack(null)}
+            onCollectionBack={closeCollection}
             onComicDisplayModeChange={setComicDisplayMode}
             onCoserPictureDisplayModeChange={setCoserPictureDisplayMode}
             onOpenRandomComic={openRandomComic}
@@ -664,7 +893,7 @@ export function App() {
                 if (work.kind === "novel-collection" || work.kind === "comic-collection" || work.kind === "coser-picture-collection") {
                   openCollection(work);
                 } else if (work.kind === "gallery") {
-                  void openGalleryReader(work);
+                  openGalleryReader(work);
                 } else if (work.kind === "coser-picture") {
                   void openComicReader(work);
                 } else {
@@ -690,11 +919,12 @@ export function App() {
         />
       )}
       <AudioDock
+        key={activeAudio ? `${activeAudio.work.id}:${activeAudio.asset.id}:${activeAudio.sessionId}` : "idle"}
         active={activeAudio}
         canPersistProgress={true}
         onClose={() => setActiveAudio(null)}
         onProgressSaved={syncProgress}
-        resumePosition={activeAudio ? historyByWorkId.get(activeAudio.work.id)?.position ?? null : null}
+        resumePosition={activeAudio?.resumePosition ?? null}
         liquid={isLiquid}
       />
 
@@ -731,7 +961,6 @@ export function App() {
             onLogout={logout}
             onPasswordChange={setLoginPassword}
             onRescan={runScan}
-            onResetAdminPassword={resetAdminPassword}
             onSaveSettings={saveSettings}
             onTagImport={runTagImport}
             onThemeChange={changeTheme}
@@ -741,9 +970,13 @@ export function App() {
         )}
         {readerOpen && detail && (
           <ReaderOverlay
+            key={detail.work.id}
             canPersistProgress={true}
             detail={detail}
-            onClose={() => setReaderOpen(false)}
+            onClose={() => {
+              setPendingReaderId(null);
+              setReaderOpen(false);
+            }}
             onProgressSaved={syncProgress}
             resumePosition={readerResume ? readerPositionOverride ?? historyByWorkId.get(detail.work.id)?.position ?? null : "start"}
             liquid={isLiquid}
@@ -966,8 +1199,7 @@ function AuthControls({
   onLogin,
   onLogout,
   onNewPasswordChange,
-  onPasswordChange,
-  onResetPassword
+  onPasswordChange
 }: {
   auth: AuthSession;
   busy: boolean;
@@ -979,7 +1211,6 @@ function AuthControls({
   onLogout: () => void;
   onNewPasswordChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
-  onResetPassword: () => void;
 }) {
   if (auth.authenticated) {
     return (
@@ -1006,7 +1237,7 @@ function AuthControls({
             value={newPassword}
             onChange={(event) => onNewPasswordChange(event.target.value)}
           />
-          <button className="auth-submit" disabled={busy || newPassword.trim().length < 4} type="submit">
+          <button className="auth-submit" disabled={busy || newPassword.trim().length < 8} type="submit">
             {busy ? <Loader2 className="spin" size={15} /> : <KeyRound size={15} />}
             <span>修改密码</span>
           </button>
@@ -1028,7 +1259,7 @@ function AuthControls({
         <KeyRound size={15} />
         <input
           autoComplete="current-password"
-          placeholder="管理员密码，默认 admin"
+          placeholder="管理员密码"
           type="password"
           value={password}
           onChange={(event) => onPasswordChange(event.target.value)}
@@ -1037,10 +1268,7 @@ function AuthControls({
           {busy ? <Loader2 className="spin" size={15} /> : <KeyRound size={15} />}
         </button>
       </form>
-      <div className="auth-help-row">
-        <span>默认密码：admin</span>
-        <button type="button" onClick={onResetPassword} disabled={busy}>忘记密码</button>
-      </div>
+      <div className="auth-help-row"><span>忘记密码时请在服务器端更新配置或持久化密码文件。</span></div>
       {message && <span className="settings-message">{message}</span>}
     </div>
   );
@@ -1081,7 +1309,6 @@ function SettingsOverlay({
   onNewAdminPasswordChange,
   onPasswordChange,
   onRescan,
-  onResetAdminPassword,
   onSaveSettings,
   onTagImport,
   onThemeChange,
@@ -1103,7 +1330,6 @@ function SettingsOverlay({
   onNewAdminPasswordChange: (value: string) => void;
   onPasswordChange: (value: string) => void;
   onRescan: () => void;
-  onResetAdminPassword: () => void;
   onSaveSettings: (settings: AppSettings) => void;
   onTagImport: () => void;
   onThemeChange: (value: ThemeMode) => void;
@@ -1287,7 +1513,6 @@ function SettingsOverlay({
               onLogout={onLogout}
               onNewPasswordChange={onNewAdminPasswordChange}
               onPasswordChange={onPasswordChange}
-              onResetPassword={onResetAdminPassword}
             />
           </section>
 
@@ -1623,15 +1848,13 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
       const rect = node.getBoundingClientRect();
       const parentRect = node.parentElement?.getBoundingClientRect();
       const availableHeight = parentRect ? Math.max(120, parentRect.bottom - rect.top) : node.clientHeight;
-      setViewport({
+      const next = {
         width: node.clientWidth || Math.round(rect.width),
-        height: Math.round(availableHeight || Math.min(window.innerHeight * 0.72, 720)),
-      });
+        height: Math.round(availableHeight || Math.min(window.innerHeight * 0.72, 720))
+      };
+      setViewport((current) => current.width === next.width && current.height === next.height ? current : next);
     };
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(node);
-    return () => observer.disconnect();
+    return observeElementResize(node, update);
   }, []);
 
   useEffect(() => {
@@ -1771,18 +1994,16 @@ function DetailPane({
     setRouteInfo(null);
     setRouteError(null);
     if (!routeAsset) return;
-    let cancelled = false;
+    const controller = new AbortController();
     api
-      .assetRoute(routeAsset.id)
+      .assetRoute(routeAsset.id, controller.signal)
       .then((info) => {
-        if (!cancelled) setRouteInfo(info);
+        if (!controller.signal.aborted) setRouteInfo(info);
       })
       .catch((err) => {
-        if (!cancelled) setRouteError(err instanceof Error ? err.message : String(err));
+        if (!controller.signal.aborted) setRouteError(err instanceof Error ? err.message : String(err));
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => controller.abort();
   }, [routeAsset?.id]);
 
   const detailClassName = variant === "modal" ? "detail-pane detail-pane-modal" : "detail-pane";
@@ -1878,8 +2099,8 @@ function DetailPane({
                 {generatedImages.slice(0, 12).map((asset) => {
                   const assetMeta = parseMeta<{ prompt?: string; style?: string; model?: string }>(asset.meta_json);
                   return (
-                    <a href={assetUrl(asset.id)} target="_blank" rel="noreferrer" key={asset.id}>
-                      <img src={thumbUrl(asset.id, 360)} alt="" loading="lazy" />
+                    <a href={assetUrl(asset.id, assetVersion(asset, detail.work.updated_at))} target="_blank" rel="noreferrer" key={asset.id}>
+                      <img src={thumbUrl(asset.id, 360, assetVersion(asset, detail.work.updated_at))} alt="" loading="lazy" />
                       <span>{assetMeta.style ?? assetMeta.model ?? shortName(asset.path)}</span>
                     </a>
                   );
@@ -1923,14 +2144,14 @@ function DetailPane({
   );
 }
 
-function workCoverUrl(work: { id: number; kind: string; cover_asset_id?: number | null; meta_json: string }) {
+function workCoverUrl(work: { id: number; kind: string; cover_asset_id?: number | null; meta_json: string; updated_at?: string }) {
   if (work.kind === "comic-collection" || work.kind === "novel-collection" || work.kind === "coser-picture-collection") {
     const meta = parseMeta<{ first_work_id?: number }>(work.meta_json);
-    if (meta.first_work_id) return coverUrl(meta.first_work_id, 480);
-    return work.cover_asset_id ? assetUrl(work.cover_asset_id) : "";
+    if (meta.first_work_id) return coverUrl(meta.first_work_id, 480, work.updated_at);
+    return work.cover_asset_id ? assetUrl(work.cover_asset_id, work.updated_at) : "";
   }
   if (work.cover_asset_id || isArchiveWorkKind(work.kind)) {
-    return coverUrl(work.id, 480);
+    return coverUrl(work.id, 480, work.updated_at);
   }
   return "";
 }
@@ -1952,6 +2173,8 @@ function AudioDock({
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const lastProgressWrite = useRef(0);
+  const resumeTrackRef = useRef(parseReadingPosition(resumePosition));
+  const resumeConsumedRef = useRef(false);
   const [currentAsset, setCurrentAsset] = useState<Asset | null>(active?.asset ?? null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -1960,11 +2183,16 @@ function AudioDock({
   const [queueOpen, setQueueOpen] = useState(false);
   const [volume, setVolume] = useState(1);
   const meta = parseMeta<{ title?: string }>(currentAsset?.meta_json);
-  const resumeTrack = parseReadingPosition(resumePosition);
   const playlist = useMemo(() => active?.playlist ?? (active?.asset ? [active.asset] : []), [active]);
   const currentIndex = Math.max(0, playlist.findIndex((asset) => asset.id === currentAsset?.id));
   const progressPercent = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
   const repeatLabel = repeatMode === "one" ? "单曲循环" : repeatMode === "all" ? "列表循环" : "不循环";
+  const { flush: flushProgress, schedule: scheduleProgress } = useProgressQueue(
+    active?.work.id ?? 0,
+    canPersistProgress && Boolean(active),
+    onProgressSaved,
+    1200
+  );
 
   useEffect(() => {
     setCurrentAsset(active?.asset ?? null);
@@ -1983,21 +2211,35 @@ function AudioDock({
     }
   }, [volume]);
 
-  const saveAudioProgress = (currentTime: number, duration: number, ended = false, force = false) => {
+  const saveAudioProgress = useCallback((currentTime: number, duration: number, ended = false, force = false) => {
     if (!canPersistProgress || !active || !currentAsset || !Number.isFinite(duration) || duration <= 0) return;
     const now = Date.now();
     if (!ended && !force && now - lastProgressWrite.current < 12000) return;
     lastProgressWrite.current = now;
     const progress = ended ? 1 : Math.min(0.995, Math.max(0, currentTime / duration));
     const position = `track:${currentAsset.id}:${Math.round(currentTime)}`;
-    api
-      .updateProgress(active.work.id, progress, position)
-      .then((res) => onProgressSaved(active.work.id, res.progress, res.position ?? position))
-      .catch(() => {});
-  };
+    scheduleProgress(progress, position, ended || force);
+  }, [active?.work.id, canPersistProgress, currentAsset, scheduleProgress]);
 
-  const changeTrack = (offset: number) => {
+  useLayoutEffect(() => {
+    return () => {
+      const audio = audioRef.current;
+      if (audio) {
+        const audioDuration = audio.duration;
+        const ended = audio.ended || (Number.isFinite(audioDuration) && audioDuration > 0 && audio.currentTime >= audioDuration - 0.25);
+        saveAudioProgress(audio.currentTime, audioDuration, ended, true);
+      }
+      void flushProgress();
+    };
+  }, [currentAsset?.id, flushProgress, saveAudioProgress]);
+
+  const changeTrack = (offset: number, flushCurrent = true) => {
     if (playlist.length === 0) return false;
+    const audio = audioRef.current;
+    if (flushCurrent && audio) {
+      saveAudioProgress(audio.currentTime, audio.duration || duration, audio.ended, true);
+      void flushProgress();
+    }
     const nextIndex = currentIndex + offset;
     if (nextIndex < 0 || nextIndex >= playlist.length) {
       if (repeatMode !== "all") return false;
@@ -2036,8 +2278,9 @@ function AudioDock({
   const handleClose = () => {
     const audio = audioRef.current;
     if (audio) {
-      saveAudioProgress(audio.currentTime, audio.duration || duration, false, true);
+      saveAudioProgress(audio.currentTime, audio.duration || duration, audio.ended, true);
     }
+    void flushProgress();
     onClose();
   };
 
@@ -2107,12 +2350,19 @@ function AudioDock({
         autoPlay
         loop={repeatMode === "one"}
         preload="metadata"
-        src={assetUrl(currentAsset.id)}
+        src={assetUrl(currentAsset.id, assetVersion(currentAsset, active.work.updated_at))}
         onLoadedMetadata={(event) => {
           let nextTime = event.currentTarget.currentTime;
-          if (resumeTrack.kind === "track" && resumeTrack.assetId === currentAsset.id && resumeTrack.seconds > 0) {
-            nextTime = Math.min(resumeTrack.seconds, Math.max(0, event.currentTarget.duration - 0.5));
-            event.currentTarget.currentTime = nextTime;
+          if (!resumeConsumedRef.current) {
+            resumeConsumedRef.current = true;
+            const resumeTrack = resumeTrackRef.current;
+            if (resumeTrack.kind === "track" && resumeTrack.assetId === currentAsset.id && resumeTrack.seconds > 0) {
+              const maxResumeTime = Number.isFinite(event.currentTarget.duration)
+                ? Math.max(0, event.currentTarget.duration - 0.5)
+                : resumeTrack.seconds;
+              nextTime = Math.min(resumeTrack.seconds, maxResumeTime);
+              event.currentTarget.currentTime = nextTime;
+            }
           }
           setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
           setCurrentTime(nextTime);
@@ -2121,10 +2371,20 @@ function AudioDock({
         onDurationChange={(event) => setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0)}
         onEnded={(event) => {
           saveAudioProgress(event.currentTarget.duration, event.currentTarget.duration, true);
+          void flushProgress();
           if (repeatMode === "one") return;
-          if (!changeTrack(1)) onClose();
+          if (!changeTrack(1, false)) onClose();
         }}
-        onPause={() => setIsPlaying(false)}
+        onPause={(event) => {
+          setIsPlaying(false);
+          saveAudioProgress(
+            event.currentTarget.currentTime,
+            event.currentTarget.duration,
+            event.currentTarget.ended,
+            true
+          );
+          void flushProgress();
+        }}
         onPlay={() => setIsPlaying(true)}
         onTimeUpdate={(event) => {
           setCurrentTime(event.currentTarget.currentTime);
@@ -2148,6 +2408,11 @@ function AudioDock({
                   className={asset.id === currentAsset.id ? "active" : ""}
                   key={asset.id}
                   onClick={() => {
+                    const audio = audioRef.current;
+                    if (audio) {
+                      saveAudioProgress(audio.currentTime, audio.duration || duration, audio.ended, true);
+                      void flushProgress();
+                    }
                     setCurrentAsset(asset);
                     lastProgressWrite.current = 0;
                   }}
@@ -2199,6 +2464,7 @@ function ReaderOverlay({
   const [comicZoom, setComicZoom] = useState(1);
   const [comicViewport, setComicViewport] = useState({ width: 0, height: 0 });
   const [comicScrollLeft, setComicScrollLeft] = useState(0);
+  const [comicScrollTop, setComicScrollTop] = useState(0);
   const [comicAutoRead, setComicAutoRead] = useState(false);
   const [comicError, setComicError] = useState<string | null>(null);
   const [readerChromeVisible, setReaderChromeVisible] = useState(false);
@@ -2211,10 +2477,18 @@ function ReaderOverlay({
   const resumeComicPageRef = useRef(0);
   const comicUserInteractedRef = useRef(false);
   const comicScrollFrameRef = useRef<number | null>(null);
-  const comicPendingScrollRef = useRef<{ left: number; page: number } | null>(null);
+  const comicPendingScrollRef = useRef<{ left: number; top: number; page: number } | null>(null);
+  const comicLayoutKeyRef = useRef<string | null>(null);
+  const activeReaderAudioRef = useRef<{ asset: Asset; element: HTMLAudioElement } | null>(null);
   const mediaImages = detail.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/"));
+  const comicArchiveVersion = assetVersion(detail.assets.find((asset) => asset.role === "archive"), detail.work.updated_at);
   const resumeTarget = useMemo(() => parseReadingPosition(resumePosition), [resumePosition]);
   const safeComicAutoReadIntervalMs = clampComicAutoReadIntervalMs(comicAutoReadIntervalMs);
+  const { flush: flushProgress, schedule: scheduleProgress } = useProgressQueue(
+    detail.work.id,
+    canPersistProgress,
+    onProgressSaved
+  );
 
   useEffect(() => {
     const body = document.body;
@@ -2240,6 +2514,7 @@ function ReaderOverlay({
     setComicZoom(1);
     setComicViewport({ width: 0, height: 0 });
     setComicScrollLeft(0);
+    setComicScrollTop(0);
     setComicAutoRead(false);
     setComicError(null);
     setReaderChromeVisible(false);
@@ -2253,23 +2528,27 @@ function ReaderOverlay({
     resumeComicPageRef.current = 0;
     comicUserInteractedRef.current = false;
     comicPendingScrollRef.current = null;
+    comicLayoutKeyRef.current = null;
     if (comicScrollFrameRef.current !== null) {
       window.cancelAnimationFrame(comicScrollFrameRef.current);
       comicScrollFrameRef.current = null;
     }
     if (isArchiveWorkKind(detail.work.kind)) {
+      const controller = new AbortController();
       api
-        .comicPages(detail.work.id)
+        .comicPages(detail.work.id, controller.signal, comicArchiveVersion)
         .then((res) => {
           setPages(res.pages.map(normalizeComicPageInfo));
           setComicError(null);
         })
         .catch((err) => {
+          if (err instanceof DOMException && err.name === "AbortError") return;
           setPages([]);
           setComicError(err instanceof Error ? err.message : String(err));
         });
+      return () => controller.abort();
     }
-  }, [detail.work.id, detail.work.kind]);
+  }, [comicArchiveVersion, detail.work.id, detail.work.kind]);
 
   useEffect(() => {
     return () => {
@@ -2308,14 +2587,44 @@ function ReaderOverlay({
     [comicWindowEnd, comicWindowStart]
   );
   const comicTotalWidth = comicMode === "horizontal" ? comicSlotWidth * pages.length : 0;
+  const comicVerticalMetrics = useMemo(() => {
+    const horizontalPadding = Math.max(14, comicMeasuredWidth * 0.05) * 2;
+    const imageWidth = Math.max(1, comicMeasuredWidth - horizontalPadding) * comicZoom;
+    const offsets = new Array<number>(pages.length + 1);
+    offsets[0] = 0;
+    for (let index = 0; index < pages.length; index += 1) {
+      offsets[index + 1] = offsets[index] + imageWidth / comicPageAspect(pages[index]) + 16;
+    }
+    return { imageWidth, offsets, totalHeight: offsets[pages.length] ?? 0 };
+  }, [comicMeasuredWidth, comicZoom, pages]);
+  const comicVerticalWindowStart = comicMode === "scroll"
+    ? Math.max(0, comicPageFromOffsets(comicVerticalMetrics.offsets, comicScrollTop) - COMIC_VERTICAL_OVERSCAN)
+    : 0;
+  const comicVerticalWindowEnd = comicMode === "scroll"
+    ? Math.min(
+      pages.length,
+      comicPageFromOffsets(
+        comicVerticalMetrics.offsets,
+        comicScrollTop + Math.max(1, comicMeasuredHeight)
+      ) + COMIC_VERTICAL_OVERSCAN + 1
+    )
+    : 0;
+  const verticalComicIndexes = useMemo(
+    () => Array.from(
+      { length: Math.max(0, comicVerticalWindowEnd - comicVerticalWindowStart) },
+      (_, index) => comicVerticalWindowStart + index
+    ),
+    [comicVerticalWindowEnd, comicVerticalWindowStart]
+  );
 
-  const persistProgress = (progress: number, position: string) => {
-    if (!canPersistProgress) return;
-    api
-      .updateProgress(detail.work.id, progress, position)
-      .then((res) => onProgressSaved(detail.work.id, res.progress, res.position ?? position))
-      .catch(() => {});
-  };
+  const persistProgress = useCallback((progress: number, position: string, immediate = false) => {
+    scheduleProgress(progress, position, immediate);
+  }, [scheduleProgress]);
+
+  const closeReader = useCallback(() => {
+    void flushProgress();
+    onClose();
+  }, [flushProgress, onClose]);
 
   const toggleReaderChrome = () => {
     if (!immersiveReader) return;
@@ -2358,25 +2667,60 @@ function ReaderOverlay({
     const timers = delays.map((delay, index) =>
       window.setTimeout(() => {
         if (!needsComicResumeScrollRef.current || comicUserInteractedRef.current) return;
-        scrollComicStageToPage(comicStageRef.current, targetPage, pages.length, comicAspect, comicZoom);
+        scrollComicStageToPage(
+          comicStageRef.current,
+          targetPage,
+          pages.length,
+          comicAspect,
+          comicZoom,
+          comicVerticalMetrics.offsets
+        );
         if (index === delays.length - 1) {
           needsComicResumeScrollRef.current = false;
         }
       }, delay)
     );
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [comicAspect, comicMode, comicZoom, isArchiveReader, pages.length]);
+  }, [comicAspect, comicMode, comicVerticalMetrics.offsets, comicZoom, isArchiveReader, pages.length]);
 
   useEffect(() => {
-    if (!isArchiveReader || comicMode !== "horizontal") return;
+    if (!isArchiveReader || comicMode === "paged") return;
     const stage = comicStageRef.current;
     if (!stage) return;
-    const measure = () => setComicViewport({ width: stage.clientWidth, height: stage.clientHeight });
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(stage);
-    return () => observer.disconnect();
+    const measure = () => {
+      const next = { width: stage.clientWidth, height: stage.clientHeight };
+      setComicViewport((current) => current.width === next.width && current.height === next.height ? current : next);
+    };
+    return observeElementResize(stage, measure);
   }, [comicMode, isArchiveReader]);
+
+  const comicLayoutKey = `${comicMode}:${comicZoom}:${comicMeasuredWidth}:${comicMeasuredHeight}:${pages.length}`;
+  useLayoutEffect(() => {
+    const previous = comicLayoutKeyRef.current;
+    comicLayoutKeyRef.current = comicLayoutKey;
+    if (
+      previous === null ||
+      previous === comicLayoutKey ||
+      !isArchiveReader ||
+      !resumeAppliedRef.current ||
+      pages.length === 0 ||
+      comicMode === "paged"
+    ) return;
+    const stage = comicStageRef.current;
+    if (!stage) return;
+    const targetPage = Math.min(Math.max(page, 0), pages.length - 1);
+    const frame = window.requestAnimationFrame(() => {
+      scrollComicStageToPage(
+        stage,
+        targetPage,
+        pages.length,
+        comicAspect,
+        comicZoom,
+        comicVerticalMetrics.offsets
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [comicAspect, comicLayoutKey, comicMode, comicVerticalMetrics.offsets, comicZoom, isArchiveReader, pages.length]);
 
   useEffect(() => {
     if (!isArchiveReader || pages.length === 0) return;
@@ -2434,8 +2778,8 @@ function ReaderOverlay({
     setComicZoom((value) => Math.min(1.8, Math.max(0.7, Number((value + delta).toFixed(2)))));
   };
 
-  const scheduleComicScrollState = (left: number, nextPage: number) => {
-    comicPendingScrollRef.current = { left, page: nextPage };
+  const scheduleComicScrollState = (left: number, top: number, nextPage: number) => {
+    comicPendingScrollRef.current = { left, top, page: nextPage };
     if (comicScrollFrameRef.current !== null) return;
     comicScrollFrameRef.current = window.requestAnimationFrame(() => {
       comicScrollFrameRef.current = null;
@@ -2443,6 +2787,7 @@ function ReaderOverlay({
       comicPendingScrollRef.current = null;
       if (!pending) return;
       setComicScrollLeft((value) => (value === pending.left ? value : pending.left));
+      setComicScrollTop((value) => (value === pending.top ? value : pending.top));
       setPage((value) => (value === pending.page ? value : pending.page));
     });
   };
@@ -2452,12 +2797,11 @@ function ReaderOverlay({
     const target = event.currentTarget;
     const nextPage = comicMode === "horizontal"
       ? comicPageFromHorizontalScroll(target, pages.length, comicAspect, comicZoom)
-      : comicPageFromVerticalScroll(target, pages.length);
-    if (comicMode === "horizontal") {
-      scheduleComicScrollState(target.scrollLeft, nextPage);
-      return;
-    }
-    setPage((value) => (value === nextPage ? value : nextPage));
+      : comicPageFromOffsets(
+        comicVerticalMetrics.offsets,
+        target.scrollTop + target.clientHeight / 2
+      );
+    scheduleComicScrollState(target.scrollLeft, target.scrollTop, nextPage);
   };
 
   const onHorizontalComicWheel = (event: { preventDefault: () => void; stopPropagation: () => void; deltaY: number; deltaX: number }) => {
@@ -2471,6 +2815,7 @@ function ReaderOverlay({
     stage.scrollLeft += event.deltaY + event.deltaX;
     scheduleComicScrollState(
       stage.scrollLeft,
+      stage.scrollTop,
       comicPageFromHorizontalScroll(stage, pages.length, comicAspect, comicZoom)
     );
   };
@@ -2480,7 +2825,8 @@ function ReaderOverlay({
       const target = event.target as HTMLElement | null;
       if (target?.closest("input, textarea, select")) return;
       if (event.key === "Escape") {
-        onClose();
+        if (isGallery && document.querySelector(".gallery-lightbox")) return;
+        closeReader();
         return;
       }
       if (isArchiveReader) {
@@ -2498,16 +2844,27 @@ function ReaderOverlay({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [comicMode, isArchiveReader, onClose, pages.length]);
+  }, [closeReader, comicAspect, comicMode, comicZoom, isArchiveReader, isGallery, page, pages.length]);
 
-  const saveTrackProgress = (asset: Asset, currentTime: number, duration: number, ended = false) => {
+  const saveTrackProgress = useCallback((asset: Asset, currentTime: number, duration: number, ended = false, force = false) => {
     if (!canPersistProgress || !Number.isFinite(duration) || duration <= 0) return;
     const now = Date.now();
-    if (!ended && now - lastAudioProgressWrite.current < 12000) return;
+    if (!ended && !force && now - lastAudioProgressWrite.current < 12000) return;
     lastAudioProgressWrite.current = now;
     const progress = ended ? 1 : Math.min(0.995, Math.max(0, currentTime / duration));
-    persistProgress(progress, `track:${asset.id}:${Math.round(currentTime)}`);
-  };
+    persistProgress(progress, `track:${asset.id}:${Math.round(currentTime)}`, ended || force);
+  }, [canPersistProgress, persistProgress]);
+
+  useLayoutEffect(() => {
+    return () => {
+      const activeAudio = activeReaderAudioRef.current;
+      if (activeAudio) {
+        const { asset, element } = activeAudio;
+        saveTrackProgress(asset, element.currentTime, element.duration, element.ended, true);
+      }
+      void flushProgress();
+    };
+  }, [detail.work.id, flushProgress, saveTrackProgress]);
 
   const readerActionsContent = (
     <>
@@ -2547,7 +2904,7 @@ function ReaderOverlay({
   );
   const readerBarContent = (
     <>
-      <button className="icon-btn reader-back-button" onClick={onClose} aria-label="关闭">
+      <button className="icon-btn reader-back-button" onClick={closeReader} aria-label="关闭">
         <ChevronLeft size={18} />
       </button>
       <span className="reader-title-pill">{detail.work.title}</span>
@@ -2578,7 +2935,7 @@ function ReaderOverlay({
         {!isNovel && (liquid ? (
           <div className={liquidReaderBarClassName}>
             <GlassSurface className="reader-back-surface" variant="dock">
-              <button className="icon-btn reader-back-button" onClick={onClose} aria-label="关闭">
+              <button className="icon-btn reader-back-button" onClick={closeReader} aria-label="关闭">
                 <ChevronLeft size={18} />
               </button>
             </GlassSurface>
@@ -2616,7 +2973,7 @@ function ReaderOverlay({
             {pages.length > 0 && comicMode === "paged" ? (
               <motion.img
                 key={page}
-                src={`/api/works/${detail.work.id}/pages/${page}/stream`}
+                src={comicPageUrl(detail.work.id, page, comicArchiveVersion)}
                 alt=""
                 initial={{ opacity: 0, x: 16 }}
                 animate={{ opacity: 1, x: 0 }}
@@ -2644,7 +3001,7 @@ function ReaderOverlay({
                           <img
                             alt=""
                             loading="lazy"
-                            src={`/api/works/${detail.work.id}/pages/${index}/stream`}
+                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion)}
                           />
                         </div>
                       );
@@ -2652,29 +3009,59 @@ function ReaderOverlay({
                   </div>
                 </div>
               ) : (
-                pages.map((comicPage, index) => (
-                  <img
-                    alt=""
-                    data-page-index={index}
-                    key={comicPage.name || index}
-                    loading="lazy"
-                    src={`/api/works/${detail.work.id}/pages/${index}/stream`}
-                    style={{ width: `${Math.round(comicZoom * 100)}%` }}
-                  />
-                ))
+                <div
+                  className="comic-vertical-spacer"
+                  style={{ height: `${Math.max(1, comicVerticalMetrics.totalHeight)}px` }}
+                >
+                  <div
+                    className="comic-vertical-window"
+                    style={{
+                      transform: `translateY(${Math.round(comicVerticalMetrics.offsets[comicVerticalWindowStart] ?? 0)}px)`
+                    }}
+                  >
+                    {verticalComicIndexes.map((index) => {
+                      const comicPage = pages[index];
+                      const slotHeight = Math.max(
+                        1,
+                        (comicVerticalMetrics.offsets[index + 1] ?? 0) -
+                        (comicVerticalMetrics.offsets[index] ?? 0) - 16
+                      );
+                      return (
+                        <div
+                          className="comic-vertical-slot"
+                          data-page-index={index}
+                          key={comicPage.name || index}
+                          style={{ height: `${slotHeight}px` }}
+                        >
+                          <img
+                            alt=""
+                            loading="lazy"
+                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion)}
+                            style={{
+                              height: `${slotHeight}px`,
+                              width: `${Math.round(comicZoom * 100)}%`
+                            }}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               )
             ) : (
               <Loader2 className="spin" />
             )}
           </div>
         ) : isNovel ? (
-          <NovelReader
-            canPersistProgress={canPersistProgress}
-            detail={detail}
-            onClose={onClose}
-            onProgressSaved={onProgressSaved}
-            resumePosition={resumePosition}
-          />
+          <Suspense fallback={<Loader2 className="spin" />}>
+            <NovelReader
+              canPersistProgress={canPersistProgress}
+              detail={detail}
+              onClose={onClose}
+              onProgressSaved={onProgressSaved}
+              resumePosition={resumePosition}
+            />
+          </Suspense>
         ) : isGallery ? (
           <GalleryStage
             canPersistProgress={canPersistProgress}
@@ -2688,7 +3075,7 @@ function ReaderOverlay({
               const assetMeta = parseMeta<{ prompt?: string; style?: string; model?: string }>(asset.meta_json);
               return (
                 <motion.a
-                  href={assetUrl(asset.id)}
+                  href={assetUrl(asset.id, assetVersion(asset, detail.work.updated_at))}
                   target="_blank"
                   rel="noreferrer"
                   key={asset.id}
@@ -2698,7 +3085,7 @@ function ReaderOverlay({
                   transition={{ delay: Math.min(index * 0.025, 0.2), duration: 0.2 }}
                   onClick={() => persistProgress((index + 1) / Math.max(1, mediaImages.length), `image:${index}`)}
                 >
-                  <img src={thumbUrl(asset.id, 360)} alt="" loading="lazy" />
+                  <img src={thumbUrl(asset.id, 360, assetVersion(asset, detail.work.updated_at))} alt="" loading="lazy" />
                   <span>{assetMeta.prompt ?? assetMeta.style ?? shortName(asset.path)}</span>
                 </motion.a>
               );
@@ -2717,13 +3104,36 @@ function ReaderOverlay({
                   <audio
                     controls
                     preload="none"
-                    src={assetUrl(asset.id)}
+                    src={assetUrl(asset.id, assetVersion(asset, detail.work.updated_at))}
                     onLoadedMetadata={(event) => {
                       if (resumeTarget.kind === "track" && resumeTarget.assetId === asset.id && resumeTarget.seconds > 0) {
                         event.currentTarget.currentTime = Math.min(resumeTarget.seconds, Math.max(0, event.currentTarget.duration - 0.5));
                       }
                     }}
-                    onEnded={(event) => saveTrackProgress(asset, event.currentTarget.duration, event.currentTarget.duration, true)}
+                    onPlay={(event) => {
+                      const previous = activeReaderAudioRef.current;
+                      if (previous && previous.element !== event.currentTarget) {
+                        saveTrackProgress(
+                          previous.asset,
+                          previous.element.currentTime,
+                          previous.element.duration,
+                          previous.element.ended,
+                          true
+                        );
+                        previous.element.pause();
+                        void flushProgress();
+                      }
+                      activeReaderAudioRef.current = { asset, element: event.currentTarget };
+                      lastAudioProgressWrite.current = 0;
+                    }}
+                    onPause={(event) => {
+                      saveTrackProgress(asset, event.currentTarget.currentTime, event.currentTarget.duration, event.currentTarget.ended, true);
+                      void flushProgress();
+                    }}
+                    onEnded={(event) => {
+                      saveTrackProgress(asset, event.currentTarget.duration, event.currentTarget.duration, true, true);
+                      void flushProgress();
+                    }}
                     onTimeUpdate={(event) => saveTrackProgress(asset, event.currentTarget.currentTime, event.currentTarget.duration)}
                   />
                 </div>
@@ -2745,7 +3155,8 @@ const GALLERY_IMAGE_LOAD_MARGIN_ROWS = 1;
 const GALLERY_THUMB_SIZE = 256;
 const GALLERY_THUMB_PREHEAT_ROWS = 4;
 const GALLERY_ORIGINAL_PREFETCH_RADIUS = 2;
-const GALLERY_PRELOAD_CACHE_LIMIT = 180;
+const GALLERY_THUMB_PRELOAD_CACHE_LIMIT = 48;
+const GALLERY_ORIGINAL_PRELOAD_CACHE_LIMIT = 5;
 
 function GalleryStage({
   canPersistProgress,
@@ -2763,12 +3174,18 @@ function GalleryStage({
   const loadedOffsetsRef = useRef(new Set<number>());
   const pendingScrollIndexRef = useRef<number | null>(resumeTarget.kind === "image" ? resumeTarget.index : 0);
   const lastProgressWriteRef = useRef(0);
+  const progressTimerRef = useRef<number | null>(null);
   const lastSavedIndexRef = useRef(-1);
   const hasGalleryScrolledRef = useRef(false);
   const scrollRafRef = useRef<number | null>(null);
   const pendingScrollTopRef = useRef(0);
   const liveScrollTopRef = useRef(0);
   const rowHeightRef = useRef(1);
+  const columnsRef = useRef(1);
+  const viewportRef = useRef({ width: 0, height: 0 });
+  const galleryLayoutRestoringRef = useRef(false);
+  const totalRef = useRef(0);
+  const latestGalleryIndexRef = useRef(resumeTarget.kind === "image" ? resumeTarget.index : 0);
   const lastWindowRowRef = useRef(-1);
   const cacheCenterPageRef = useRef(0);
   const pendingActiveImageRef = useRef<number | null>(null);
@@ -2776,6 +3193,7 @@ function GalleryStage({
   const lastLightboxWheelAtRef = useRef(0);
   const preloadedThumbsRef = useRef(new Map<string, HTMLImageElement>());
   const preloadedOriginalsRef = useRef(new Map<string, HTMLImageElement>());
+  const fetchControllersRef = useRef(new Map<number, AbortController>());
   const [itemsByIndex, setItemsByIndex] = useState<Record<number, Asset>>({});
   const [total, setTotal] = useState(0);
   const [loadedOnce, setLoadedOnce] = useState(false);
@@ -2783,7 +3201,15 @@ function GalleryStage({
   const [scrollTop, setScrollTop] = useState(0);
   const [activeImage, setActiveImage] = useState<{ asset: Asset; index: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const galleryVersion = detail.work.updated_at;
   const galleryMeta = useMemo(() => parseMeta<{ image_count?: number }>(detail.work.meta_json), [detail.work.meta_json]);
+  const { flush: flushGalleryProgress, schedule: scheduleGalleryProgress } = useProgressQueue(
+    detail.work.id,
+    canPersistProgress,
+    onProgressSaved,
+    1200
+  );
+  const shouldPreloadOriginals = useMemo(() => allowsOriginalPreload(), []);
 
   const initialGalleryIndex = useCallback(() => {
     if (resumeTarget.kind === "image") return resumeTarget.index;
@@ -2795,12 +3221,28 @@ function GalleryStage({
     );
   }, [detail.work.progress, galleryMeta.image_count, resumeTarget]);
 
+  const cancelGalleryFetchesOutsideCache = useCallback((centerPage: number) => {
+    const pageRadius = Math.floor(GALLERY_MAX_CACHED_PAGES / 2);
+    const keepMinPage = Math.max(0, centerPage - pageRadius);
+    const keepMaxPage = centerPage + pageRadius;
+    for (const [offset, controller] of fetchControllersRef.current) {
+      const page = Math.floor(offset / GALLERY_PAGE_SIZE);
+      if (page >= keepMinPage && page <= keepMaxPage) continue;
+      fetchControllersRef.current.delete(offset);
+      loadingOffsetsRef.current.delete(offset);
+      controller.abort();
+    }
+  }, []);
+
   const fetchPage = useCallback(async (offset: number) => {
     const aligned = Math.max(0, Math.floor(offset / GALLERY_PAGE_SIZE) * GALLERY_PAGE_SIZE);
     if (loadingOffsetsRef.current.has(aligned) || loadedOffsetsRef.current.has(aligned)) return;
     loadingOffsetsRef.current.add(aligned);
+    const controller = new AbortController();
+    fetchControllersRef.current.set(aligned, controller);
     try {
-      const res = await api.galleryPage(detail.work.id, aligned, GALLERY_PAGE_SIZE);
+      const res = await api.galleryPage(detail.work.id, aligned, GALLERY_PAGE_SIZE, controller.signal, galleryVersion);
+      if (controller.signal.aborted || fetchControllersRef.current.get(aligned) !== controller) return;
       const responsePage = Math.floor(aligned / GALLERY_PAGE_SIZE);
       const centerPage = cacheCenterPageRef.current;
       const pageRadius = Math.floor(GALLERY_MAX_CACHED_PAGES / 2);
@@ -2834,20 +3276,29 @@ function GalleryStage({
       setLoadedOnce(true);
       setError(null);
     } catch (err) {
+      if (
+        controller.signal.aborted ||
+        fetchControllersRef.current.get(aligned) !== controller ||
+        (err instanceof DOMException && err.name === "AbortError")
+      ) return;
       setLoadedOnce(true);
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      loadingOffsetsRef.current.delete(aligned);
+      if (fetchControllersRef.current.get(aligned) === controller) {
+        fetchControllersRef.current.delete(aligned);
+        loadingOffsetsRef.current.delete(aligned);
+      }
     }
-  }, [detail.work.id]);
+  }, [detail.work.id, galleryVersion]);
 
   const preloadThumb = useCallback((asset: Asset) => {
-    rememberGalleryPreload(preloadedThumbsRef.current, thumbUrl(asset.id, GALLERY_THUMB_SIZE));
-  }, []);
+    rememberGalleryPreload(preloadedThumbsRef.current, thumbUrl(asset.id, GALLERY_THUMB_SIZE, assetVersion(asset, galleryVersion)), false, GALLERY_THUMB_PRELOAD_CACHE_LIMIT);
+  }, [galleryVersion]);
 
   const preloadOriginal = useCallback((asset: Asset, decode = false) => {
-    rememberGalleryPreload(preloadedOriginalsRef.current, assetUrl(asset.id), decode);
-  }, []);
+    if (!shouldPreloadOriginals && !decode) return;
+    rememberGalleryPreload(preloadedOriginalsRef.current, assetUrl(asset.id, assetVersion(asset, galleryVersion)), decode, GALLERY_ORIGINAL_PRELOAD_CACHE_LIMIT);
+  }, [galleryVersion, shouldPreloadOriginals]);
 
   const commitScrollTop = useCallback((nextScrollTop: number) => {
     liveScrollTopRef.current = nextScrollTop;
@@ -2873,18 +3324,27 @@ function GalleryStage({
     setActiveImage(null);
     setError(null);
     loadingOffsetsRef.current.clear();
+    for (const controller of fetchControllersRef.current.values()) controller.abort();
+    fetchControllersRef.current.clear();
     loadedOffsetsRef.current.clear();
     cacheCenterPageRef.current = Math.floor(startIndex / GALLERY_PAGE_SIZE);
     pendingScrollIndexRef.current = startIndex;
     lastProgressWriteRef.current = Date.now();
+    if (progressTimerRef.current !== null) {
+      window.clearTimeout(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
     lastSavedIndexRef.current = -1;
     hasGalleryScrolledRef.current = false;
     pendingScrollTopRef.current = 0;
     liveScrollTopRef.current = 0;
+    totalRef.current = 0;
+    latestGalleryIndexRef.current = startIndex;
     lastWindowRowRef.current = -1;
+    galleryLayoutRestoringRef.current = false;
     pendingActiveImageRef.current = null;
-    preloadedThumbsRef.current.clear();
-    preloadedOriginalsRef.current.clear();
+    clearGalleryPreloads(preloadedThumbsRef.current);
+    clearGalleryPreloads(preloadedOriginalsRef.current);
     void fetchPage(startIndex);
   }, [detail.work.id]);
 
@@ -2893,17 +3353,42 @@ function GalleryStage({
       if (scrollRafRef.current !== null) {
         window.cancelAnimationFrame(scrollRafRef.current);
       }
+      if (progressTimerRef.current !== null) window.clearTimeout(progressTimerRef.current);
+      for (const controller of fetchControllersRef.current.values()) controller.abort();
+      fetchControllersRef.current.clear();
+      const currentTotal = totalRef.current;
+      if (hasGalleryScrolledRef.current && currentTotal > 0) {
+        const safeIndex = Math.min(Math.max(latestGalleryIndexRef.current, 0), currentTotal - 1);
+        if (lastSavedIndexRef.current !== safeIndex) {
+          lastSavedIndexRef.current = safeIndex;
+          scheduleGalleryProgress(
+            Math.min(0.995, Math.max(0, (safeIndex + 1) / currentTotal)),
+            `image:${safeIndex}`,
+            true
+          );
+        }
+      }
+      void flushGalleryProgress();
+      clearGalleryPreloads(preloadedThumbsRef.current);
+      clearGalleryPreloads(preloadedOriginalsRef.current);
     };
-  }, []);
+  }, [flushGalleryProgress, scheduleGalleryProgress]);
 
   useEffect(() => {
     const element = stageRef.current;
     if (!element) return;
-    const measure = () => setViewport({ width: element.clientWidth, height: element.clientHeight });
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(element);
-    return () => observer.disconnect();
+    const measure = () => {
+      const next = { width: element.clientWidth, height: element.clientHeight };
+      const previous = viewportRef.current;
+      if (previous.width > 0 && Math.abs(previous.width - next.width) > 1) {
+        pendingScrollIndexRef.current = latestGalleryIndexRef.current;
+        lastWindowRowRef.current = -1;
+        galleryLayoutRestoringRef.current = true;
+      }
+      viewportRef.current = next;
+      setViewport((current) => current.width === next.width && current.height === next.height ? current : next);
+    };
+    return observeElementResize(element, measure);
   }, []);
 
   const columns = Math.max(1, Math.floor((viewport.width + GALLERY_TILE_GAP) / (GALLERY_TILE_MIN_WIDTH + GALLERY_TILE_GAP)));
@@ -2912,6 +3397,8 @@ function GalleryStage({
     : GALLERY_TILE_MIN_WIDTH;
   const tileHeight = Math.round(tileWidth * 1.32);
   const rowHeight = tileHeight + GALLERY_TILE_GAP;
+  columnsRef.current = columns;
+  totalRef.current = total;
   const rowCount = Math.ceil(total / columns);
   rowHeightRef.current = Math.max(1, rowHeight);
   const rowAdvance = rowHeight * GALLERY_WINDOW_UPDATE_RATIO;
@@ -2933,7 +3420,9 @@ function GalleryStage({
 
   useEffect(() => {
     if (windowEndIndex <= windowStartIndex) return;
-    cacheCenterPageRef.current = Math.floor(Math.max(0, (windowStartIndex + windowEndIndex - 1) / 2) / GALLERY_PAGE_SIZE);
+    const centerPage = Math.floor(Math.max(0, (windowStartIndex + windowEndIndex - 1) / 2) / GALLERY_PAGE_SIZE);
+    cacheCenterPageRef.current = centerPage;
+    cancelGalleryFetchesOutsideCache(centerPage);
     const preheatStartIndex = Math.max(0, (windowStartRow - GALLERY_THUMB_PREHEAT_ROWS) * columns);
     const preheatEndIndex = Math.min(total, (windowEndRow + GALLERY_THUMB_PREHEAT_ROWS) * columns);
     const firstPage = Math.floor(preheatStartIndex / GALLERY_PAGE_SIZE) * GALLERY_PAGE_SIZE;
@@ -2941,7 +3430,7 @@ function GalleryStage({
     for (let offset = firstPage; offset <= lastPage; offset += GALLERY_PAGE_SIZE) {
       void fetchPage(offset);
     }
-  }, [columns, fetchPage, total, windowEndIndex, windowEndRow, windowStartIndex, windowStartRow]);
+  }, [cancelGalleryFetchesOutsideCache, columns, fetchPage, total, windowEndIndex, windowEndRow, windowStartIndex, windowStartRow]);
 
   useEffect(() => {
     if (total <= 0 || columns <= 0) return;
@@ -2962,9 +3451,11 @@ function GalleryStage({
     stageRef.current?.scrollTo({ top, behavior: "auto" });
     liveScrollTopRef.current = top;
     pendingScrollTopRef.current = top;
+    latestGalleryIndexRef.current = index;
     lastWindowRowRef.current = Math.floor(top / Math.max(1, rowHeight * GALLERY_WINDOW_UPDATE_RATIO));
     setScrollTop(top);
     pendingScrollIndexRef.current = null;
+    galleryLayoutRestoringRef.current = false;
   }, [columns, rowHeight, total, viewport.width]);
 
   const saveGalleryProgress = useCallback((index: number) => {
@@ -2974,26 +3465,39 @@ function GalleryStage({
     lastSavedIndexRef.current = safeIndex;
     const progress = Math.min(0.995, Math.max(0, (safeIndex + 1) / total));
     const position = `image:${safeIndex}`;
-    api
-      .updateProgress(detail.work.id, progress, position)
-      .then((res) => onProgressSaved(detail.work.id, res.progress, res.position ?? position))
-      .catch(() => {});
-  }, [canPersistProgress, detail.work.id, onProgressSaved, total]);
+    scheduleGalleryProgress(progress, position);
+  }, [canPersistProgress, scheduleGalleryProgress, total]);
 
   useEffect(() => {
     if (total <= 0 || rowHeight <= 0) return;
+    if (galleryLayoutRestoringRef.current) return;
     if (!hasGalleryScrolledRef.current && scrollTop <= 0) return;
-    const now = Date.now();
-    if (now - lastProgressWriteRef.current < 3000) return;
-    lastProgressWriteRef.current = now;
-    saveGalleryProgress(Math.floor(liveScrollTopRef.current / rowHeight) * columns);
+    const saveCurrent = () => {
+      lastProgressWriteRef.current = Date.now();
+      saveGalleryProgress(Math.floor(liveScrollTopRef.current / rowHeight) * columns);
+    };
+    const elapsed = Date.now() - lastProgressWriteRef.current;
+    if (elapsed >= 3000) saveCurrent();
+    if (progressTimerRef.current !== null) window.clearTimeout(progressTimerRef.current);
+    progressTimerRef.current = window.setTimeout(() => {
+      progressTimerRef.current = null;
+      saveCurrent();
+    }, 700);
+    return () => {
+      if (progressTimerRef.current !== null) {
+        window.clearTimeout(progressTimerRef.current);
+        progressTimerRef.current = null;
+      }
+    };
   }, [columns, rowHeight, saveGalleryProgress, scrollTop, total]);
 
   const openGalleryImage = useCallback((index: number) => {
     if (total <= 0) return;
     const safeIndex = Math.min(Math.max(index, 0), total - 1);
+    latestGalleryIndexRef.current = safeIndex;
     const page = Math.floor(safeIndex / GALLERY_PAGE_SIZE);
     cacheCenterPageRef.current = page;
+    cancelGalleryFetchesOutsideCache(page);
     const asset = itemsByIndex[safeIndex];
     if (asset) {
       saveGalleryProgress(safeIndex);
@@ -3004,7 +3508,12 @@ function GalleryStage({
     }
     pendingActiveImageRef.current = safeIndex;
     void fetchPage(safeIndex);
-  }, [fetchPage, itemsByIndex, preloadOriginal, saveGalleryProgress, total]);
+  }, [cancelGalleryFetchesOutsideCache, fetchPage, itemsByIndex, preloadOriginal, saveGalleryProgress, total]);
+
+  const closeGalleryImage = useCallback(() => {
+    pendingActiveImageRef.current = null;
+    setActiveImage(null);
+  }, []);
 
   useEffect(() => {
     const pendingIndex = pendingActiveImageRef.current;
@@ -3021,8 +3530,10 @@ function GalleryStage({
     if (!activeImage || total <= 0) return;
     const centerPage = Math.floor(activeImage.index / GALLERY_PAGE_SIZE);
     cacheCenterPageRef.current = centerPage;
-    const start = Math.max(0, activeImage.index - GALLERY_ORIGINAL_PREFETCH_RADIUS);
-    const end = Math.min(total - 1, activeImage.index + GALLERY_ORIGINAL_PREFETCH_RADIUS);
+    cancelGalleryFetchesOutsideCache(centerPage);
+    const radius = shouldPreloadOriginals ? GALLERY_ORIGINAL_PREFETCH_RADIUS : 0;
+    const start = Math.max(0, activeImage.index - radius);
+    const end = Math.min(total - 1, activeImage.index + radius);
     const firstPage = Math.floor(start / GALLERY_PAGE_SIZE) * GALLERY_PAGE_SIZE;
     const lastPage = Math.floor(end / GALLERY_PAGE_SIZE) * GALLERY_PAGE_SIZE;
     for (let offset = firstPage; offset <= lastPage; offset += GALLERY_PAGE_SIZE) {
@@ -3032,14 +3543,15 @@ function GalleryStage({
       const asset = itemsByIndex[index];
       if (asset) preloadOriginal(asset, Math.abs(index - activeImage.index) <= 1);
     }
-  }, [activeImage, fetchPage, itemsByIndex, preloadOriginal, total]);
+  }, [activeImage, cancelGalleryFetchesOutsideCache, fetchPage, itemsByIndex, preloadOriginal, shouldPreloadOriginals, total]);
 
   useEffect(() => {
     if (!activeImage) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        setActiveImage(null);
+        event.stopImmediatePropagation();
+        closeGalleryImage();
       }
       if (event.key === "ArrowLeft") {
         event.preventDefault();
@@ -3052,12 +3564,13 @@ function GalleryStage({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeImage, openGalleryImage]);
+  }, [activeImage, closeGalleryImage, openGalleryImage]);
 
   useEffect(() => {
+    if (activeImage) latestGalleryIndexRef.current = activeImage.index;
     lightboxWheelDeltaRef.current = 0;
     lastLightboxWheelAtRef.current = 0;
-  }, [activeImage?.index]);
+  }, [activeImage]);
 
   const onGalleryLightboxWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
     if (!activeImage) return;
@@ -3081,6 +3594,13 @@ function GalleryStage({
       ref={stageRef}
       onScroll={(event) => {
         const nextScrollTop = event.currentTarget.scrollTop;
+        const currentTotal = totalRef.current;
+        latestGalleryIndexRef.current = currentTotal > 0
+          ? Math.min(
+              Math.max(Math.floor(nextScrollTop / Math.max(1, rowHeightRef.current)) * columnsRef.current, 0),
+              currentTotal - 1
+            )
+          : 0;
         if (nextScrollTop > 0 || hasGalleryScrolledRef.current) {
           hasGalleryScrolledRef.current = true;
         }
@@ -3122,7 +3642,7 @@ function GalleryStage({
                   type="button"
                 >
                   {asset && shouldLoadImage ? (
-                    <img src={thumbUrl(asset.id, GALLERY_THUMB_SIZE)} alt="" loading="lazy" decoding="async" />
+                    <img src={thumbUrl(asset.id, GALLERY_THUMB_SIZE, assetVersion(asset, galleryVersion))} alt="" loading="lazy" decoding="async" />
                   ) : (
                     <span className="gallery-skeleton" />
                   )}
@@ -3143,10 +3663,10 @@ function GalleryStage({
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
-                  onClick={() => setActiveImage(null)}
+                  onClick={closeGalleryImage}
                   onWheel={onGalleryLightboxWheel}
                 >
-                  <button className="icon-btn lightbox-close" onClick={() => setActiveImage(null)} aria-label="关闭图片">
+                  <button className="icon-btn lightbox-close" onClick={closeGalleryImage} aria-label="关闭图片">
                     <X size={18} />
                   </button>
                   <div className="gallery-lightbox-content" onClick={(event) => event.stopPropagation()}>
@@ -3159,7 +3679,7 @@ function GalleryStage({
                       <ChevronLeft size={20} />
                     </button>
                     <div className="gallery-lightbox-frame">
-                      <img src={assetUrl(activeImage.asset.id)} alt="" />
+                      <img src={assetUrl(activeImage.asset.id, assetVersion(activeImage.asset, galleryVersion))} alt="" />
                     </div>
                     <button
                       className="icon-btn gallery-lightbox-nav next"
@@ -3171,7 +3691,7 @@ function GalleryStage({
                     </button>
                     <div className="gallery-lightbox-toolbar">
                       <span>{activeImage.index + 1}/{total}</span>
-                      <a href={assetUrl(activeImage.asset.id)} target="_blank" rel="noreferrer">
+                      <a href={assetUrl(activeImage.asset.id, assetVersion(activeImage.asset, galleryVersion))} target="_blank" rel="noreferrer">
                         <ExternalLink size={14} />
                         原图
                       </a>
@@ -3219,7 +3739,7 @@ function buildComicCollections(works: WorkSummary[]) {
   }
 
   let syntheticId = -10000;
-  return [...groups.values()].flatMap((group) => {
+  return [...groups.entries()].flatMap(([collectionKey, group]) => {
     const items = group.items;
     if (items.length <= 1) return items;
     const sorted = [...items].sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
@@ -3241,6 +3761,7 @@ function buildComicCollections(works: WorkSummary[]) {
       updated_at: latest.updated_at,
       meta_json: JSON.stringify({
         artist: collectionTitle,
+        collection_key: collectionKey,
         first_work_id: first.id,
         page_count: pageCount,
         volume_ids: sorted.map((item) => item.id),
@@ -3292,7 +3813,7 @@ function buildNovelCollections(works: WorkSummary[]) {
   }
 
   let syntheticId = -1;
-  return [...groups.values()].flatMap((group) => {
+  return [...groups.entries()].flatMap(([collectionKey, group]) => {
     const items = group.items;
     if (items.length <= 1) return items;
     const sorted = [...items].sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
@@ -3314,6 +3835,7 @@ function buildNovelCollections(works: WorkSummary[]) {
       updated_at: latest.updated_at,
       meta_json: JSON.stringify({
         ...meta,
+        collection_key: collectionKey,
         first_work_id: first.id,
         volume_ids: sorted.map((item) => item.id),
         volume_count: sorted.length,
@@ -3342,7 +3864,7 @@ function buildCoserPictureCollections(works: WorkSummary[]) {
   }
 
   let syntheticId = -20000;
-  return [...groups.values()].flatMap((group) => {
+  return [...groups.entries()].flatMap(([collectionKey, group]) => {
     const items = group.items;
     if (items.length <= 1) return items;
     const sorted = [...items].sort((a, b) => a.title.localeCompare(b.title, "zh-Hans"));
@@ -3365,6 +3887,7 @@ function buildCoserPictureCollections(works: WorkSummary[]) {
       updated_at: latest.updated_at,
       meta_json: JSON.stringify({
         ...meta,
+        collection_key: collectionKey,
         coser: collectionTitle,
         first_work_id: first.id,
         page_count: pageCount,
@@ -3460,32 +3983,26 @@ function comicPageFromHorizontalScroll(stage: HTMLDivElement, pageCount: number,
   return Math.min(Math.max(Math.round(centerPage), 0), Math.max(0, pageCount - 1));
 }
 
-function comicPageFromVerticalScroll(stage: HTMLDivElement, pageCount: number) {
-  const pages = [...stage.querySelectorAll<HTMLElement>("[data-page-index]")];
-  if (pages.length === 0) {
-    return fallbackComicPageFromScroll(stage.scrollTop, stage.scrollHeight - stage.clientHeight, pageCount);
+function comicPageFromOffsets(offsets: number[], position: number) {
+  if (offsets.length <= 1) return 0;
+  let low = 0;
+  let high = offsets.length - 1;
+  while (low < high) {
+    const middle = Math.floor((low + high + 1) / 2);
+    if (offsets[middle] <= position) low = middle;
+    else high = middle - 1;
   }
-  const center = stage.scrollTop + stage.clientHeight / 2;
-  let nearestIndex = 0;
-  let nearestDistance = Number.POSITIVE_INFINITY;
-  for (const page of pages) {
-    const index = safeIndex(page.dataset.pageIndex);
-    const pageCenter = page.offsetTop + page.offsetHeight / 2;
-    const distance = Math.abs(pageCenter - center);
-    if (distance < nearestDistance) {
-      nearestDistance = distance;
-      nearestIndex = index;
-    }
-  }
-  return Math.min(Math.max(nearestIndex, 0), Math.max(0, pageCount - 1));
+  return Math.min(Math.max(low, 0), offsets.length - 2);
 }
 
-function fallbackComicPageFromScroll(current: number, maxScroll: number, pageCount: number) {
-  if (maxScroll <= 0 || pageCount < 2) return 0;
-  return Math.min(pageCount - 1, Math.max(0, Math.round((current / maxScroll) * (pageCount - 1))));
-}
-
-function scrollComicStageToPage(stage: HTMLDivElement | null, page: number, pageCount: number, aspect = COMIC_DEFAULT_ASPECT, zoom = 1) {
+function scrollComicStageToPage(
+  stage: HTMLDivElement | null,
+  page: number,
+  pageCount: number,
+  aspect = COMIC_DEFAULT_ASPECT,
+  zoom = 1,
+  verticalOffsets: number[] = []
+) {
   if (!stage || pageCount < 2) return;
   const slot = stage.querySelector<HTMLElement>(`[data-page-index="${page}"]`);
   if (slot) {
@@ -3496,9 +4013,13 @@ function scrollComicStageToPage(stage: HTMLDivElement | null, page: number, page
     stage.scrollTo({ left: comicHorizontalSlotWidth(stage, aspect, zoom) * page, behavior: "auto" });
     return;
   }
-  const maxScroll = stage.scrollWidth - stage.clientWidth;
+  if (stage.dataset.mode === "scroll" && verticalOffsets.length > page) {
+    stage.scrollTo({ left: 0, top: verticalOffsets[page], behavior: "auto" });
+    return;
+  }
+  const maxScroll = stage.scrollHeight - stage.clientHeight;
   if (maxScroll <= 0) return;
-  stage.scrollTo({ left: (maxScroll * page) / (pageCount - 1), behavior: "auto" });
+  stage.scrollTo({ top: (maxScroll * page) / (pageCount - 1), behavior: "auto" });
 }
 
 function upsertLocalHistory(history: HistoryRecord[], work: WorkSummary | undefined, progress: number, position?: string | null) {
@@ -3565,6 +4086,49 @@ function novelParentFolder(path?: string | null) {
 
 function normalizeNovelFolder(value: string) {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+}
+
+function compareWorksByUpdatedAt(left: WorkSummary, right: WorkSummary) {
+  const updated = right.updated_at.localeCompare(left.updated_at);
+  return updated || right.id - left.id;
+}
+
+const LIBRARY_MUTATING_JOB_TYPES = new Set([
+  "scan-library",
+  "import-tag-translations",
+  "rebuild-search-index"
+]);
+
+function isTerminalJob(job: Job) {
+  return job.status === "done" || job.status === "failed";
+}
+
+function markLibraryTerminalJobsSeen(jobs: Job[], seenJobIds: Set<number>) {
+  let foundNewTerminalJob = false;
+  for (const job of jobs) {
+    if (!LIBRARY_MUTATING_JOB_TYPES.has(job.job_type) || !isTerminalJob(job) || seenJobIds.has(job.id)) continue;
+    seenJobIds.add(job.id);
+    foundNewTerminalJob = true;
+  }
+  return foundNewTerminalJob;
+}
+
+function jobsEqual(left: Job[], right: Job[]) {
+  if (left === right) return true;
+  if (left.length !== right.length) return false;
+  return left.every((job, index) => {
+    const other = right[index];
+    return Boolean(
+      other &&
+      job.id === other.id &&
+      job.job_type === other.job_type &&
+      job.status === other.status &&
+      job.payload_json === other.payload_json &&
+      job.attempts === other.attempts &&
+      job.last_error === other.last_error &&
+      job.updated_at === other.updated_at
+    );
+  });
 }
 
 function jobLabel(value: string) {
@@ -3736,21 +4300,55 @@ function shortName(path: string) {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-function rememberGalleryPreload(cache: Map<string, HTMLImageElement>, url: string, decode = false) {
+function observeElementResize(element: Element, measure: () => void) {
+  let frame: number | null = null;
+  const schedule = () => {
+    if (frame !== null) return;
+    frame = window.requestAnimationFrame(() => {
+      frame = null;
+      measure();
+    });
+  };
+  const observer = new ResizeObserver(schedule);
+  observer.observe(element);
+  schedule();
+  return () => {
+    observer.disconnect();
+    if (frame !== null) window.cancelAnimationFrame(frame);
+  };
+}
+
+function rememberGalleryPreload(cache: Map<string, HTMLImageElement>, url: string, decode = false, limit = 5) {
   if (typeof window === "undefined" || cache.has(url)) return;
   const image = new window.Image();
   image.decoding = "async";
   image.loading = "eager";
   image.src = url;
   cache.set(url, image);
-  while (cache.size > GALLERY_PRELOAD_CACHE_LIMIT) {
+  while (cache.size > limit) {
     const oldest = cache.keys().next().value;
     if (!oldest) break;
+    const evicted = cache.get(oldest);
+    if (evicted) evicted.removeAttribute("src");
     cache.delete(oldest);
   }
   if (decode && typeof image.decode === "function") {
     void image.decode().catch(() => {});
   }
+}
+
+function clearGalleryPreloads(cache: Map<string, HTMLImageElement>) {
+  for (const image of cache.values()) image.removeAttribute("src");
+  cache.clear();
+}
+
+function allowsOriginalPreload() {
+  if (typeof navigator === "undefined") return false;
+  const connection = (navigator as Navigator & {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+  if (connection?.saveData) return false;
+  return !connection?.effectiveType || !["slow-2g", "2g", "3g"].includes(connection.effectiveType);
 }
 
 function preferredTrackVariants(tracks: Asset[]) {

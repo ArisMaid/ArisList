@@ -25,6 +25,7 @@ export type Asset = {
   position?: number | null;
   size?: number | null;
   meta_json: string;
+  created_at: string;
 };
 
 export type Tag = {
@@ -58,6 +59,18 @@ export type LibraryResponse = {
   next_cursor?: string | null;
 };
 
+type LibraryRequestOptions = {
+  cursor?: string | null;
+  limit?: number;
+  includeContext?: boolean;
+  signal?: AbortSignal;
+};
+
+type ProgressRequestOptions = {
+  keepalive?: boolean;
+  signal?: AbortSignal;
+};
+
 export type HistoryRecord = {
   work_id: number;
   kind: string;
@@ -82,6 +95,7 @@ export type WorkDetail = {
     source_path?: string | null;
     cover_asset_id?: number | null;
     meta_json: string;
+    updated_at?: string;
   };
   assets: Asset[];
   tags: Tag[];
@@ -224,8 +238,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-async function requestText(url: string): Promise<string> {
-  const res = await fetch(url);
+async function requestText(url: string, init?: RequestInit): Promise<string> {
+  const res = await fetch(url, { ...init, credentials: "same-origin" });
   if (!res.ok) {
     const body = await res.text().catch(() => res.statusText);
     throw new Error(body || res.statusText);
@@ -252,11 +266,6 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ password })
     }),
-  resetPassword: () =>
-    request<{ status: string; password: string }>("/api/auth/password/reset", {
-      method: "POST",
-      body: JSON.stringify({})
-    }),
   logout: async () => {
     await fetch("/api/auth/logout", {
       method: "POST",
@@ -265,32 +274,41 @@ export const api = {
     });
     setCsrfToken(null);
   },
-  library: () => request<LibraryResponse>("/api/library"),
+  library: ({ cursor, limit = 100, includeContext, signal }: LibraryRequestOptions = {}) => {
+    const params = new URLSearchParams();
+    if (cursor) params.set("cursor", cursor);
+    params.set("limit", String(Math.min(500, Math.max(1, Math.trunc(limit)))));
+    if (includeContext !== undefined) params.set("include_context", String(includeContext));
+    return request<LibraryResponse>(`/api/library?${params.toString()}`, { signal });
+  },
   settings: () => request<AppSettings>("/api/settings"),
   updateSettings: (settings: AppSettings) =>
     request<AppSettings>("/api/settings", {
       method: "PATCH",
       body: JSON.stringify(settings)
     }),
-  search: (q: string, limit = 48) =>
-    request<SearchResponse>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`),
-  work: (id: number) => request<WorkDetail>(`/api/works/${id}`),
-  updateProgress: (id: number, progress: number, position?: string) =>
-    request<{ status: string; progress: number; position?: string | null }>(`/api/works/${id}/progress`, {
+  search: (q: string, limit = 48, signal?: AbortSignal) =>
+    request<SearchResponse>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`, { signal }),
+  work: (id: number, signal?: AbortSignal) => request<WorkDetail>(`/api/works/${id}`, { signal }),
+  workHistory: (id: number, signal?: AbortSignal) => request<HistoryRecord | null>(`/api/works/${id}/history`, { signal }),
+  updateProgress: (id: number, progress: number, position: string | undefined, updateToken: number, options: ProgressRequestOptions = {}) =>
+    request<{ status: string; accepted: boolean; progress: number; position?: string | null }>(`/api/works/${id}/progress`, {
       method: "PATCH",
-      body: JSON.stringify({ progress, position })
+      body: JSON.stringify({ progress, position, update_token: updateToken }),
+      keepalive: options.keepalive,
+      signal: options.signal
     }),
-  history: () => request<HistoryRecord[]>("/api/history"),
+  history: (signal?: AbortSignal) => request<HistoryRecord[]>("/api/history", { signal }),
   cloudStatus: () => request<{ qmediasync: { enabled: boolean; base_url: string; configured: boolean; sources: number; strm_roots: number }; cache: { bytes: number; files: number } }>("/api/cloud/status"),
   testQMediaSyncStrmRoot: (input: { root: string; kind?: string; scan_depth?: number }) =>
     request<{ status: string; root: string; works: number; strm_files: number; samples: string[] }>("/api/cloud/qmediasync/test-strm-root", {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  galleryPage: (id: number, cursor = 0, limit = 120) =>
-    request<GalleryPageResponse>(`/api/works/${id}/gallery?cursor=${cursor}&limit=${limit}`),
-  assetRoute: (id: number) => request<AssetRouteInfo>(`/api/assets/${id}/route`),
-  scan: (enqueue_enrichment = false) => request<{ comics: number; novels: number; audio: number; gallery: number; coser_picture: number; jobs_created: number }>("/api/scan", {
+  galleryPage: (id: number, cursor = 0, limit = 120, signal?: AbortSignal, version?: string | null) =>
+    request<GalleryPageResponse>(withVersion(`/api/works/${id}/gallery?cursor=${cursor}&limit=${limit}`, version), { signal }),
+  assetRoute: (id: number, signal?: AbortSignal) => request<AssetRouteInfo>(`/api/assets/${id}/route`, { signal }),
+  scan: (enqueue_enrichment = false) => request<{ job_id: number; status: "queued" | "already-queued" }>("/api/scan", {
     method: "POST",
     body: JSON.stringify({ enqueue_enrichment })
   }),
@@ -304,21 +322,37 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  comicPages: (id: number) => request<{ pages: Array<ComicPageInfo | string> }>(`/api/works/${id}/pages`),
-  epubManifest: (id: number) => request<EpubManifestResponse>(`/api/works/${id}/epub`),
-  epubChapterHtml: (id: number, chapter: number) => requestText(`/api/works/${id}/epub/${chapter}/html`)
+  comicPages: (id: number, signal?: AbortSignal, version?: string | null) =>
+    request<{ pages: Array<ComicPageInfo | string> }>(withVersion(`/api/works/${id}/pages`, version), { signal }),
+  epubManifest: (id: number, signal?: AbortSignal, version?: string | null) =>
+    request<EpubManifestResponse>(withVersion(`/api/works/${id}/epub`, version), { signal }),
+  epubChapterHtml: (id: number, chapter: number, signal?: AbortSignal, version?: string | null) =>
+    requestText(withVersion(`/api/works/${id}/epub/${chapter}/html`, version), { signal })
 };
 
-export function assetUrl(id?: number | null) {
-  return id ? `/api/assets/${id}/stream` : "";
+function withVersion(url: string, version?: string | null) {
+  return version ? `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}` : url;
 }
 
-export function thumbUrl(id?: number | null, size = 360) {
-  return id ? `/api/assets/${id}/thumb?size=${size}` : "";
+export function assetVersion(asset?: Pick<Asset, "created_at" | "size"> | null, _workVersion?: string | null) {
+  if (!asset) return undefined;
+  return `${asset.created_at}:${asset.size ?? "unknown"}`;
 }
 
-export function coverUrl(id?: number | null, size = 480) {
-  return id ? `/api/works/${id}/cover?size=${size}` : "";
+export function assetUrl(id?: number | null, version?: string | null) {
+  return id ? withVersion(`/api/assets/${id}/stream`, version) : "";
+}
+
+export function thumbUrl(id?: number | null, size = 360, version?: string | null) {
+  return id ? withVersion(`/api/assets/${id}/thumb?size=${size}`, version) : "";
+}
+
+export function coverUrl(id?: number | null, size = 480, version?: string | null) {
+  return id ? withVersion(`/api/works/${id}/cover?size=${size}`, version) : "";
+}
+
+export function comicPageUrl(workId: number, page: number, version?: string | null) {
+  return withVersion(`/api/works/${workId}/pages/${page}/stream`, version);
 }
 
 export function parseMeta<T extends Record<string, unknown>>(value?: string | null): T {

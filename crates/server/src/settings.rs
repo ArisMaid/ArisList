@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, RwLock};
+use std::time::SystemTime;
 
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -6,23 +8,31 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 use crate::auth;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::AppState;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ThemeMode {
-    Light,
-    Dark,
+#[derive(Clone)]
+struct CachedSettings {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    settings: AppSettings,
 }
 
-impl Default for ThemeMode {
-    fn default() -> Self {
-        Self::Light
-    }
+static SETTINGS_CACHE: LazyLock<RwLock<Option<CachedSettings>>> =
+    LazyLock::new(|| RwLock::new(None));
+const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThemeMode {
+    #[default]
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -94,22 +104,12 @@ impl CoverCacheDirectorySettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QMediaSyncSettings {
     pub enabled: bool,
     pub base_url: String,
     #[serde(default)]
     pub strm_roots: Vec<String>,
-}
-
-impl Default for QMediaSyncSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: String::new(),
-            strm_roots: Vec::new(),
-        }
-    }
 }
 
 fn default_scan_depth() -> usize {
@@ -139,31 +139,21 @@ pub struct OpenAiSettings {
     pub image_configured: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum UiMaterial {
     Classic,
+    #[default]
     Liquid,
 }
 
-impl Default for UiMaterial {
-    fn default() -> Self {
-        Self::Liquid
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum GlassIntensity {
     Clear,
+    #[default]
     Standard,
     Readable,
-}
-
-impl Default for GlassIntensity {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -192,17 +182,12 @@ fn default_comic_auto_read_interval_ms() -> u64 {
     4000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DetailPaneMode {
+    #[default]
     Modal,
     Docked,
-}
-
-impl Default for DetailPaneMode {
-    fn default() -> Self {
-        Self::Modal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,7 +308,6 @@ impl AppSettings {
                 .trim_end_matches('/')
                 .to_string();
         }
-        self.scan.enqueue_enrichment = false;
         self.scan.enrichment_concurrency = self.scan.enrichment_concurrency.clamp(1, 8);
         self.openai.image_model = config.openai_image_model.clone();
         self.openai.image_configured = config.openai_api_key.is_some();
@@ -343,6 +327,7 @@ pub async fn update_settings(
     auth::require_csrf(&state, &headers, "settings.update").await?;
     let settings = input.normalized(&state.config);
     save_settings(&state.config, &settings).await?;
+    update_settings_cache(&state.config, &settings).await;
     state
         .db
         .audit(
@@ -370,10 +355,31 @@ pub async fn update_settings(
 
 pub async fn load_settings(config: &Config) -> Result<AppSettings> {
     let path = settings_path(config);
-    if !path.exists() {
-        return Ok(AppSettings::defaults(config));
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.as_ref().map(|value| value.len()).unwrap_or(0);
+    if let Ok(cache) = SETTINGS_CACHE.read() {
+        if let Some(cache) = cache.as_ref() {
+            if cache.path == path && cache.modified == modified && cache.len == len {
+                return Ok(cache.settings.clone());
+            }
+        }
     }
-    let raw = tokio::fs::read_to_string(&path).await?;
+    if metadata.is_none() {
+        let settings = AppSettings::defaults(config);
+        replace_settings_cache(path, modified, len, settings.clone());
+        return Ok(settings);
+    }
+    if len > MAX_SETTINGS_FILE_BYTES {
+        return Err(AppError::Other(format!(
+            "settings file exceeds {MAX_SETTINGS_FILE_BYTES} bytes"
+        )));
+    }
+    let raw = read_settings_file_bounded(&path, len).await?;
     let raw_value = serde_json::from_str::<Value>(&raw)
         .map_err(|err| AppError::Other(format!("settings file is invalid: {err}")))?;
     let missing_coser_picture = raw_value
@@ -385,15 +391,56 @@ pub async fn load_settings(config: &Config) -> Result<AppSettings> {
     if missing_coser_picture {
         settings.media_dirs.coser_picture = vec![path_string(&config.coser_picture_dir)];
     }
-    Ok(settings.normalized(config))
+    let settings = settings.normalized(config);
+    replace_settings_cache(path, modified, len, settings.clone());
+    Ok(settings)
+}
+
+async fn read_settings_file_bounded(path: &Path, expected_len: u64) -> Result<String> {
+    let file = tokio::fs::File::open(path).await?;
+    let capacity = expected_len.min(MAX_SETTINGS_FILE_BYTES) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_SETTINGS_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > MAX_SETTINGS_FILE_BYTES {
+        return Err(AppError::Other(format!(
+            "settings file exceeds {MAX_SETTINGS_FILE_BYTES} bytes"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| AppError::Other(format!("settings file is not valid UTF-8: {err}")))
 }
 
 async fn save_settings(config: &Config, settings: &AppSettings) -> Result<()> {
-    tokio::fs::create_dir_all(&config.data_dir).await?;
     let raw = serde_json::to_string_pretty(settings)
         .map_err(|err| AppError::Other(format!("settings serialization failed: {err}")))?;
-    tokio::fs::write(settings_path(config), raw).await?;
+    crate::atomic_file::write(&settings_path(config), raw.as_bytes()).await?;
     Ok(())
+}
+
+async fn update_settings_cache(config: &Config, settings: &AppSettings) {
+    let path = settings_path(config);
+    let metadata = tokio::fs::metadata(&path).await.ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.map(|value| value.len()).unwrap_or(0);
+    replace_settings_cache(path, modified, len, settings.clone());
+}
+
+fn replace_settings_cache(
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    settings: AppSettings,
+) {
+    if let Ok(mut cache) = SETTINGS_CACHE.write() {
+        *cache = Some(CachedSettings {
+            path,
+            modified,
+            len,
+            settings,
+        });
+    }
 }
 
 fn settings_path(config: &Config) -> PathBuf {
@@ -426,6 +473,7 @@ fn normalize_cache_dir(value: String, default: String) -> String {
 
 fn normalize_sources(values: Vec<MediaSourceSettings>) -> Vec<MediaSourceSettings> {
     let mut out: Vec<MediaSourceSettings> = Vec::new();
+    let mut used_mounts = std::collections::HashSet::new();
     for mut value in values {
         value.kind = value.kind.trim().to_ascii_lowercase();
         value.provider = value.provider.trim().to_ascii_lowercase();
@@ -438,21 +486,23 @@ fn normalize_sources(values: Vec<MediaSourceSettings>) -> Vec<MediaSourceSetting
         if !matches!(
             value.kind.as_str(),
             "comic" | "novel" | "audio" | "gallery" | "coser-picture"
-        )
-            || value.provider != "qmediasync"
+        ) || value.provider != "qmediasync"
             || value.root.is_empty()
             || value.mount_name.is_empty()
         {
             continue;
         }
-        if out.iter().any(|existing| {
-            existing.kind == value.kind
-                && existing.provider == value.provider
-                && existing.root == value.root
-                && existing.mount_name == value.mount_name
-        }) {
+        if used_mounts.contains(&value.mount_name)
+            || out.iter().any(|existing| {
+                existing.kind == value.kind
+                    && existing.provider == value.provider
+                    && existing.root == value.root
+                    && existing.mount_name == value.mount_name
+            })
+        {
             continue;
         }
+        used_mounts.insert(value.mount_name.clone());
         out.push(value);
     }
     out
@@ -510,5 +560,49 @@ mod tests {
         assert_eq!(sources[0].provider, "qmediasync");
         assert_eq!(sources[0].root, "/qms/coser");
         assert_eq!(sources[0].scan_depth, 64);
+    }
+
+    #[test]
+    fn rejects_duplicate_mount_names_across_media_kinds() {
+        let sources = normalize_sources(vec![
+            MediaSourceSettings {
+                kind: "comic".to_string(),
+                provider: "qmediasync".to_string(),
+                root: "/qms/comics".to_string(),
+                mount_name: "cloud".to_string(),
+                enabled: true,
+                scan_depth: 12,
+            },
+            MediaSourceSettings {
+                kind: "coser-picture".to_string(),
+                provider: "qmediasync".to_string(),
+                root: "/qms/coser".to_string(),
+                mount_name: "cloud".to_string(),
+                enabled: true,
+                scan_depth: 12,
+            },
+        ]);
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].root, "/qms/comics");
+    }
+
+    #[tokio::test]
+    async fn settings_reader_enforces_actual_size_and_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        tokio::fs::write(&path, vec![b'x'; MAX_SETTINGS_FILE_BYTES as usize + 1])
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_settings_file_bounded(&path, 1).await,
+            Err(AppError::Other(message)) if message.contains("exceeds")
+        ));
+
+        tokio::fs::write(&path, [0xff_u8]).await.unwrap();
+        assert!(matches!(
+            read_settings_file_bounded(&path, 1).await,
+            Err(AppError::Other(message)) if message.contains("UTF-8")
+        ));
     }
 }

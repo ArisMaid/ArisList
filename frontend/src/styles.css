@@ -2130,6 +2130,40 @@ body.reader-open .detail-content::-webkit-scrollbar {
   background: #0b0c0d;
 }
 
+.comic-vertical-spacer {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  contain: layout style;
+}
+
+.comic-vertical-window {
+  position: absolute;
+  inset: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  will-change: transform;
+}
+
+.comic-vertical-slot {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 100%;
+  min-width: 0;
+  contain: layout paint style;
+  overflow: visible;
+}
+
+.comic-stage[data-mode="scroll"] .comic-vertical-slot img {
+  display: block;
+  max-width: none;
+  object-fit: contain;
+}
+
 .novel-stage {
   grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
   align-items: stretch;

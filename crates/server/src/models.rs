@@ -1,6 +1,18 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{sqlite::SqliteRow, FromRow, Row};
+
+macro_rules! impl_sqlite_from_row {
+    ($model:ty { $($field:ident),+ $(,)? }) => {
+        impl<'r> FromRow<'r, SqliteRow> for $model {
+            fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+                Ok(Self {
+                    $($field: row.try_get(stringify!($field))?,)+
+                })
+            }
+        }
+    };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -26,7 +38,7 @@ impl WorkKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Work {
     pub id: i64,
     pub kind: String,
@@ -43,7 +55,23 @@ pub struct Work {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+impl_sqlite_from_row!(Work {
+    id,
+    kind,
+    title,
+    subtitle,
+    category,
+    description,
+    rating,
+    progress,
+    source_path,
+    cover_asset_id,
+    meta_json,
+    created_at,
+    updated_at,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Asset {
     pub id: i64,
     pub work_id: i64,
@@ -57,7 +85,20 @@ pub struct Asset {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+impl_sqlite_from_row!(Asset {
+    id,
+    work_id,
+    path,
+    mime,
+    role,
+    variant,
+    position,
+    size,
+    meta_json,
+    created_at,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
     pub id: i64,
     pub namespace: String,
@@ -71,7 +112,20 @@ pub struct Tag {
     pub count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+impl_sqlite_from_row!(Tag {
+    id,
+    namespace,
+    key,
+    label,
+    translated_label,
+    translated_namespace,
+    source,
+    intro,
+    links,
+    count,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: i64,
     pub job_type: String,
@@ -84,7 +138,19 @@ pub struct Job {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+impl_sqlite_from_row!(Job {
+    id,
+    job_type,
+    status,
+    payload_json,
+    attempts,
+    retry_at,
+    last_error,
+    created_at,
+    updated_at,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRecord {
     pub work_id: i64,
     pub kind: String,
@@ -96,7 +162,18 @@ pub struct HistoryRecord {
     pub last_opened_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+impl_sqlite_from_row!(HistoryRecord {
+    work_id,
+    kind,
+    title,
+    subtitle,
+    cover_asset_id,
+    progress,
+    position,
+    last_opened_at,
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalId {
     pub id: i64,
     pub work_id: i64,
@@ -105,6 +182,15 @@ pub struct ExternalId {
     pub token: Option<String>,
     pub url: Option<String>,
 }
+
+impl_sqlite_from_row!(ExternalId {
+    id,
+    work_id,
+    source,
+    external_id,
+    token,
+    url,
+});
 
 #[derive(Debug, Serialize)]
 pub struct LibraryResponse {
@@ -115,7 +201,7 @@ pub struct LibraryResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 pub struct WorkSummary {
     pub id: i64,
     pub kind: String,
@@ -132,6 +218,23 @@ pub struct WorkSummary {
     pub asset_count: i64,
     pub updated_at: DateTime<Utc>,
 }
+
+impl_sqlite_from_row!(WorkSummary {
+    id,
+    kind,
+    title,
+    subtitle,
+    category,
+    rating,
+    progress,
+    source_path,
+    cover_asset_id,
+    meta_json,
+    tag_keys,
+    tag_count,
+    asset_count,
+    updated_at,
+});
 
 #[derive(Debug, Serialize)]
 pub struct WorkDetail {
