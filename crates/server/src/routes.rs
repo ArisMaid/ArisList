@@ -9,6 +9,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -18,14 +20,21 @@ use walkdir::WalkDir;
 
 use crate::assets;
 use crate::auth;
+use crate::catalog;
+use crate::catalog_reconciliation;
+use crate::catalog_writer::CATALOG_KINDS;
 use crate::enrich;
 use crate::error::{AppError, Result};
+use crate::inventory;
+use crate::migrations;
 use crate::models::{
-    Asset, HistoryRecord, LibraryResponse, ScanRequest, Tag, WorkDetail, WorkKind,
+    Asset, HistoryRecord, LibraryResponse, ScanRequest, Tag, WorkDetail, WorkDetailAssetMode,
+    WorkKind,
 };
+use crate::resource;
 use crate::search;
 use crate::settings;
-use crate::AppState;
+use crate::{AppState, Row};
 
 static FILESYSTEM_INSPECTION_LIMIT: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(2)));
@@ -51,21 +60,65 @@ where
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/health/resources", get(resource_health))
+        .route("/catalog/works", get(catalog::works))
+        .route("/catalog/ownership", get(catalog_ownership))
+        .route("/catalog/ownership/{kind}", post(change_catalog_ownership))
+        .route(
+            "/catalog/reconciliation",
+            get(catalog_reconciliation_status),
+        )
+        .route(
+            "/catalog/reconciliation/novel",
+            post(reconcile_catalog_novel),
+        )
+        .route(
+            "/catalog/reconciliation/comic",
+            post(reconcile_catalog_comic),
+        )
+        .route(
+            "/catalog/reconciliation/coser-picture",
+            post(reconcile_catalog_coser_picture),
+        )
+        .route(
+            "/catalog/reconciliation/audio",
+            post(reconcile_catalog_audio),
+        )
+        .route(
+            "/catalog/reconciliation/gallery",
+            post(reconcile_catalog_gallery),
+        )
+        .route("/catalog/random", get(catalog::random))
+        .route("/catalog/collections", get(catalog::collections))
+        .route("/catalog/facets/tags", get(catalog::facets_tags))
+        .route("/catalog/counts", get(catalog::counts))
+        .route("/catalog/history", get(catalog::history))
+        .route("/inventory/status", get(inventory::status))
         .route("/auth/session", get(auth::session))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/password", patch(auth::change_password))
         .route("/library", get(library))
+        .route("/jobs", get(jobs))
         .route("/history", get(history))
         .route(
             "/settings",
             get(settings::get_settings).patch(settings::update_settings),
         )
         .route("/search", get(search::search))
+        .route(
+            "/search/shadow/reconcile",
+            get(search::reconcile_shadow_facts),
+        )
         .route("/search/rebuild", post(search::enqueue_rebuild))
+        .route(
+            "/search/shadow/rebuild",
+            post(search::enqueue_shadow_rebuild),
+        )
         .route("/cloud/status", get(cloud_status))
         .route("/cloud/qmediasync/test-strm-root", post(test_qms_strm_root))
         .route("/works/{id}", get(work_detail))
+        .route("/works/{id}/assets", get(catalog::assets))
         .route("/works/{id}/history", get(work_history))
         .route(
             "/works/{id}/cover",
@@ -110,6 +163,84 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct ResourceHealthQuery {
+    /// Optional, explicit maintenance probe.  Normal health polling remains
+    /// read-only; `?checkpoint=true` runs one passive WAL checkpoint so a
+    /// benchmark can capture reader-snapshot evidence without adding that
+    /// work to every poll.
+    #[serde(default)]
+    checkpoint: bool,
+}
+
+async fn resource_health(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ResourceHealthQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let cgroup_memory = resource::cgroup_memory_snapshot().await;
+    let cgroup_cpu = resource::cgroup_cpu_snapshot().await;
+    if query.checkpoint {
+        state.db.checkpoint_wal().await?;
+    }
+    let sqlite = state.db.runtime_snapshot().await;
+    let catalog_queries = catalog::query_metrics_snapshot();
+    let catalog_runtime = state.catalog_runtime.snapshot().await;
+    let search_runtime = state.search_runtime.snapshot().await;
+    // All diagnostic database facts below are intentionally read from one
+    // short tracked snapshot.  A one-second sampler must not turn six pool
+    // checkouts into a recurring source of connection contention, nor report
+    // catalog/search revisions from different generations.
+    let mut transaction = state.db.begin_tracked_read_transaction().await?;
+    let schema_version = migrations::current_version_in(transaction.connection()).await?;
+    let derivatives = state.derivatives.stats_in(transaction.connection()).await?;
+    let tag_facets = catalog::tag_kind_count_status_in(transaction.connection()).await?;
+    let search_outbox = crate::search::outbox::status_in(transaction.connection()).await?;
+    let search_shadow =
+        crate::search::outbox::shadow_index_status_in(transaction.connection()).await?;
+    let search_reconciliation =
+        crate::search::outbox::reconciliation_status_in(transaction.connection()).await?;
+    let archive_manifest_cache = sqlx::query(
+        r#"
+        SELECT resident_bytes, resident_entries, updated_at
+        FROM archive_manifest_cache_state
+        WHERE singleton = 1
+        "#,
+    )
+    .fetch_one(transaction.connection())
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(json!({
+        "status": "ok",
+        "schema_version": schema_version,
+        "resources": state.resources.snapshot(),
+        "cgroup_memory": cgroup_memory,
+        "cgroup_cpu": cgroup_cpu,
+        "sqlite": sqlite,
+        "tag_facets": tag_facets,
+        "catalog_queries": catalog_queries,
+        "catalog_runtime": catalog_runtime,
+        "search_runtime": search_runtime,
+        "search_outbox": search_outbox,
+        "search_shadow": search_shadow,
+        "search_reconciliation": search_reconciliation,
+        "jobs": crate::jobs::runtime_snapshot(),
+        "archive_manifest_cache": {
+            "resident_bytes": archive_manifest_cache.get::<i64, _>("resident_bytes"),
+            "resident_entries": archive_manifest_cache.get::<i64, _>("resident_entries"),
+            "budget_bytes": state.resources.limits().archive_manifest_cache_bytes / 2,
+            "updated_at": archive_manifest_cache.get::<String, _>("updated_at"),
+        },
+        "search_features": {
+            "outbox_shadow": state.config.search_outbox_shadow_enabled,
+            "shadow_canary": state.config.search_shadow_canary_enabled,
+            "incremental_reader": state.config.search_incremental_reader_enabled,
+            "reader_prewarm": state.config.search_reader_prewarm_enabled,
+        },
+        "derivatives": derivatives,
+        "qmediasync": crate::vfs::qms_runtime_snapshot(),
+    })))
+}
+
 async fn health(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let paths = [
         ("comics", state.config.comics_dir.clone()),
@@ -136,16 +267,376 @@ async fn health(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::V
             .collect::<serde_json::Map<_, _>>()
     })
     .await?;
+    // Keep the readiness response coherent and bounded.  These three search
+    // status rows describe one deployment generation; reading them through
+    // separate pool checkouts could combine state from different revisions
+    // and turns a periodic health probe into avoidable connection churn.
+    let mut transaction = state.db.begin_tracked_read_transaction().await?;
+    let search_outbox = crate::search::outbox::status_in(transaction.connection()).await?;
+    let search_shadow =
+        crate::search::outbox::shadow_index_status_in(transaction.connection()).await?;
+    let search_reconciliation =
+        crate::search::outbox::reconciliation_status_in(transaction.connection()).await?;
+    transaction.commit().await?;
     Ok(Json(json!({
         "status": "ok",
         "mode": "single-user-private",
         "media": media,
+        "search_outbox": search_outbox,
+        "search_shadow": search_shadow,
+        "search_reconciliation": search_reconciliation,
         "features": {
             "file_watcher": state.config.enable_file_watcher,
             "enrichment_concurrency": state.config.enrichment_concurrency.clamp(1, 8),
             "openai_image_model": state.config.openai_image_model,
             "openai_image_configured": state.config.openai_api_key.is_some(),
+            "catalog_v2": state.config.catalog_v2_enabled,
+            "facet_bitmap": state.config.facet_bitmap_enabled,
+            "inventory_scanner": state.config.inventory_scanner_enabled,
+            "inventory_scanner_kinds": state
+                .config
+                .inventory_enabled_kinds()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "search_outbox_shadow": state.config.search_outbox_shadow_enabled,
+            "search_shadow_canary": state.config.search_shadow_canary_enabled,
+            "search_incremental_reader": state.config.search_incremental_reader_enabled,
+            "search_reader_prewarm": state.config.search_reader_prewarm_enabled,
+            "derivative_cache_v2": state.config.derivative_cache_v2_enabled,
+            "jpeg_thumbnail_downscale": state.config.jpeg_thumbnail_downscale_enabled,
         }
+    })))
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogOwnershipItem {
+    kind: String,
+    authoritative_writer: String,
+    updated_at: String,
+    roots: i64,
+    enabled_roots: i64,
+    ready_roots: i64,
+    pending_events: i64,
+    failed_events: i64,
+}
+
+/// Return ownership and coordinator readiness without exposing configured
+/// filesystem paths.  This is intentionally read-only so an operator can
+/// inspect a NAS before deciding whether to issue the explicit cutover call.
+async fn catalog_ownership(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<CatalogOwnershipItem>>> {
+    // Ownership status is sampled by operators and Gate tooling. Keep all
+    // correlated root/event counts on one short snapshot so a promotion
+    // boundary cannot produce a mixed-generation diagnostic response.
+    let mut transaction = state.db.begin_tracked_read_transaction().await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            ownership.kind,
+            ownership.authoritative_writer,
+            ownership.updated_at,
+            (SELECT COUNT(*) FROM library_roots AS root
+             WHERE root.kind = ownership.kind) AS roots,
+            (SELECT COUNT(*) FROM library_roots AS root
+             WHERE root.kind = ownership.kind AND root.enabled = 1) AS enabled_roots,
+            (SELECT COUNT(*) FROM library_roots AS root
+             WHERE root.kind = ownership.kind AND root.enabled = 1
+               AND root.status = 'idle'
+               AND root.active_token IS NULL
+               AND root.completed_generation = root.generation) AS ready_roots,
+            (SELECT COUNT(*)
+             FROM scan_events AS event
+             JOIN library_roots AS root ON root.id = event.root_id
+             WHERE root.kind = ownership.kind
+               AND event.event_kind IN ('catalog-upsert', 'catalog-delete')
+               AND event.status IN ('pending', 'processing')) AS pending_events,
+            (SELECT COUNT(*)
+             FROM scan_events AS event
+             JOIN library_roots AS root ON root.id = event.root_id
+             WHERE root.kind = ownership.kind
+               AND event.event_kind IN ('catalog-upsert', 'catalog-delete')
+               AND event.status = 'failed'
+               AND event.work_key IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_events AS newer
+                   WHERE newer.root_id = event.root_id
+                     AND newer.work_key = event.work_key
+                     AND newer.event_kind IN ('catalog-upsert', 'catalog-delete')
+                     AND newer.seq > event.seq
+               )) AS failed_events
+        FROM catalog_kind_ownership AS ownership
+        ORDER BY CASE ownership.kind
+            WHEN 'novel' THEN 1
+            WHEN 'comic' THEN 2
+            WHEN 'coser-picture' THEN 3
+            WHEN 'audio' THEN 4
+            WHEN 'gallery' THEN 5
+            ELSE 99 END
+        "#,
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| CatalogOwnershipItem {
+                kind: row.get("kind"),
+                authoritative_writer: row.get("authoritative_writer"),
+                updated_at: row.get("updated_at"),
+                roots: row.get("roots"),
+                enabled_roots: row.get("enabled_roots"),
+                ready_roots: row.get("ready_roots"),
+                pending_events: row.get("pending_events"),
+                failed_events: row.get("failed_events"),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogOwnershipRequest {
+    /// `promote` assigns the kind to the bounded Catalog v2 coordinator;
+    /// `rollback` returns it to the legacy scanner.
+    action: String,
+    reason: Option<String>,
+}
+
+async fn change_catalog_ownership(
+    State(state): State<Arc<AppState>>,
+    Path(kind): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<CatalogOwnershipRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.ownership").await?;
+    let kind = kind.trim().to_ascii_lowercase();
+    if !CATALOG_KINDS.contains(&kind.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported catalog kind {kind:?}"
+        )));
+    }
+    let action = input.action.trim().to_ascii_lowercase();
+    let target_writer = match action.as_str() {
+        "promote" | "catalog-v2" | "v2" => "catalog-v2",
+        "rollback" | "legacy" => "legacy",
+        _ => {
+            return Err(AppError::BadRequest(
+                "catalog ownership action must be promote or rollback".to_string(),
+            ))
+        }
+    };
+
+    if target_writer == "catalog-v2" {
+        if !state.config.catalog_v2_enabled {
+            return Err(AppError::BadRequest(
+                "CATALOG_V2_ENABLED is false; enable the Catalog v2 read/write implementation before promotion"
+                    .to_string(),
+            ));
+        }
+        if !state.config.inventory_kind_enabled(&kind) {
+            return Err(AppError::BadRequest(
+                "INVENTORY_SCANNER_ENABLED and INVENTORY_SCANNER_KINDS must include the target kind before promotion".to_string(),
+            ));
+        }
+        if !state.config.search_outbox_shadow_enabled {
+            return Err(AppError::BadRequest(
+                "SEARCH_OUTBOX_SHADOW_ENABLED must be true before a kind can be promoted"
+                    .to_string(),
+            ));
+        }
+        if matches!(kind.as_str(), "comic" | "coser-picture" | "audio") {
+            let runtime_settings = settings::load_settings(&state.config).await?;
+            if !crate::vfs::qmediasync_scan_sources(&runtime_settings, &kind).is_empty() {
+                return Err(AppError::BadRequest(format!(
+                    "cannot promote {kind}: qmediasync roots require provider reconciliation evidence and remain fail-closed"
+                )));
+            }
+        }
+    }
+
+    // Promotion rechecks Search evidence inside the same writer transaction as
+    // the ownership update. Rollback does not need that gate and retains the
+    // existing conservative legacy-reconcile path.
+    let change = if target_writer == "catalog-v2" {
+        state
+            .db
+            .change_catalog_kind_ownership_checked(&kind, target_writer, input.reason.as_deref())
+            .await?
+    } else {
+        state
+            .db
+            .change_catalog_kind_ownership(&kind, target_writer, input.reason.as_deref())
+            .await?
+    };
+    let mut job_id = None;
+    let mut job_created = false;
+    if change.changed {
+        let (id, created) = state
+            .db
+            .create_job_if_absent(
+                "scan-library",
+                "queued",
+                json!({
+                    "source": "catalog-ownership",
+                    "kind": kind,
+                    "enqueue_enrichment": false,
+                }),
+            )
+            .await?;
+        job_id = Some(id);
+        job_created = created;
+    }
+    Ok(Json(json!({
+        "status": if change.changed { "changed" } else { "unchanged" },
+        "change": change,
+        "scan_job_id": job_id,
+        "scan_job_created": job_created,
+    })))
+}
+
+async fn catalog_reconciliation_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<catalog_reconciliation::CatalogReconciliationOverview>> {
+    Ok(Json(catalog_reconciliation::overview(&state.db).await?))
+}
+
+async fn reconcile_catalog_novel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent(
+            catalog_reconciliation::RECONCILE_NOVEL_JOB_TYPE,
+            "queued",
+            json!({ "source": "catalog-reconciliation-api", "kind": "novel" }),
+        )
+        .await?;
+    state
+        .db
+        .audit(
+            "catalog.reconciliation",
+            if created { "queued" } else { "coalesced" },
+            json!({ "job_id": job_id, "kind": "novel" }),
+        )
+        .await?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-active" },
+        "created": created,
+    })))
+}
+
+async fn reconcile_catalog_comic(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent(
+            catalog_reconciliation::RECONCILE_COMIC_JOB_TYPE,
+            "queued",
+            json!({ "source": "catalog-reconciliation-api", "kind": "comic" }),
+        )
+        .await?;
+    state
+        .db
+        .audit(
+            "catalog.reconciliation",
+            if created { "queued" } else { "coalesced" },
+            json!({ "job_id": job_id, "kind": "comic" }),
+        )
+        .await?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-active" },
+        "created": created,
+    })))
+}
+
+async fn reconcile_catalog_coser_picture(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent(
+            catalog_reconciliation::RECONCILE_COSER_PICTURE_JOB_TYPE,
+            "queued",
+            json!({ "source": "catalog-reconciliation-api", "kind": "coser-picture" }),
+        )
+        .await?;
+    state
+        .db
+        .audit(
+            "catalog.reconciliation",
+            if created { "queued" } else { "coalesced" },
+            json!({ "job_id": job_id, "kind": "coser-picture" }),
+        )
+        .await?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-active" },
+        "created": created,
+    })))
+}
+
+async fn reconcile_catalog_audio(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent(
+            catalog_reconciliation::RECONCILE_AUDIO_JOB_TYPE,
+            "queued",
+            json!({ "source": "catalog-reconciliation-api", "kind": "audio" }),
+        )
+        .await?;
+    state
+        .db
+        .audit(
+            "catalog.reconciliation",
+            if created { "queued" } else { "coalesced" },
+            json!({ "job_id": job_id, "kind": "audio" }),
+        )
+        .await?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-active" },
+        "created": created,
+    })))
+}
+
+async fn reconcile_catalog_gallery(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
+    let (job_id, created) = state
+        .db
+        .create_job_if_absent(
+            catalog_reconciliation::RECONCILE_GALLERY_JOB_TYPE,
+            "queued",
+            json!({ "source": "catalog-reconciliation-api", "kind": "gallery" }),
+        )
+        .await?;
+    state
+        .db
+        .audit(
+            "catalog.reconciliation",
+            if created { "queued" } else { "coalesced" },
+            json!({ "job_id": job_id, "kind": "gallery" }),
+        )
+        .await?;
+    Ok(Json(json!({
+        "job_id": job_id,
+        "status": if created { "queued" } else { "already-active" },
+        "created": created,
     })))
 }
 
@@ -175,16 +666,43 @@ async fn library(
     ))
 }
 
+async fn jobs(State(state): State<Arc<AppState>>) -> Result<Json<Vec<crate::models::Job>>> {
+    Ok(Json(state.db.jobs(100).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkDetailQuery {
+    /// `legacy` is the compatibility default.  Catalog v2 clients request
+    /// `summary` so a large work never embeds its complete asset list.
+    asset_mode: Option<String>,
+}
+
+fn parse_work_detail_asset_mode(value: Option<&str>) -> Result<WorkDetailAssetMode> {
+    match value {
+        None | Some("legacy") => Ok(WorkDetailAssetMode::Legacy),
+        Some("summary") => Ok(WorkDetailAssetMode::Summary),
+        Some(value) => Err(AppError::BadRequest(format!(
+            "invalid asset_mode {value:?}; expected legacy or summary"
+        ))),
+    }
+}
+
 async fn work_detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<WorkDetailQuery>,
 ) -> Result<Json<WorkDetail>> {
-    Ok(Json(state.db.work_detail(id).await?))
+    let asset_mode = parse_work_detail_asset_mode(query.asset_mode.as_deref())?;
+    state.catalog_runtime.record_work_detail_mode(asset_mode);
+    Ok(Json(state.db.work_detail_with_mode(id, asset_mode).await?))
 }
 
 #[derive(Debug, Deserialize)]
 struct GalleryQuery {
-    cursor: Option<i64>,
+    /// New clients send an opaque `(position,id)` cursor.  A decimal value
+    /// is still accepted as a bounded compatibility path for older clients;
+    /// those requests use one offset lookup and then receive a keyset cursor.
+    cursor: Option<String>,
     limit: Option<i64>,
     v: Option<String>,
 }
@@ -192,8 +710,42 @@ struct GalleryQuery {
 #[derive(Debug, Serialize)]
 struct GalleryAssetsResponse {
     items: Vec<Asset>,
-    next_cursor: Option<i64>,
+    next_cursor: Option<String>,
     total: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GalleryCursor {
+    position: i64,
+    id: i64,
+    #[serde(default)]
+    source_version: Option<String>,
+    #[serde(default)]
+    catalog_revision: Option<i64>,
+}
+
+fn encode_gallery_cursor(
+    position: i64,
+    id: i64,
+    source_version: &str,
+    catalog_revision: i64,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&GalleryCursor {
+        position,
+        id,
+        source_version: Some(source_version.to_string()),
+        catalog_revision: Some(catalog_revision),
+    })
+    .map_err(|err| AppError::Other(format!("encode gallery cursor: {err}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_gallery_cursor(cursor: &str) -> Result<GalleryCursor> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| AppError::BadRequest("invalid gallery cursor".to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::BadRequest("invalid gallery cursor".to_string()))
 }
 
 async fn gallery_assets(
@@ -201,22 +753,65 @@ async fn gallery_assets(
     Path(id): Path<i64>,
     Query(query): Query<GalleryQuery>,
 ) -> Result<Response> {
-    let (kind, _) = state.db.work_kind_and_meta(id).await?;
-    if kind != WorkKind::Gallery.as_str() {
+    let limit = query.limit.unwrap_or(120).clamp(1, 240);
+    let (offset, after, cursor) = match query.cursor.as_deref() {
+        None => (Some(0), None, None),
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(offset) => (Some(offset.max(0)), None, None),
+            Err(_) => {
+                let cursor = decode_gallery_cursor(raw)?;
+                (None, Some((cursor.position, cursor.id)), Some(cursor))
+            }
+        },
+    };
+    let page = state
+        .db
+        .gallery_assets_page(id, offset, after, limit + 1)
+        .await?;
+    if page.kind != WorkKind::Gallery.as_str() {
         return Err(AppError::BadRequest("work is not a gallery".to_string()));
     }
-    let offset = query.cursor.unwrap_or(0).max(0);
-    let limit = query.limit.unwrap_or(120).clamp(1, 240);
-    let total = state.db.gallery_asset_count(id).await?;
-    let items = if offset >= total {
-        Vec::new()
+    if let Some(cursor) = cursor.as_ref() {
+        if cursor
+            .source_version
+            .as_deref()
+            .is_some_and(|version| version != page.source_version.to_rfc3339())
+        {
+            return Err(AppError::BadRequest(
+                "gallery cursor expired after the work changed".to_string(),
+            ));
+        }
+        if cursor
+            .catalog_revision
+            .is_some_and(|revision| revision != page.catalog_revision)
+        {
+            return Err(AppError::BadRequest(
+                "gallery cursor expired after the catalog changed".to_string(),
+            ));
+        }
+    }
+    let total = page.total;
+    let mut items = page.items;
+    let has_more = items.len() as i64 > limit;
+    items.truncate(limit as usize);
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|asset| {
+                encode_gallery_cursor(
+                    asset.position.unwrap_or(-1),
+                    asset.id,
+                    &page.source_version.to_rfc3339(),
+                    page.catalog_revision,
+                )
+            })
+            .transpose()?
     } else {
-        state.db.gallery_assets(id, offset, limit).await?
+        None
     };
-    let next = offset + items.len() as i64;
     let mut response = Json(GalleryAssetsResponse {
         items,
-        next_cursor: (next < total).then_some(next),
+        next_cursor,
         total,
     })
     .into_response();
@@ -404,7 +999,18 @@ async fn scan(
     let enqueue_enrichment = input
         .enqueue_enrichment
         .unwrap_or(configured.scan.enqueue_enrichment);
-    let payload = json!({ "enqueue_enrichment": enqueue_enrichment });
+    let kind = input
+        .kind
+        .as_deref()
+        .map(crate::scanner::normalize_scan_kind)
+        .transpose()?;
+    let payload = match kind.as_deref() {
+        Some(kind) => json!({
+            "enqueue_enrichment": enqueue_enrichment,
+            "kind": kind,
+        }),
+        None => json!({ "enqueue_enrichment": enqueue_enrichment }),
+    };
     let (job_id, created) = state
         .db
         .create_job_if_absent("scan-library", "queued", payload.clone())
@@ -417,6 +1023,7 @@ async fn scan(
             json!({
                 "job_id": job_id,
                 "enqueue_enrichment": enqueue_enrichment,
+                "kind": kind,
             }),
         )
         .await?;
@@ -441,4 +1048,288 @@ async fn events(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_detail_asset_mode_defaults_to_legacy_and_accepts_summary() {
+        assert_eq!(
+            parse_work_detail_asset_mode(None).unwrap(),
+            WorkDetailAssetMode::Legacy
+        );
+        assert_eq!(
+            parse_work_detail_asset_mode(Some("legacy")).unwrap(),
+            WorkDetailAssetMode::Legacy
+        );
+        assert_eq!(
+            parse_work_detail_asset_mode(Some("summary")).unwrap(),
+            WorkDetailAssetMode::Summary
+        );
+    }
+
+    #[test]
+    fn work_detail_asset_mode_rejects_unknown_values() {
+        let error = parse_work_detail_asset_mode(Some("all"))
+            .expect_err("unknown detail modes must fail closed");
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("asset_mode")));
+    }
+
+    #[test]
+    fn search_promotion_gate_accepts_a_revision_zero_empty_catalog() {
+        let shadow = crate::search::outbox::ShadowIndexStatus {
+            index_name: "shadow-v3".to_string(),
+            schema_version: 1,
+            baseline_revision: 0,
+            applied_revision: 0,
+            baseline_search_revision: 0,
+            applied_search_revision: 0,
+            indexed_documents: 0,
+            ready: false,
+            status: "shadow".to_string(),
+            last_error: None,
+            updated_at: "2026-08-18T00:00:00.000Z".to_string(),
+        };
+        let reconciliation = crate::search::outbox::ShadowReconciliationStatus {
+            index_name: "shadow-v3".to_string(),
+            status: "passed".to_string(),
+            catalog_revision: 0,
+            catalog_revision_after: 0,
+            applied_revision: 0,
+            applied_revision_after: 0,
+            search_revision: 0,
+            search_revision_after: 0,
+            applied_search_revision: 0,
+            applied_search_revision_after: 0,
+            sqlite_work_count: 0,
+            index_document_count: 0,
+            index_unique_work_count: 0,
+            missing_work_ids: 0,
+            unexpected_work_ids: 0,
+            duplicate_documents: 0,
+            invalid_documents: 0,
+            sqlite_ids_sha256: Some(
+                "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc".to_string(),
+            ),
+            index_ids_sha256: Some(
+                "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc".to_string(),
+            ),
+            consecutive_passes: 1,
+            passed_since: Some("2026-08-18T00:00:00.000Z".to_string()),
+            last_checked_at: Some("2026-08-18T00:00:00.000Z".to_string()),
+            took_millis: Some(1),
+            cutover_armed: false,
+        };
+        let outbox = crate::search::outbox::OutboxStatus {
+            pending: 0,
+            claimed: 0,
+            committed: 0,
+            failed: 0,
+            retrying: 0,
+            max_attempts: 0,
+            stale_claims: 0,
+            oldest_failed_at: None,
+            oldest_pending_at: None,
+            latest_committed_at: None,
+            oldest_pending_revision: None,
+            oldest_pending_search_revision: None,
+            catalog_revision: 0,
+            shadow_applied_revision: 0,
+            revision_lag: 0,
+            search_revision: 0,
+            shadow_applied_search_revision: 0,
+            search_revision_lag: 0,
+        };
+
+        assert!(crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+    }
+
+    #[test]
+    fn search_promotion_gate_rejects_stale_or_incompatible_evidence() {
+        let mut shadow = crate::search::outbox::ShadowIndexStatus {
+            index_name: "shadow-v3".to_string(),
+            schema_version: 1,
+            baseline_revision: 0,
+            applied_revision: 3,
+            baseline_search_revision: 0,
+            applied_search_revision: 3,
+            indexed_documents: 1,
+            ready: true,
+            status: "ready".to_string(),
+            last_error: None,
+            updated_at: "2026-08-18T00:00:00.000Z".to_string(),
+        };
+        let reconciliation = crate::search::outbox::ShadowReconciliationStatus {
+            index_name: "shadow-v3".to_string(),
+            status: "passed".to_string(),
+            catalog_revision: 3,
+            catalog_revision_after: 3,
+            applied_revision: 3,
+            applied_revision_after: 3,
+            search_revision: 3,
+            search_revision_after: 3,
+            applied_search_revision: 3,
+            applied_search_revision_after: 3,
+            sqlite_work_count: 1,
+            index_document_count: 1,
+            index_unique_work_count: 1,
+            missing_work_ids: 0,
+            unexpected_work_ids: 0,
+            duplicate_documents: 0,
+            invalid_documents: 0,
+            sqlite_ids_sha256: Some("a".repeat(64)),
+            index_ids_sha256: Some("a".repeat(64)),
+            consecutive_passes: 1,
+            passed_since: Some("2026-08-18T00:00:00.000Z".to_string()),
+            last_checked_at: Some("2026-08-18T00:00:00.000Z".to_string()),
+            took_millis: Some(1),
+            cutover_armed: false,
+        };
+        let outbox = crate::search::outbox::OutboxStatus {
+            pending: 0,
+            claimed: 0,
+            committed: 0,
+            failed: 0,
+            retrying: 0,
+            max_attempts: 0,
+            stale_claims: 0,
+            oldest_failed_at: None,
+            oldest_pending_at: None,
+            latest_committed_at: None,
+            oldest_pending_revision: None,
+            oldest_pending_search_revision: None,
+            catalog_revision: 3,
+            shadow_applied_revision: 3,
+            revision_lag: 0,
+            search_revision: 3,
+            shadow_applied_search_revision: 3,
+            search_revision_lag: 0,
+        };
+
+        assert!(crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+        shadow.schema_version += 1;
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+        shadow.schema_version = 1;
+        shadow.status = "unknown".to_string();
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+    }
+
+    #[test]
+    fn search_promotion_gate_rejects_passed_status_with_count_drift() {
+        let mut shadow = crate::search::outbox::ShadowIndexStatus {
+            index_name: "shadow-v3".to_string(),
+            schema_version: 1,
+            baseline_revision: 4,
+            applied_revision: 4,
+            baseline_search_revision: 4,
+            applied_search_revision: 4,
+            indexed_documents: 2,
+            ready: true,
+            status: "ready".to_string(),
+            last_error: None,
+            updated_at: "2026-08-23T00:00:00.000Z".to_string(),
+        };
+        let mut reconciliation = crate::search::outbox::ShadowReconciliationStatus {
+            index_name: "shadow-v3".to_string(),
+            status: "passed".to_string(),
+            catalog_revision: 4,
+            catalog_revision_after: 4,
+            applied_revision: 4,
+            applied_revision_after: 4,
+            search_revision: 4,
+            search_revision_after: 4,
+            applied_search_revision: 4,
+            applied_search_revision_after: 4,
+            sqlite_work_count: 2,
+            index_document_count: 2,
+            index_unique_work_count: 2,
+            missing_work_ids: 0,
+            unexpected_work_ids: 0,
+            duplicate_documents: 0,
+            invalid_documents: 0,
+            sqlite_ids_sha256: Some("a".repeat(64)),
+            index_ids_sha256: Some("a".repeat(64)),
+            consecutive_passes: 1,
+            passed_since: Some("2026-08-23T00:00:00.000Z".to_string()),
+            last_checked_at: Some("2026-08-23T00:00:00.000Z".to_string()),
+            took_millis: Some(1),
+            cutover_armed: false,
+        };
+        let outbox = crate::search::outbox::OutboxStatus {
+            pending: 0,
+            claimed: 0,
+            committed: 0,
+            failed: 0,
+            retrying: 0,
+            max_attempts: 0,
+            stale_claims: 0,
+            oldest_failed_at: None,
+            oldest_pending_at: None,
+            latest_committed_at: None,
+            oldest_pending_revision: None,
+            oldest_pending_search_revision: None,
+            catalog_revision: 4,
+            shadow_applied_revision: 4,
+            revision_lag: 0,
+            search_revision: 4,
+            shadow_applied_search_revision: 4,
+            search_revision_lag: 0,
+        };
+
+        assert!(crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+
+        reconciliation.index_document_count = 1;
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+
+        reconciliation.index_document_count = 2;
+        reconciliation.index_ids_sha256 = Some("b".repeat(64));
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+
+        reconciliation.index_ids_sha256 = reconciliation.sqlite_ids_sha256.clone();
+        shadow.indexed_documents = 1;
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+
+        shadow.indexed_documents = 2;
+        reconciliation.sqlite_ids_sha256 = Some("a".to_string());
+        reconciliation.index_ids_sha256 = Some("a".to_string());
+        assert!(!crate::search::outbox::search_promotion_gate_ready(
+            &shadow,
+            &reconciliation,
+            &outbox,
+        ));
+    }
 }

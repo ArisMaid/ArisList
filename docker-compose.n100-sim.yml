@@ -1,0 +1,64 @@
+# Controlled local approximation of the NAS/N100 deployment.
+#
+# This file is intentionally an override. It keeps the production compose file
+# unchanged, uses an isolated data tree and port, and applies only cgroup-level
+# limits that Docker can actually enforce. It does not emulate the N100 CPU
+# model, cache hierarchy, frequency behavior, or NAS HDD latency.
+#
+# Requires a Linux Docker Engine or Docker Desktop Compose with !override
+# support (Compose v2.24+). Start with:
+#   docker compose -f docker-compose.yml -f docker-compose.n100-sim.yml up --build
+
+services:
+  app:
+    image: ${ARISLIST_SIM_IMAGE:-arislist:n100-sim}
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Formal project acceptance uses one throttled CPU quota. This is a
+    # conservative approximation on a faster development host; it does not
+    # emulate N100 IPC, cache hierarchy, frequency or storage latency.
+    cpus: ${SIM_CPUS:-1.0}
+    mem_limit: ${SIM_MEMORY_LIMIT:-4g}
+    memswap_limit: ${SIM_MEMORY_SWAP_LIMIT:-4g}
+    pids_limit: ${SIM_PIDS_LIMIT:-256}
+
+    ports: !override
+      - "${SIM_APP_PORT:-8788}:8787"
+
+    environment:
+      RESOURCE_PROFILE: nas-n100-4g
+      ENABLE_FILE_WATCHER: "false"
+      # Inventory remains closed by default, but an isolated simulation may
+      # opt into one or more kinds without changing production Compose.
+      INVENTORY_SCANNER_ENABLED: "${SIM_INVENTORY_SCANNER_ENABLED:-false}"
+      INVENTORY_SCANNER_KINDS: "${SIM_INVENTORY_SCANNER_KINDS:-all}"
+      # Experimental search gates remain closed unless an isolated simulation
+      # explicitly opts in through SIM_* overrides. Production Compose is not
+      # affected by these variables.
+      SEARCH_OUTBOX_SHADOW_ENABLED: "${SIM_SEARCH_OUTBOX_SHADOW_ENABLED:-false}"
+      SEARCH_SHADOW_CANARY_ENABLED: "${SIM_SEARCH_SHADOW_CANARY_ENABLED:-false}"
+      SEARCH_INCREMENTAL_READER_ENABLED: "${SIM_SEARCH_INCREMENTAL_READER_ENABLED:-false}"
+      SEARCH_READER_PREWARM_ENABLED: "${SIM_SEARCH_READER_PREWARM_ENABLED:-false}"
+      # Keep experimental media derivatives disabled by default, but allow an
+      # isolated simulation to opt in without changing production Compose.
+      DERIVATIVE_CACHE_V2_ENABLED: "${SIM_DERIVATIVE_CACHE_V2_ENABLED:-false}"
+      JPEG_THUMBNAIL_DOWNSCALE_ENABLED: "${SIM_JPEG_THUMBNAIL_DOWNSCALE_ENABLED:-false}"
+      # Experimental gates stay closed by default. Set SIM_FACET_BITMAP_ENABLED=true
+      # only for an isolated bitmap A/B; production defaults are unchanged.
+      FACET_BITMAP_ENABLED: ${SIM_FACET_BITMAP_ENABLED:-false}
+
+    # Do not reuse production data, generated files or cache artifacts during
+    # a simulation. !override replaces the base volume list rather than
+    # appending a second mount at the same container path.
+    volumes: !override
+      - ${SIM_COMICS_DIR:-./漫画}:/library/comics:ro
+      - ${SIM_NOVELS_DIR:-./轻小说}:/library/novels:ro
+      - ${SIM_AUDIO_DIR:-./音声}:/library/audio:ro
+      - ${SIM_GALLERY_DIR:-./图库}:/library/gallery:ro
+      - ${SIM_COSER_DIR:-./COS图}:/library/coser-picture:ro
+      - ${SIM_DATA_DIR:-./perf-results/docker-n100-sim/data}:/app/data
+      - ${SIM_GENERATED_DIR:-./perf-results/docker-n100-sim/generated}:/app/generated
+      - ${SIM_COVER_CACHE_DIR:-./perf-results/docker-n100-sim/cover-cache}:/app/cover-cache

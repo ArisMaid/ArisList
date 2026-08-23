@@ -16,6 +16,7 @@ html-escape = "0.2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 lofty = "0.22"
 mime_guess = "2"
+mozjpeg = "0.10.13"
 notify = "8"
 rand = "0.8"
 quick-xml = { version = "0.41", features = ["serialize"] }

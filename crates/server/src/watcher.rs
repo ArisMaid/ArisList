@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 
 use crate::error::{AppError, Result};
+use crate::inventory;
 use crate::settings;
 use crate::AppState;
 
@@ -21,9 +23,14 @@ pub fn spawn_library_watcher(state: Arc<AppState>) {
 }
 
 async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let callback_overflowed = overflowed.clone();
+    let event_processor_running = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = mpsc::channel(128);
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-        let _ = tx.try_send(event);
+        if tx.try_send(event).is_err() {
+            callback_overflowed.store(true, Ordering::Release);
+        }
     })
     .map_err(watch_error)?;
 
@@ -32,6 +39,8 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(2));
     let mut watched_roots = HashSet::new();
     let mut watcher_enabled = false;
+    let mut current_settings = None;
+    let mut legacy_scan_needed = false;
 
     loop {
         tokio::select! {
@@ -41,10 +50,46 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
                 };
                 match event {
                     Ok(event) if is_media_event(&event) => {
+                        if state.config.inventory_any_kind_enabled() {
+                            if let Some(app_settings) = current_settings.as_ref() {
+                                let enabled_kinds = state.config.inventory_enabled_kinds();
+                                if let Err(err) = inventory::journal_watcher_paths_for_kinds(
+                                    &state.db,
+                                    app_settings,
+                                    event_kind_label(&event),
+                                    &event.paths,
+                                    &enabled_kinds,
+                                ).await {
+                                    overflowed.store(true, Ordering::Release);
+                                    tracing::warn!(error = %err, "failed to journal library watcher event");
+                                }
+                                match inventory::event_requires_legacy_scan_for_kinds(
+                                    &state.db,
+                                    app_settings,
+                                    &event.paths,
+                                    &enabled_kinds,
+                                )
+                                .await {
+                                    Ok(required) => legacy_scan_needed |= required,
+                                    Err(err) => {
+                                        legacy_scan_needed = true;
+                                        tracing::warn!(error = %err, "failed to classify watcher event");
+                                    }
+                                }
+                            } else {
+                                overflowed.store(true, Ordering::Release);
+                                legacy_scan_needed = true;
+                            }
+                        } else {
+                            legacy_scan_needed = true;
+                        }
                         last_event = Some(Instant::now());
                     }
                     Ok(_) => {}
-                    Err(err) => tracing::warn!(error = %err, "library watcher event failed"),
+                    Err(err) => {
+                        overflowed.store(true, Ordering::Release);
+                        tracing::warn!(error = %err, "library watcher event failed");
+                    }
                 }
             }
             _ = ticker.tick() => {
@@ -61,14 +106,65 @@ async fn run_library_watcher(state: Arc<AppState>) -> Result<()> {
                             &mut watched_roots,
                             roots,
                         );
+                        current_settings = Some(app_settings);
                     }
                     Err(err) => tracing::warn!(error = %err, "failed to refresh watcher settings"),
                 }
-                if watcher_enabled && last_event.map(|instant| instant.elapsed() >= debounce).unwrap_or(false) {
+                if state.config.inventory_any_kind_enabled() && overflowed.swap(false, Ordering::AcqRel) {
+                    if let Some(app_settings) = current_settings.as_ref() {
+                        let enabled_kinds = state.config.inventory_enabled_kinds();
+                        if let Err(err) = inventory::mark_watcher_gap_for_kinds(
+                            &state.db,
+                            app_settings,
+                            "watcher event stream overflowed or reported an error",
+                            &enabled_kinds,
+                        ).await {
+                            overflowed.store(true, Ordering::Release);
+                            tracing::warn!(error = %err, "failed to mark inventory roots for reconcile");
+                        }
+                        legacy_scan_needed = true;
+                    }
+                }
+                if state.config.inventory_any_kind_enabled()
+                    && event_processor_running
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                {
+                    let processor_state = state.clone();
+                    let processor_running = event_processor_running.clone();
+                    tokio::spawn(async move {
+                        let enabled_kinds = processor_state.config.inventory_enabled_kinds();
+                        match inventory::process_pending_events_for_kinds(
+                            &processor_state.db,
+                            &processor_state.resources,
+                            &processor_state.config.generated_dir,
+                            64,
+                            &enabled_kinds,
+                        ).await {
+                            Ok(summary) if summary.claimed > 0 => tracing::debug!(
+                                claimed = summary.claimed,
+                                completed = summary.completed,
+                                retried = summary.retried,
+                                failed = summary.failed,
+                                discovered = summary.discovered,
+                                newly_missing = summary.newly_missing,
+                                "processed shadow inventory watcher events"
+                            ),
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!(error = %err, "failed to process inventory watcher journal"),
+                        }
+                        processor_running.store(false, Ordering::Release);
+                    });
+                }
+                if watcher_enabled
+                    && legacy_scan_needed
+                    && last_event.map(|instant| instant.elapsed() >= debounce).unwrap_or(false)
+                {
                     if let Err(err) = queue_scan(&state).await {
                         tracing::warn!(error = %err, "failed to queue watcher scan");
                     }
                     last_event = None;
+                    legacy_scan_needed = false;
                 }
             }
         }
@@ -129,7 +225,24 @@ fn is_media_event(event: &Event) -> bool {
     ) {
         return false;
     }
-    matches!(event.kind, EventKind::Remove(_)) || event.paths.iter().any(|path| is_media_path(path))
+    matches!(
+        event.kind,
+        EventKind::Remove(_)
+            | EventKind::Create(notify::event::CreateKind::Folder)
+            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+    ) || event.paths.iter().any(|path| is_media_path(path))
+}
+
+fn event_kind_label(event: &Event) -> &'static str {
+    match event.kind {
+        EventKind::Create(notify::event::CreateKind::Folder) => "create-folder",
+        EventKind::Create(_) => "create",
+        EventKind::Modify(notify::event::ModifyKind::Name(_)) => "rename",
+        EventKind::Modify(_) => "modify",
+        EventKind::Remove(notify::event::RemoveKind::Folder) => "remove-folder",
+        EventKind::Remove(_) => "remove",
+        _ => "other",
+    }
 }
 
 fn is_media_path(path: &Path) -> bool {
@@ -194,5 +307,27 @@ mod tests {
         };
 
         assert!(is_media_event(&event));
+        assert_eq!(event_kind_label(&event), "remove-folder");
+    }
+
+    #[test]
+    fn created_directories_and_renames_are_journaled() {
+        let folder = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![PathBuf::from("gallery/new-author")],
+            attrs: Default::default(),
+        };
+        assert!(is_media_event(&folder));
+        assert_eq!(event_kind_label(&folder), "create-folder");
+
+        let rename = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both,
+            )),
+            paths: vec![PathBuf::from("old"), PathBuf::from("new")],
+            attrs: Default::default(),
+        };
+        assert!(is_media_event(&rename));
+        assert_eq!(event_kind_label(&rename), "rename");
     }
 }

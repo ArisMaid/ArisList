@@ -11,19 +11,22 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::db::ScannerAssetInput;
+use crate::db::{ScannerAssetInput, ScannerExternalIdInput, ScannerTagInput, ScannerWorkSnapshot};
 use crate::error::{AppError, Result};
+use crate::inventory;
 use crate::models::ScanResponse;
+use crate::resource::{ResourceClass, ResourceGovernor};
 use crate::settings;
 use crate::vfs;
 use crate::AppState;
 
+pub(crate) mod audio_grouping;
+pub(crate) mod inspectors;
+
 static NATURAL_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
-static RJ_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"RJ\d{6,9}").unwrap());
 static EPUB_MANIFEST_ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?is)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?item\s+[^>]+>"#).unwrap());
 static EPUB_META_RE: LazyLock<Regex> =
@@ -59,15 +62,17 @@ static EPUB_GROUP_POSITION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)<(?:[A-Za-z_][A-Za-z0-9_.-]*:)?meta[^>]+property=["']group-position["'][^>]*>(.*?)</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?meta>"#).unwrap()
 });
 static AUDIO_TRACK_NOISE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(mp3|wav|flac|ogg|m4a|効果音なし|seなし|bonus|特典)\b").unwrap()
+    Regex::new(r"(?i)\b(mp3|wav|flac|ogg|m4a|aac|opus|効果音なし|seなし|bonus|特典)\b").unwrap()
 });
-static SCANNER_BLOCKING_LIMIT: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(4)));
 const MAX_COMIC_INFO_BYTES: u64 = 1024 * 1024;
 const MAX_EPUB_XML_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TEXT_SUMMARY_BYTES: u64 = 64 * 1024;
 const MAX_EPUB_COVER_BYTES: u64 = 12 * 1024 * 1024;
 const SCANNER_ASSET_BATCH_SIZE: usize = 512;
+const SCANNER_DISCOVERY_BATCH_SIZE: usize = 512;
+const SCANNER_PROCESSING_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GALLERY_PARENT_DIRECTORIES: usize = 65_536;
+const MAX_AUDIO_DISCOVERY_PATH_BYTES: usize = 64 * 1024 * 1024;
 
 struct ScannerHeartbeat {
     task: tokio::task::JoinHandle<()>,
@@ -155,6 +160,22 @@ struct ScannedPath {
     source_version: String,
 }
 
+/// Gallery directories can contain thousands of images.  Keep their ordered
+/// path and metadata in one allocation instead of retaining the directory
+/// list, a fingerprint input clone, and a second map key for every image.
+#[derive(Debug)]
+struct GalleryScannedPath {
+    path: PathBuf,
+    size: Option<i64>,
+    source_version: String,
+}
+
+#[derive(Debug)]
+struct GalleryFingerprint {
+    value: String,
+    files: Vec<GalleryScannedPath>,
+}
+
 impl ScanFingerprint {
     fn from_paths(mut paths: Vec<PathBuf>) -> Self {
         paths.sort();
@@ -210,12 +231,83 @@ impl ScanFingerprint {
         self.paths.get(path).and_then(|value| value.size)
     }
 
+    fn source_version(&self, path: &Path) -> Option<&str> {
+        self.paths
+            .get(path)
+            .map(|value| value.source_version.as_str())
+    }
+
     fn asset_meta(&self, path: &Path, mut meta: serde_json::Value) -> serde_json::Value {
         if let (Some(scanned), Some(object)) = (self.paths.get(path), meta.as_object_mut()) {
             object.insert(
                 "_source_version".to_string(),
                 json!(&scanned.source_version),
             );
+        }
+        meta
+    }
+}
+
+impl GalleryFingerprint {
+    fn from_ordered_paths(root: PathBuf, paths: Vec<PathBuf>) -> Result<Self> {
+        let mut hasher = Sha256::new();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let metadata = std::fs::metadata(&path).map_err(|error| {
+                AppError::Other(format!(
+                    "gallery metadata changed during scan for {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(AppError::Other(format!(
+                    "gallery entry is no longer a file during scan: {}",
+                    path.display()
+                )));
+            }
+            let stored_size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or(0);
+            let modified_ns = modified.min(i64::MAX as u128) as i64;
+            let file_id = inventory::file_id_for_metadata(&path, &metadata);
+            let source_version =
+                inventory::fast_fingerprint("image", stored_size, modified_ns, file_id.as_deref());
+            let relative_path = path
+                .strip_prefix(&root)
+                .map_err(|_| {
+                    AppError::Other(format!(
+                        "gallery path escaped configured root during scan: {}",
+                        path.display()
+                    ))
+                })
+                .map(path_string)?;
+            inspectors::gallery::update_gallery_fingerprint(
+                &mut hasher,
+                &relative_path,
+                &source_version,
+                stored_size,
+            );
+            files.push(GalleryScannedPath {
+                path,
+                size: Some(stored_size),
+                source_version,
+            });
+        }
+        Ok(Self {
+            value: format!("{:x}", hasher.finalize()),
+            files,
+        })
+    }
+}
+
+impl GalleryScannedPath {
+    fn asset_meta(&self, mut meta: serde_json::Value) -> serde_json::Value {
+        if let Some(object) = meta.as_object_mut() {
+            object.insert("_source_version".to_string(), json!(&self.source_version));
         }
         meta
     }
@@ -261,6 +353,7 @@ struct AudioMetadataState {
 struct ExtractedCover {
     path: PathBuf,
     size: Option<i64>,
+    source_version: String,
 }
 
 struct ScanWalk {
@@ -269,34 +362,194 @@ struct ScanWalk {
     complete: bool,
 }
 
-async fn scanner_blocking<T, F>(task: F) -> Result<T>
+struct BatchedWalkState {
+    iterator: Option<walkdir::IntoIter>,
+    usable: bool,
+    complete: bool,
+    done: bool,
+}
+
+/// Incremental variant of `walk_matching_files`.
+///
+/// The legacy walker retains every matching path until traversal completes.
+/// That is needlessly expensive on a large NAS library and also delays the
+/// first database write.  This walker keeps only WalkDir's bounded traversal
+/// state and exposes a small batch at a time.  The caller still decides when
+/// to commit the scanner scope, so incomplete traversal keeps the same
+/// tombstone-safety semantics as the legacy path.
+struct BatchedFileWalker {
+    resources: ResourceGovernor,
+    state: Arc<std::sync::Mutex<BatchedWalkState>>,
+    root: PathBuf,
+    label: &'static str,
+    lease_valid: Arc<AtomicBool>,
+    predicate: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+}
+
+impl BatchedFileWalker {
+    fn usable(&self) -> bool {
+        self.state.lock().map(|state| state.usable).unwrap_or(false)
+    }
+
+    async fn next_batch(&self) -> Result<Option<Vec<PathBuf>>> {
+        let state = self.state.clone();
+        let root = self.root.clone();
+        let label = self.label;
+        let lease_valid = self.lease_valid.clone();
+        let predicate = self.predicate.clone();
+        scanner_blocking(&self.resources, move || {
+            let mut state = state.lock().map_err(|_| {
+                AppError::Other("scanner traversal state lock poisoned".to_string())
+            })?;
+            if state.done {
+                return Ok(None);
+            }
+            let mut files = Vec::with_capacity(SCANNER_DISCOVERY_BATCH_SIZE);
+            let mut traversal_failed = false;
+            let iterator = state.iterator.as_mut().ok_or_else(|| {
+                AppError::Other("scanner traversal iterator was unexpectedly missing".to_string())
+            })?;
+            while files.len() < SCANNER_DISCOVERY_BATCH_SIZE {
+                if !lease_valid.load(Ordering::Acquire) {
+                    return Err(AppError::Other(
+                        "library scanner lease was lost during traversal".to_string(),
+                    ));
+                }
+                match iterator.next() {
+                    None => {
+                        state.done = true;
+                        break;
+                    }
+                    Some(Err(err)) => {
+                        tracing::warn!(
+                            path = %root.display(),
+                            error = %err,
+                            "{label} traversal failed"
+                        );
+                        traversal_failed = true;
+                    }
+                    Some(Ok(entry)) => {
+                        if entry.file_type().is_file() && predicate(entry.path()) {
+                            files.push(entry.into_path());
+                        }
+                    }
+                }
+            }
+            if traversal_failed {
+                state.complete = false;
+            }
+            if files.is_empty() && state.done {
+                Ok(None)
+            } else {
+                Ok(Some(files))
+            }
+        })
+        .await
+    }
+
+    async fn finish(self) -> Result<ScanWalk> {
+        let state = self.state.clone();
+        scanner_blocking(&self.resources, move || {
+            let state = state.lock().map_err(|_| {
+                AppError::Other("scanner traversal state lock poisoned".to_string())
+            })?;
+            Ok(ScanWalk {
+                files: Vec::new(),
+                usable: state.usable,
+                complete: state.complete && state.done,
+            })
+        })
+        .await
+    }
+}
+
+async fn open_matching_file_batches<F>(
+    resources: &ResourceGovernor,
+    root: &Path,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    label: &'static str,
+    lease_valid: Arc<AtomicBool>,
+    predicate: F,
+) -> Result<BatchedFileWalker>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    let root = root.to_path_buf();
+    let state_root = root.clone();
+    let state = scanner_blocking(resources, move || {
+        if !state_root.is_dir() || std::fs::read_dir(&state_root).is_err() {
+            tracing::warn!(path = %state_root.display(), "{label} root is not readable");
+            return Ok(BatchedWalkState {
+                iterator: None,
+                usable: false,
+                complete: false,
+                done: true,
+            });
+        }
+        let mut walker = WalkDir::new(&state_root).min_depth(min_depth);
+        if let Some(max_depth) = max_depth {
+            walker = walker.max_depth(max_depth);
+        }
+        Ok(BatchedWalkState {
+            iterator: Some(walker.into_iter()),
+            usable: true,
+            complete: true,
+            done: false,
+        })
+    })
+    .await?;
+    Ok(BatchedFileWalker {
+        resources: resources.clone(),
+        state: Arc::new(std::sync::Mutex::new(state)),
+        root,
+        label,
+        lease_valid,
+        predicate: Arc::new(predicate),
+    })
+}
+
+async fn scanner_blocking<T, F>(resources: &ResourceGovernor, task: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
-    let permit = SCANNER_BLOCKING_LIMIT
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| AppError::Other("scanner blocking executor is closed".to_string()))?;
+    let lease = resources
+        .reserve_background(ResourceClass::ScanIo, SCANNER_PROCESSING_BUDGET_BYTES, 0)
+        .await?;
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _lease = lease;
         task()
     })
     .await
     .map_err(|err| AppError::Other(format!("scanner blocking task failed: {err}")))?
 }
 
-async fn fingerprint_paths(paths: Vec<PathBuf>) -> Result<ScanFingerprint> {
-    scanner_blocking(move || Ok(ScanFingerprint::from_paths(paths))).await
+async fn fingerprint_paths(
+    resources: &ResourceGovernor,
+    paths: Vec<PathBuf>,
+) -> Result<ScanFingerprint> {
+    scanner_blocking(resources, move || Ok(ScanFingerprint::from_paths(paths))).await
+}
+
+async fn fingerprint_gallery_paths(
+    resources: &ResourceGovernor,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+) -> Result<GalleryFingerprint> {
+    scanner_blocking(resources, move || {
+        GalleryFingerprint::from_ordered_paths(root, paths)
+    })
+    .await
 }
 
 async fn fingerprint_archive(
+    resources: &ResourceGovernor,
     archive_path: PathBuf,
     include_comic_info: bool,
     include_cover: bool,
 ) -> Result<ArchiveScanState> {
-    scanner_blocking(move || {
+    scanner_blocking(resources, move || {
         let dir = archive_path.parent().unwrap_or_else(|| Path::new(""));
         let comic_info_path = dir.join("ComicInfo.xml");
         let cover = include_cover.then(|| find_cover_file(dir)).flatten();
@@ -316,11 +569,12 @@ async fn fingerprint_archive(
 }
 
 async fn fingerprint_audio_group(
+    resources: &ResourceGovernor,
     audio_dir: PathBuf,
     rj: String,
     files: Vec<PathBuf>,
 ) -> Result<AudioFingerprintState> {
-    scanner_blocking(move || {
+    scanner_blocking(resources, move || {
         let root = common_rj_root(&audio_dir, &rj, &files);
         let cover = audio_cover_candidate(&files, &root);
         let mut fingerprint_files = files;
@@ -338,13 +592,16 @@ async fn fingerprint_audio_group(
     .await
 }
 
-async fn read_audio_group_metadata(files: Vec<PathBuf>) -> Result<AudioMetadataState> {
-    scanner_blocking(move || {
+async fn read_audio_group_metadata(
+    resources: &ResourceGovernor,
+    files: Vec<PathBuf>,
+) -> Result<AudioMetadataState> {
+    scanner_blocking(resources, move || {
         let summary = read_first_text_summary(&files);
         let tracks = files
             .iter()
             .map(|path| {
-                if !extension_is(path, &["mp3", "wav", "flac", "ogg", "m4a"]) {
+                if !audio_track_file(path) {
                     return None;
                 }
                 let stem = path
@@ -368,40 +625,44 @@ async fn read_audio_group_metadata(files: Vec<PathBuf>) -> Result<AudioMetadataS
     .await
 }
 
-async fn read_comic_info_blocking(dir: PathBuf) -> Result<Option<ComicInfo>> {
-    scanner_blocking(move || read_comic_info(&dir)).await
+async fn read_comic_info_blocking(
+    resources: &ResourceGovernor,
+    dir: PathBuf,
+) -> Result<Option<ComicInfo>> {
+    scanner_blocking(resources, move || read_comic_info(&dir)).await
 }
 
-async fn count_cbz_pages_blocking(path: PathBuf) -> Result<i64> {
-    scanner_blocking(move || count_cbz_pages(&path)).await
+async fn count_cbz_pages_blocking(resources: &ResourceGovernor, path: PathBuf) -> Result<i64> {
+    scanner_blocking(resources, move || count_cbz_pages(&path)).await
 }
 
-async fn read_epub_metadata_blocking(path: PathBuf) -> Result<EpubMetadata> {
-    scanner_blocking(move || read_epub_metadata(&path)).await
+async fn read_epub_metadata_blocking(
+    resources: &ResourceGovernor,
+    path: PathBuf,
+) -> Result<EpubMetadata> {
+    scanner_blocking(resources, move || read_epub_metadata(&path)).await
 }
 
-async fn extract_epub_cover_blocking(
+async fn extract_epub_cover_content_addressed_blocking(
+    resources: &ResourceGovernor,
     epub_path: PathBuf,
     generated_dir: PathBuf,
-    work_id: i64,
 ) -> Result<Option<ExtractedCover>> {
-    scanner_blocking(move || {
-        let Some(path) = extract_epub_cover(&epub_path, &generated_dir, work_id)? else {
-            return Ok(None);
-        };
-        let size = std::fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| i64::try_from(metadata.len()).ok());
-        Ok(Some(ExtractedCover { path, size }))
+    scanner_blocking(resources, move || {
+        extract_epub_cover_named(&epub_path, &generated_dir, "epub-cover-v2")
     })
     .await
 }
 
-async fn read_qms_strm_url_blocking(path: PathBuf) -> Result<String> {
-    scanner_blocking(move || vfs::read_qms_strm_url(&path)).await
+pub(crate) async fn read_qms_strm_url_blocking(
+    resources: &ResourceGovernor,
+    path: PathBuf,
+) -> Result<String> {
+    scanner_blocking(resources, move || vfs::read_qms_strm_url(&path)).await
 }
 
 async fn walk_matching_files<F>(
+    resources: &ResourceGovernor,
     root: &Path,
     min_depth: usize,
     max_depth: Option<usize>,
@@ -413,7 +674,7 @@ where
     F: Fn(&Path) -> bool + Send + Sync + 'static,
 {
     let root = root.to_path_buf();
-    scanner_blocking(move || {
+    scanner_blocking(resources, move || {
         if !root.is_dir() || std::fs::read_dir(&root).is_err() {
             tracing::warn!(path = %root.display(), "{label} root is not readable");
             return Ok(ScanWalk {
@@ -451,6 +712,139 @@ where
             usable: true,
             complete,
         })
+    })
+    .await
+}
+
+/// Discover only the parent directories that contain gallery images.  The
+/// legacy gallery scanner used to retain every matching path (70w images can
+/// turn that into hundreds of megabytes before the first database write).
+/// Directory identities are small and bounded by the number of image sets;
+/// each set is enumerated and committed separately by `scan_gallery`.
+async fn walk_matching_parent_directories<F>(
+    resources: &ResourceGovernor,
+    root: &Path,
+    min_depth: usize,
+    max_depth: Option<usize>,
+    label: &'static str,
+    lease_valid: Arc<AtomicBool>,
+    predicate: F,
+) -> Result<ScanWalk>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    let root = root.to_path_buf();
+    scanner_blocking(resources, move || {
+        if !root.is_dir() || std::fs::read_dir(&root).is_err() {
+            tracing::warn!(path = %root.display(), "{label} root is not readable");
+            return Ok(ScanWalk {
+                files: Vec::new(),
+                usable: false,
+                complete: false,
+            });
+        }
+        let mut walker = WalkDir::new(&root).min_depth(min_depth);
+        if let Some(max_depth) = max_depth {
+            walker = walker.max_depth(max_depth);
+        }
+        let mut parents = std::collections::BTreeSet::new();
+        let mut complete = true;
+        for entry in walker {
+            if !lease_valid.load(Ordering::Acquire) {
+                return Err(AppError::Other(
+                    "library scanner lease was lost during traversal".to_string(),
+                ));
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(path = %root.display(), error = %err, "{label} traversal failed");
+                    complete = false;
+                    continue;
+                }
+            };
+            if entry.file_type().is_file() && predicate(entry.path()) {
+                if let Some(parent) = entry.path().parent() {
+                    parents.insert(parent.to_path_buf());
+                    if parents.len() >= MAX_GALLERY_PARENT_DIRECTORIES {
+                        tracing::warn!(
+                            path = %root.display(),
+                            limit = MAX_GALLERY_PARENT_DIRECTORIES,
+                            "gallery parent-directory discovery reached its safety limit"
+                        );
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ScanWalk {
+            files: parents.into_iter().collect(),
+            usable: true,
+            complete,
+        })
+    })
+    .await
+}
+
+async fn list_matching_files_in_directory<F>(
+    resources: &ResourceGovernor,
+    directory: &Path,
+    lease_valid: Arc<AtomicBool>,
+    predicate: F,
+) -> Result<(Vec<PathBuf>, bool)>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
+    let directory = directory.to_path_buf();
+    scanner_blocking(resources, move || {
+        let read_dir = match std::fs::read_dir(&directory) {
+            Ok(read_dir) => read_dir,
+            Err(err) => {
+                tracing::warn!(path = %directory.display(), error = %err, "gallery directory is not readable");
+                return Ok((Vec::new(), false));
+            }
+        };
+        let mut files = Vec::new();
+        let mut complete = true;
+        for entry in read_dir {
+            if !lease_valid.load(Ordering::Acquire) {
+                return Err(AppError::Other(
+                    "library scanner lease was lost during gallery directory enumeration"
+                        .to_string(),
+                ));
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(path = %directory.display(), error = %err, "gallery directory entry read failed");
+                    complete = false;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), error = %err, "gallery entry type read failed");
+                    complete = false;
+                    continue;
+                }
+            };
+            if file_type.is_file() && predicate(&path) {
+                if files.len() >= inspectors::gallery::MAX_GALLERY_FILES_PER_WORK {
+                    tracing::warn!(
+                        path = %directory.display(),
+                        limit = inspectors::gallery::MAX_GALLERY_FILES_PER_WORK,
+                        "gallery directory reached the per-work file safety limit"
+                    );
+                    complete = false;
+                    break;
+                }
+                files.push(path);
+            }
+        }
+        Ok((files, complete))
     })
     .await
 }
@@ -496,6 +890,41 @@ pub struct ScanStats {
 }
 
 pub async fn scan_all(state: &AppState, enqueue_enrichment: bool) -> Result<ScanResponse> {
+    scan_with_scope(state, enqueue_enrichment, None).await
+}
+
+/// Run a maintenance scan for one media kind.  Ownership promotion and
+/// operator-triggered repair jobs use this path so a change to (for example)
+/// Gallery does not rescan Comic, Novel, Audio, and CoserPicture on the same
+/// N100/HDD maintenance window.
+pub async fn scan_kind(
+    state: &AppState,
+    kind: &str,
+    enqueue_enrichment: bool,
+) -> Result<ScanResponse> {
+    let kind = normalize_scan_kind(kind)?;
+    scan_with_scope(state, enqueue_enrichment, Some(kind.as_str())).await
+}
+
+pub fn normalize_scan_kind(kind: &str) -> Result<String> {
+    let normalized = kind.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "comic" | "novel" | "audio" | "gallery" | "coser-picture"
+    ) {
+        Ok(normalized)
+    } else {
+        Err(AppError::BadRequest(format!(
+            "unsupported scan kind {kind:?}"
+        )))
+    }
+}
+
+async fn scan_with_scope(
+    state: &AppState,
+    enqueue_enrichment: bool,
+    scope: Option<&str>,
+) -> Result<ScanResponse> {
     let token = uuid::Uuid::new_v4().to_string();
     if !state
         .db
@@ -512,6 +941,7 @@ pub async fn scan_all(state: &AppState, enqueue_enrichment: bool) -> Result<Scan
         token.clone(),
         heartbeat.lease_valid.clone(),
         enqueue_enrichment,
+        scope,
     )
     .await;
     if let Err(err) = state.db.release_scanner_lock("library", &token).await {
@@ -525,35 +955,128 @@ async fn scan_all_locked(
     token: String,
     lease_valid: Arc<AtomicBool>,
     enqueue_enrichment: bool,
+    scope: Option<&str>,
 ) -> Result<ScanResponse> {
+    let revision_before = state.db.revision_fence_snapshot().await?;
+    let catalog_revision_before = revision_before.catalog_revision;
+    let search_revision_before = revision_before.search_revision;
     let context = ScanContext {
         state,
         settings: settings::load_settings(&state.config).await?,
         token,
         lease_valid,
     };
-    let mut stats = ScanStats {
-        comics: scan_comics(&context).await?,
-        ..Default::default()
-    };
-    let (novels, novel_jobs) = scan_novels(&context, enqueue_enrichment).await?;
-    stats.novels = novels;
-    stats.jobs_created += novel_jobs;
-    let (audio, audio_jobs) = scan_audio(&context, enqueue_enrichment).await?;
-    stats.audio = audio;
-    stats.jobs_created += audio_jobs;
-    stats.gallery = scan_gallery(&context).await?;
-    stats.coser_picture = scan_coser_pictures(&context).await?;
-    let (_, created) = state
-        .db
-        .create_job_if_absent(
-            "rebuild-search-index",
-            "queued",
-            json!({ "source": "scan" }),
-        )
-        .await?;
-    stats.jobs_created += usize::from(created);
-    state.db.refresh_tag_counts().await?;
+    if state.config.inventory_any_kind_enabled() {
+        let inventory_result = match scope {
+            Some(kind) if state.config.inventory_kind_enabled(kind) => {
+                inventory::reconcile_kind_shadow(
+                    &state.db,
+                    &state.resources,
+                    &context.settings,
+                    &state.config.generated_dir,
+                    context.lease_valid.clone(),
+                    kind,
+                )
+                .await
+            }
+            Some(kind) => {
+                tracing::debug!(
+                    kind,
+                    "skipping shadow inventory for an unselected scan kind"
+                );
+                Ok(Default::default())
+            }
+            None => {
+                let enabled_kinds = state.config.inventory_enabled_kinds();
+                inventory::reconcile_all_shadow_for_kinds(
+                    &state.db,
+                    &state.resources,
+                    &context.settings,
+                    &state.config.generated_dir,
+                    context.lease_valid.clone(),
+                    &enabled_kinds,
+                )
+                .await
+            }
+        };
+        match inventory_result {
+            Ok(summary) => tracing::info!(
+                roots = summary.roots,
+                complete_roots = summary.complete_roots,
+                incomplete_roots = summary.incomplete_roots,
+                discovered = summary.discovered,
+                inserted = summary.inserted,
+                changed = summary.changed,
+                unchanged = summary.unchanged,
+                newly_missing = summary.newly_missing,
+                max_batch_rows = summary.max_batch_rows,
+                max_serialized_batch_bytes = summary.max_serialized_batch_bytes,
+                "shadow inventory reconcile completed"
+            ),
+            Err(err) => tracing::warn!(
+                error = %err,
+                "shadow inventory reconcile failed; authoritative scanner will continue"
+            ),
+        }
+    }
+    let mut stats = ScanStats::default();
+    if scope.is_none_or(|kind| kind == "comic") {
+        stats.comics = scan_comics(&context).await?;
+    }
+    if scope.is_none_or(|kind| kind == "novel") {
+        let (novels, novel_jobs) = scan_novels(&context, enqueue_enrichment).await?;
+        stats.novels = novels;
+        stats.jobs_created += novel_jobs;
+    }
+    if scope.is_none_or(|kind| kind == "audio") {
+        let (audio, audio_jobs) = scan_audio(&context, enqueue_enrichment).await?;
+        stats.audio = audio;
+        stats.jobs_created += audio_jobs;
+    }
+    if scope.is_none_or(|kind| kind == "gallery") {
+        stats.gallery = scan_gallery(&context).await?;
+    }
+    if scope.is_none_or(|kind| kind == "coser-picture") {
+        stats.coser_picture = scan_coser_pictures(&context).await?;
+    }
+    let revision_after_scan = state.db.revision_fence_snapshot().await?;
+    let catalog_revision_after_scan = revision_after_scan.catalog_revision;
+    let search_revision_after_scan = revision_after_scan.search_revision;
+    if catalog_revision_after_scan != catalog_revision_before {
+        // A no-op maintenance scan should not rescan the entire work_tags
+        // relation merely to rediscover the same global tag counts.  Real
+        // catalog mutations still take the existing set-oriented refresh
+        // path, while an explicit repair can continue to call
+        // `refresh_tag_counts` directly.
+        state.db.refresh_tag_counts().await?;
+    }
+    let catalog_revision_after = state.db.revision_fence_snapshot().await?.catalog_revision;
+    let search_index_missing = !state
+        .config
+        .data_dir
+        .join("search-index-v2")
+        .join("meta.json")
+        .is_file();
+    // Once the incremental reader is atomically cut over, the search outbox
+    // is the authoritative update path. A full rebuild remains an explicit
+    // recovery job, rather than turning every scan into an hours-long index
+    // rebuild. Legacy mode only queues it when the catalog changed or the
+    // index has not been initialized yet.
+    if !state.config.search_incremental_reader_enabled
+        && (catalog_revision_after != catalog_revision_before
+            || search_revision_after_scan != search_revision_before
+            || search_index_missing)
+    {
+        let (_, created) = state
+            .db
+            .create_job_if_absent(
+                "rebuild-search-index",
+                "queued",
+                json!({ "source": "scan" }),
+            )
+            .await?;
+        stats.jobs_created += usize::from(created);
+    }
 
     Ok(ScanResponse {
         comics: stats.comics,
@@ -578,8 +1101,24 @@ struct ComicInfo {
     community_rating: Option<f64>,
 }
 
+async fn catalog_v2_coordinator_owns_kind(state: &AppState, kind: &str) -> Result<bool> {
+    if !state.config.inventory_kind_enabled(kind) {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT EXISTS (SELECT 1 FROM catalog_kind_ownership WHERE kind = ?1 AND authoritative_writer = 'catalog-v2')",
+    )
+    .bind(kind)
+    .fetch_one(state.db.pool())
+    .await?
+        != 0)
+}
+
 async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
     let state = context.state;
+    if catalog_v2_coordinator_owns_kind(state, "comic").await? {
+        return Ok(0);
+    }
     let roots = context.settings.comic_roots();
     let qms_sources = vfs::qmediasync_scan_sources(&context.settings, "comic");
     let mut active_scopes = roots
@@ -594,176 +1133,183 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
     let mut count = 0;
     for root in roots {
         let scope = context.prepare_scope("comic", &root).await?;
-        let walk = walk_matching_files(
+        let walk = open_matching_file_batches(
+            &state.resources,
             &root,
             1,
-            Some(2),
+            Some(context.settings.media_dirs.comic_scan_depth),
             "comic",
             context.lease_valid.clone(),
-            |path| extension_is(path, &["cbz"]),
+            is_local_comic_archive,
         )
         .await?;
-        if !walk.usable || !walk.complete {
+        if !walk.usable() {
+            let _ = walk.finish().await?;
             continue;
         }
-        for cbz_path in walk.files {
-            context.ensure_lease_valid()?;
-            let dir = cbz_path.parent().unwrap_or(root.as_path()).to_path_buf();
-            let ArchiveScanState { fingerprint, cover } =
-                fingerprint_archive(cbz_path.clone(), true, true).await?;
-            let source_path = path_string(&cbz_path);
-            if let Some((work_id, previous)) = state
-                .db
-                .scanner_work_fingerprint("comic", &source_path)
-                .await?
-            {
-                if previous == fingerprint.value.as_str() {
-                    state
-                        .db
-                        .touch_scanner_work(work_id, &scope, &context.token)
-                        .await?;
-                    count += 1;
-                    continue;
-                }
-            }
-            let comic_info = match read_comic_info_blocking(dir.clone()).await {
-                Ok(comic_info) => comic_info.unwrap_or_default(),
-                Err(err) => {
-                    tracing::warn!(path = %dir.display(), error = %err, "preserving comic after ComicInfo.xml read failure");
-                    if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
-                        .await?
-                    {
+        while let Some(batch) = walk.next_batch().await? {
+            for cbz_path in batch {
+                context.ensure_lease_valid()?;
+                let dir = cbz_path.parent().unwrap_or(root.as_path()).to_path_buf();
+                let ArchiveScanState { fingerprint, cover } =
+                    fingerprint_archive(&state.resources, cbz_path.clone(), true, true).await?;
+                let source_path = path_string(&cbz_path);
+                if let Some((work_id, previous)) = state
+                    .db
+                    .scanner_work_fingerprint("comic", &source_path)
+                    .await?
+                {
+                    if previous == fingerprint.value.as_str() {
+                        state
+                            .db
+                            .touch_scanner_work(work_id, &scope, &context.token)
+                            .await?;
                         count += 1;
+                        continue;
                     }
-                    continue;
                 }
-            };
-            let title = clean_title(
-                comic_info
-                    .series
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        dir.file_name()
-                            .and_then(|v| v.to_str())
-                            .unwrap_or("Untitled comic")
-                    }),
-            );
-            let archive_page_count = match count_cbz_pages_blocking(cbz_path.clone()).await {
-                Ok(page_count) => page_count,
-                Err(err) => {
-                    tracing::warn!(path = %cbz_path.display(), error = %err, "skipping unreadable comic archive");
-                    if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
-                        .await?
-                    {
-                        count += 1;
+                let comic_info = match read_comic_info_blocking(&state.resources, dir.clone()).await
+                {
+                    Ok(comic_info) => comic_info.unwrap_or_default(),
+                    Err(err) => {
+                        tracing::warn!(path = %dir.display(), error = %err, "preserving comic after ComicInfo.xml read failure");
+                        if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
+                            .await?
+                        {
+                            count += 1;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-            };
-            let page_count = comic_info.page_count.unwrap_or(archive_page_count);
-            let rating = comic_info.community_rating;
-
-            let work_id = state
-                .db
-                .upsert_scanner_work(
-                    "comic",
-                    &title,
-                    Some(&source_path),
-                    Some("Doujinshi"),
-                    comic_info.alternate_series.as_deref(),
-                    rating,
-                    json!({
-                        "page_count": page_count,
-                        "writer": comic_info.writer.clone(),
-                        "penciller": comic_info.penciller.clone(),
-                        "language_iso": comic_info.language_iso.clone(),
-                    }),
-                    &context.token,
-                    &fingerprint.value,
+                };
+                let title = clean_title(
+                    comic_info
+                        .series
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            dir.file_name()
+                                .and_then(|v| v.to_str())
+                                .unwrap_or("Untitled comic")
+                        }),
+                );
+                let title = if title.is_empty() {
+                    "Untitled comic".to_string()
+                } else {
+                    title
+                };
+                let archive_page_count = match count_cbz_pages_blocking(
+                    &state.resources,
+                    cbz_path.clone(),
                 )
-                .await?;
-
-            let size = fingerprint.size(&cbz_path);
-            state
-                .db
-                .upsert_scanner_asset(
-                    work_id,
-                    &path_string(&cbz_path),
-                    "application/vnd.comicbook+zip",
-                    "archive",
-                    Some("cbz"),
-                    None,
+                .await
+                {
+                    Ok(page_count) => page_count,
+                    Err(err) => {
+                        tracing::warn!(path = %cbz_path.display(), error = %err, "skipping unreadable comic archive");
+                        if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
+                            .await?
+                        {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                };
+                let page_count = comic_info.page_count.unwrap_or(archive_page_count);
+                let rating = comic_info.community_rating;
+                let (archive_mime, archive_variant) = local_comic_archive_type(&cbz_path);
+                let size = fingerprint.size(&cbz_path);
+                let mut assets = vec![ScannerAssetInput {
+                    path: path_string(&cbz_path),
+                    mime: archive_mime.to_string(),
+                    role: "archive".to_string(),
+                    variant: Some(archive_variant.to_string()),
+                    position: None,
                     size,
-                    fingerprint.asset_meta(&cbz_path, json!({ "page_count": page_count })),
-                    &context.token,
-                )
-                .await?;
+                    meta: fingerprint.asset_meta(&cbz_path, json!({ "page_count": page_count })),
+                }];
+                if let Some(cover) = cover {
+                    let mime = mime_guess::from_path(&cover)
+                        .first_or_octet_stream()
+                        .to_string();
+                    let size = fingerprint.size(&cover);
+                    assets.push(ScannerAssetInput {
+                        path: path_string(&cover),
+                        mime,
+                        role: "cover".to_string(),
+                        variant: None,
+                        position: None,
+                        size,
+                        meta: fingerprint.asset_meta(&cover, json!({})),
+                    });
+                }
 
-            if let Some(cover) = cover {
-                let mime = mime_guess::from_path(&cover)
-                    .first_or_octet_stream()
-                    .to_string();
-                let size = fingerprint.size(&cover);
+                let mut tags = Vec::new();
+                if let Some(genre) = comic_info.genre.as_deref() {
+                    for tag in parse_comic_genre_tags(genre) {
+                        tags.push(ScannerTagInput {
+                            namespace: tag.namespace,
+                            key: tag.key,
+                            label: tag.label,
+                            source: "comic-info".to_string(),
+                        });
+                    }
+                }
+                for (namespace, value) in [
+                    ("artist", comic_info.penciller.as_deref()),
+                    ("group", comic_info.writer.as_deref()),
+                ] {
+                    if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
+                        tags.push(ScannerTagInput {
+                            namespace: namespace.to_string(),
+                            key: normalize_key(value),
+                            label: value.to_string(),
+                            source: "comic-info".to_string(),
+                        });
+                    }
+                }
+                if let Some(lang) = comic_info.language_iso.as_deref() {
+                    let label = match lang {
+                        "zh" | "cn" => "chinese",
+                        "ja" => "japanese",
+                        "en" => "english",
+                        other => other,
+                    };
+                    tags.push(ScannerTagInput {
+                        namespace: "language".to_string(),
+                        key: label.to_string(),
+                        label: label.to_string(),
+                        source: "comic-info".to_string(),
+                    });
+                }
                 state
                     .db
-                    .upsert_scanner_asset(
-                        work_id,
-                        &path_string(&cover),
-                        &mime,
-                        "cover",
-                        None,
-                        None,
-                        size,
-                        fingerprint.asset_meta(&cover, json!({})),
+                    .commit_scanner_work_snapshot(
+                        ScannerWorkSnapshot {
+                            kind: "comic".to_string(),
+                            title,
+                            source_path: Some(source_path.clone()),
+                            category: Some("Doujinshi".to_string()),
+                            description: comic_info.alternate_series.clone(),
+                            rating,
+                            meta: json!({
+                                "page_count": page_count,
+                                "writer": comic_info.writer.clone(),
+                                "penciller": comic_info.penciller.clone(),
+                                "language_iso": comic_info.language_iso.clone(),
+                            }),
+                            fingerprint: fingerprint.value.clone(),
+                            assets,
+                            tags,
+                            external_ids: Vec::new(),
+                        },
                         &context.token,
+                        &scope,
                     )
                     .await?;
+                count += 1;
             }
-
-            if let Some(genre) = comic_info.genre.as_deref() {
-                for tag in parse_comic_genre_tags(genre) {
-                    link_tag(
-                        context,
-                        work_id,
-                        &tag.namespace,
-                        &tag.key,
-                        &tag.label,
-                        "comic-info",
-                    )
-                    .await?;
-                }
-            }
-            for (namespace, value) in [
-                ("artist", comic_info.penciller.as_deref()),
-                ("group", comic_info.writer.as_deref()),
-            ] {
-                if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
-                    link_tag(
-                        context,
-                        work_id,
-                        namespace,
-                        &normalize_key(value),
-                        value,
-                        "comic-info",
-                    )
-                    .await?;
-                }
-            }
-            if let Some(lang) = comic_info.language_iso.as_deref() {
-                let label = match lang {
-                    "zh" | "cn" => "chinese",
-                    "ja" => "japanese",
-                    "en" => "english",
-                    other => other,
-                };
-                link_tag(context, work_id, "language", label, label, "comic-info").await?;
-            }
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
-            count += 1;
         }
+        let walk = walk.finish().await?;
         if walk.complete {
             state
                 .db
@@ -781,6 +1327,9 @@ async fn scan_novels(
     enqueue_enrichment: bool,
 ) -> Result<(usize, usize)> {
     let state = context.state;
+    if catalog_v2_coordinator_owns_kind(state, "novel").await? {
+        return Ok((0, 0));
+    }
     let roots = context.settings.novel_roots();
     let active_scopes = roots
         .iter()
@@ -790,7 +1339,8 @@ async fn scan_novels(
     let mut jobs_created = 0;
     for root in roots {
         let scope = context.prepare_scope("novel", &root).await?;
-        let walk = walk_matching_files(
+        let walk = open_matching_file_batches(
+            &state.resources,
             &root,
             1,
             None,
@@ -799,226 +1349,227 @@ async fn scan_novels(
             |path| extension_is(path, &["epub"]),
         )
         .await?;
-        if !walk.usable || !walk.complete {
+        if !walk.usable() {
+            let _ = walk.finish().await?;
             continue;
         }
-        for epub_path in walk.files {
-            context.ensure_lease_valid()?;
-            let fingerprint = fingerprint_paths(vec![epub_path.clone()]).await?;
-            let source_path = path_string(&epub_path);
-            if let Some((work_id, previous)) = state
-                .db
-                .scanner_work_fingerprint("novel", &source_path)
-                .await?
-            {
-                if previous == fingerprint.value.as_str() {
-                    state
-                        .db
-                        .touch_scanner_work(work_id, &scope, &context.token)
-                        .await?;
-                    if enqueue_enrichment {
-                        let (_, created) = state
+        while let Some(batch) = walk.next_batch().await? {
+            for epub_path in batch {
+                context.ensure_lease_valid()?;
+                let fingerprint =
+                    fingerprint_paths(&state.resources, vec![epub_path.clone()]).await?;
+                let source_path = path_string(&epub_path);
+                let existing_scanner_work = state
+                    .db
+                    .scanner_work_fingerprint("novel", &source_path)
+                    .await?;
+                if let Some((work_id, previous)) = existing_scanner_work.as_ref() {
+                    if previous == fingerprint.value.as_str() {
+                        state
                             .db
-                            .create_work_job_once(
-                                "enrich-lightnovel-work",
-                                work_id,
-                                &fingerprint.value,
-                                json!({
-                                    "work_id": work_id,
-                                    "fingerprint": fingerprint.value,
-                                }),
-                            )
+                            .touch_scanner_work(*work_id, &scope, &context.token)
                             .await?;
-                        jobs_created += usize::from(created);
-                    }
-                    count += 1;
-                    continue;
-                }
-            }
-            let meta = match read_epub_metadata_blocking(epub_path.clone()).await {
-                Ok(meta) => meta,
-                Err(err) => {
-                    tracing::warn!(path = %epub_path.display(), error = %err, "skipping unreadable EPUB");
-                    if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
-                        .await?
-                    {
-                        count += 1;
-                    }
-                    continue;
-                }
-            };
-            let title = meta.title.clone().unwrap_or_else(|| {
-                epub_path
-                    .file_stem()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("Untitled novel")
-                    .to_string()
-            });
-            let series = meta.series.clone().or_else(|| {
-                epub_path
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|v| v.to_str())
-                    .map(|s| s.to_string())
-            });
-
-            let work_id = state
-                .db
-                .upsert_scanner_work(
-                    "novel",
-                    &clean_title(&title),
-                    Some(&source_path),
-                    Some("Light Novel"),
-                    meta.description.as_deref(),
-                    None,
-                    json!({
-                        "creator": meta.creator.clone(),
-                        "language": meta.language.clone(),
-                        "series": series.clone(),
-                        "volume": meta.volume.clone(),
-                        "source": meta.source.clone(),
-                    }),
-                    &context.token,
-                    &fingerprint.value,
-                )
-                .await?;
-            let previous_epub_cover = state
-                .db
-                .work_asset_path(work_id, "cover", Some("epub-extracted"))
-                .await?
-                .map(PathBuf::from);
-            let mut current_epub_cover = None;
-
-            let size = fingerprint.size(&epub_path);
-            state
-                .db
-                .upsert_scanner_asset(
-                    work_id,
-                    &path_string(&epub_path),
-                    "application/epub+zip",
-                    "book",
-                    Some("epub"),
-                    None,
-                    size,
-                    fingerprint.asset_meta(&epub_path, json!({})),
-                    &context.token,
-                )
-                .await?;
-
-            match extract_epub_cover_blocking(
-                epub_path.clone(),
-                state.config.generated_dir.clone(),
-                work_id,
-            )
-            .await
-            {
-                Ok(Some(ExtractedCover { path: cover, size })) => {
-                    current_epub_cover = Some(cover.clone());
-                    let mime = mime_guess::from_path(&cover)
-                        .first_or_octet_stream()
-                        .to_string();
-                    state
-                        .db
-                        .upsert_scanner_asset(
-                            work_id,
-                            &path_string(&cover),
-                            &mime,
-                            "cover",
-                            Some("epub-extracted"),
-                            None,
-                            size,
-                            json!({ "source": "epub" }),
-                            &context.token,
-                        )
-                        .await?;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(path = %epub_path.display(), error = %err, "preserving previous EPUB assets after cover extraction failure");
-                    if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
-                        .await?
-                    {
+                        if enqueue_enrichment {
+                            let (_, created) = state
+                                .db
+                                .create_work_job_once(
+                                    "enrich-lightnovel-work",
+                                    *work_id,
+                                    &fingerprint.value,
+                                    json!({
+                                        "work_id": *work_id,
+                                        "fingerprint": fingerprint.value,
+                                    }),
+                                )
+                                .await?;
+                            jobs_created += usize::from(created);
+                        }
                         count += 1;
                         continue;
                     }
                 }
-            }
+                let existing_work_id = existing_scanner_work.map(|(work_id, _)| work_id);
+                let meta = match read_epub_metadata_blocking(&state.resources, epub_path.clone())
+                    .await
+                {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        tracing::warn!(path = %epub_path.display(), error = %err, "skipping unreadable EPUB");
+                        if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
+                            .await?
+                        {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                };
+                let title = meta.title.clone().unwrap_or_else(|| {
+                    epub_path
+                        .file_stem()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or("Untitled novel")
+                        .to_string()
+                });
+                let series = meta.series.clone().or_else(|| {
+                    epub_path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|v| v.to_str())
+                        .map(|s| s.to_string())
+                });
 
-            if let Some(series) = series.as_deref() {
-                link_tag(
-                    context,
-                    work_id,
-                    "series",
-                    &normalize_key(series),
-                    series,
-                    "epub",
+                let previous_epub_cover = if let Some(work_id) = existing_work_id {
+                    state
+                        .db
+                        .work_asset_path(work_id, "cover", Some("epub-extracted"))
+                        .await?
+                        .map(PathBuf::from)
+                } else {
+                    None
+                };
+                let mut current_epub_cover = None;
+
+                let size = fingerprint.size(&epub_path);
+                let mut assets = vec![ScannerAssetInput {
+                    path: path_string(&epub_path),
+                    mime: "application/epub+zip".to_string(),
+                    role: "book".to_string(),
+                    variant: Some("epub".to_string()),
+                    position: None,
+                    size,
+                    meta: fingerprint.asset_meta(&epub_path, json!({})),
+                }];
+
+                match extract_epub_cover_content_addressed_blocking(
+                    &state.resources,
+                    epub_path.clone(),
+                    state.config.generated_dir.clone(),
                 )
-                .await?;
-            }
-            if let Some(author) = meta.creator.as_deref() {
-                link_tag(
-                    context,
-                    work_id,
-                    "artist",
-                    &normalize_key(author),
-                    author,
-                    "epub",
-                )
-                .await?;
-            }
-            for subject in &meta.subjects {
-                link_tag(
-                    context,
-                    work_id,
-                    "ln",
-                    &normalize_key(subject),
-                    subject,
-                    "epub",
-                )
-                .await?;
-            }
-            if let Some(lang) = meta.language.as_deref() {
-                link_tag(
-                    context,
-                    work_id,
-                    "language",
-                    &normalize_key(lang),
-                    lang,
-                    "epub",
-                )
-                .await?;
-            }
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
-            cleanup_replaced_epub_cover(
-                state,
-                work_id,
-                previous_epub_cover,
-                current_epub_cover.as_ref(),
-            )
-            .await;
-            if enqueue_enrichment {
-                let (_, created) = state
+                .await
+                {
+                    Ok(Some(ExtractedCover {
+                        path: cover,
+                        size: cover_size,
+                        source_version,
+                    })) => {
+                        current_epub_cover = Some(cover.clone());
+                        let mime = mime_guess::from_path(&cover)
+                            .first_or_octet_stream()
+                            .to_string();
+                        assets.push(ScannerAssetInput {
+                            path: path_string(&cover),
+                            mime,
+                            role: "cover".to_string(),
+                            variant: Some("epub-extracted".to_string()),
+                            position: None,
+                            size: cover_size,
+                            meta: json!({
+                                "source": "epub",
+                                "_source_version": source_version,
+                            }),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(path = %epub_path.display(), error = %err, "preserving previous EPUB assets after cover extraction failure");
+                        if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
+                            .await?
+                        {
+                            count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                let mut tags = Vec::new();
+                if let Some(series) = series.as_deref() {
+                    tags.push(ScannerTagInput {
+                        namespace: "series".to_string(),
+                        key: normalize_key(series),
+                        label: series.to_string(),
+                        source: "epub".to_string(),
+                    });
+                }
+                if let Some(author) = meta.creator.as_deref() {
+                    tags.push(ScannerTagInput {
+                        namespace: "artist".to_string(),
+                        key: normalize_key(author),
+                        label: author.to_string(),
+                        source: "epub".to_string(),
+                    });
+                }
+                for subject in &meta.subjects {
+                    tags.push(ScannerTagInput {
+                        namespace: "ln".to_string(),
+                        key: normalize_key(subject),
+                        label: subject.clone(),
+                        source: "epub".to_string(),
+                    });
+                }
+                if let Some(lang) = meta.language.as_deref() {
+                    tags.push(ScannerTagInput {
+                        namespace: "language".to_string(),
+                        key: normalize_key(lang),
+                        label: lang.to_string(),
+                        source: "epub".to_string(),
+                    });
+                }
+                let work_id = state
                     .db
-                    .create_work_job_once(
-                        "enrich-lightnovel-work",
-                        work_id,
-                        &fingerprint.value,
-                        json!({
-                            "work_id": work_id,
-                            "fingerprint": fingerprint.value,
-                            "title": title,
-                            "series": series,
-                            "creator": meta.creator,
-                            "subjects": meta.subjects,
-                        }),
+                    .commit_scanner_work_snapshot(
+                        ScannerWorkSnapshot {
+                            kind: "novel".to_string(),
+                            title: clean_title(&title),
+                            source_path: Some(source_path.clone()),
+                            category: Some("Light Novel".to_string()),
+                            description: meta.description.clone(),
+                            rating: None,
+                            meta: json!({
+                                "creator": meta.creator.clone(),
+                                "language": meta.language.clone(),
+                                "series": series.clone(),
+                                "volume": meta.volume.clone(),
+                                "source": meta.source.clone(),
+                            }),
+                            fingerprint: fingerprint.value.clone(),
+                            assets,
+                            tags,
+                            external_ids: Vec::new(),
+                        },
+                        &context.token,
+                        &scope,
                     )
                     .await?;
-                jobs_created += usize::from(created);
+                cleanup_replaced_epub_cover(
+                    state,
+                    work_id,
+                    previous_epub_cover,
+                    current_epub_cover.as_ref(),
+                )
+                .await;
+                if enqueue_enrichment {
+                    let (_, created) = state
+                        .db
+                        .create_work_job_once(
+                            "enrich-lightnovel-work",
+                            work_id,
+                            &fingerprint.value,
+                            json!({
+                                "work_id": work_id,
+                                "fingerprint": fingerprint.value,
+                                "title": title,
+                                "series": series,
+                                "creator": meta.creator,
+                                "subjects": meta.subjects,
+                            }),
+                        )
+                        .await?;
+                    jobs_created += usize::from(created);
+                }
+                count += 1;
             }
-            count += 1;
         }
+        let walk = walk.finish().await?;
         if walk.complete {
             state
                 .db
@@ -1032,6 +1583,9 @@ async fn scan_novels(
 
 async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Result<(usize, usize)> {
     let state = context.state;
+    if catalog_v2_coordinator_owns_kind(state, "audio").await? {
+        return Ok((0, 0));
+    }
     let roots = context.settings.audio_roots();
     let active_scopes = roots
         .iter()
@@ -1041,41 +1595,96 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
     let mut jobs_created = 0;
     for audio_dir in roots {
         let scope = context.prepare_scope("audio", &audio_dir).await?;
-        let walk = walk_matching_files(
+        let walk = open_matching_file_batches(
+            &state.resources,
             &audio_dir,
             1,
             None,
             "audio",
             context.lease_valid.clone(),
             |path| {
-                extension_is(
-                    path,
-                    &[
-                        "mp3", "wav", "flac", "ogg", "m4a", "jpg", "jpeg", "png", "webp", "txt",
-                    ],
-                )
+                audio_track_file(path) || extension_is(path, &["jpg", "jpeg", "png", "webp", "txt"])
             },
         )
         .await?;
-        if !walk.usable || !walk.complete {
+        if !walk.usable() {
+            let _ = walk.finish().await?;
             continue;
         }
         let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-        for path in walk.files {
-            let full = path_string(&path);
-            if let Some(m) = RJ_RE.find(&full) {
-                groups.entry(m.as_str().to_string()).or_default().push(path);
+        let mut oversized_groups = BTreeSet::new();
+        let mut grouped_path_bytes = 0_usize;
+        let mut discovery_within_budget = true;
+        while let Some(batch) = walk.next_batch().await? {
+            for path in batch {
+                let relative = path
+                    .strip_prefix(&audio_dir)
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path_string(&path));
+                let parent_key = Path::new(&relative)
+                    .parent()
+                    .map(|value| value.to_string_lossy().replace('\\', "/"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| ".".to_string());
+                let work_key = audio_grouping::derive_work_key(
+                    context.settings.audio_grouping,
+                    &relative,
+                    &parent_key,
+                    false,
+                );
+                grouped_path_bytes = grouped_path_bytes.saturating_add(relative.len());
+                if grouped_path_bytes > MAX_AUDIO_DISCOVERY_PATH_BYTES {
+                    discovery_within_budget = false;
+                    continue;
+                }
+                let files = groups.entry(work_key.clone()).or_default();
+                if files.len() >= inspectors::audio::MAX_AUDIO_FILES_PER_WORK {
+                    oversized_groups.insert(work_key);
+                    continue;
+                }
+                files.push(path);
             }
         }
+        let walk = walk.finish().await?;
+        if !walk.complete || !discovery_within_budget {
+            // Do not process a partial grouping: the missing file could be a
+            // track, cover, or text summary for an existing work.  Waiting for
+            // a complete discovery keeps the legacy scanner's tombstone and
+            // metadata-preservation fence intact.
+            if !discovery_within_budget {
+                tracing::warn!(
+                    root = %audio_dir.display(),
+                    limit_bytes = MAX_AUDIO_DISCOVERY_PATH_BYTES,
+                    "preserving audio works after the discovery path budget was reached"
+                );
+            }
+            continue;
+        }
 
-        for (rj, mut files) in groups {
+        for (work_key, mut files) in groups {
+            if oversized_groups.contains(&work_key) {
+                tracing::warn!(
+                    work_key,
+                    limit = inspectors::audio::MAX_AUDIO_FILES_PER_WORK,
+                    "preserving audio work after reaching the per-work file safety limit"
+                );
+                continue;
+            }
             context.ensure_lease_valid()?;
             files.sort();
+            let rj = audio_grouping::rj_key(&work_key);
+            let grouping_key = rj.clone().unwrap_or_else(|| work_key.clone());
             let AudioFingerprintState {
                 fingerprint,
                 root,
                 cover,
-            } = fingerprint_audio_group(audio_dir.clone(), rj.clone(), files.clone()).await?;
+            } = fingerprint_audio_group(
+                &state.resources,
+                audio_dir.clone(),
+                grouping_key,
+                files.clone(),
+            )
+            .await?;
             let source_path = path_string(&root);
             if let Some((work_id, previous)) = state
                 .db
@@ -1087,7 +1696,7 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                         .db
                         .touch_scanner_work(work_id, &scope, &context.token)
                         .await?;
-                    if enqueue_enrichment {
+                    if enqueue_enrichment && rj.is_some() {
                         let (_, created) = state
                             .db
                             .create_work_job_once(
@@ -1107,13 +1716,19 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     continue;
                 }
             }
-            let audio_metadata = read_audio_group_metadata(files).await?;
+            let audio_metadata = read_audio_group_metadata(&state.resources, files).await?;
             let files = audio_metadata.files;
-            let title = infer_audio_title(&root, &rj);
-            let track_count = files
-                .iter()
-                .filter(|p| extension_is(p, &["mp3", "wav", "flac", "ogg", "m4a"]))
-                .count();
+            let title = rj
+                .as_deref()
+                .map(|rj| infer_audio_title(&root, rj))
+                .unwrap_or_else(|| {
+                    root.file_name()
+                        .and_then(|value| value.to_str())
+                        .map(clean_title)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| work_key.clone())
+                });
+            let track_count = files.iter().filter(|p| audio_track_file(p)).count();
 
             let work_id = state
                 .db
@@ -1124,46 +1739,53 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     Some("Audio"),
                     audio_metadata.summary.as_deref(),
                     None,
-                    json!({ "rj": rj.clone(), "track_count": track_count }),
+                    json!({
+                        "rj": rj.clone(),
+                        "track_count": track_count,
+                        "grouping": context.settings.audio_grouping.as_str()
+                    }),
                     &context.token,
                     &fingerprint.value,
                 )
                 .await?;
 
-            state
-                .db
-                .upsert_scanner_external_id(
-                    work_id,
-                    "asmr",
-                    &rj,
-                    None,
-                    Some(&format!("https://asmr.one/work/{rj}")),
-                    &context.token,
-                )
-                .await?;
-            state
-                .db
-                .upsert_scanner_external_id(
-                    work_id,
-                    "dlsite",
-                    &rj,
-                    None,
-                    Some(&format!(
+            let mut tags = Vec::new();
+            let mut external_ids = Vec::new();
+            if let Some(rj) = rj.as_deref() {
+                external_ids.push(ScannerExternalIdInput {
+                    source: "asmr".to_string(),
+                    external_id: rj.to_string(),
+                    token: None,
+                    url: Some(format!("https://asmr.one/work/{rj}")),
+                });
+                external_ids.push(ScannerExternalIdInput {
+                    source: "dlsite".to_string(),
+                    external_id: rj.to_string(),
+                    token: None,
+                    url: Some(format!(
                         "https://www.dlsite.com/maniax/work/=/product_id/{rj}.html"
                     )),
-                    &context.token,
-                )
-                .await?;
-            link_tag(context, work_id, "audio", "asmr", "ASMR", "audio-folder").await?;
-            link_tag(
-                context,
-                work_id,
-                "source",
-                &rj.to_lowercase(),
-                &rj,
-                "audio-folder",
-            )
-            .await?;
+                });
+                tags.push(ScannerTagInput {
+                    namespace: "audio".to_string(),
+                    key: "asmr".to_string(),
+                    label: "ASMR".to_string(),
+                    source: "audio-folder".to_string(),
+                });
+                tags.push(ScannerTagInput {
+                    namespace: "source".to_string(),
+                    key: rj.to_lowercase(),
+                    label: rj.to_string(),
+                    source: "audio-folder".to_string(),
+                });
+            } else {
+                tags.push(ScannerTagInput {
+                    namespace: "audio".to_string(),
+                    key: "local".to_string(),
+                    label: "Audio".to_string(),
+                    source: "audio-folder".to_string(),
+                });
+            }
 
             let mut next_position = 0_i64;
             let mut track_positions = BTreeMap::new();
@@ -1173,7 +1795,7 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
             for (file, track_meta) in files
                 .iter()
                 .zip(audio_metadata.tracks.iter())
-                .filter(|(path, _)| extension_is(path, &["mp3", "wav", "flac", "ogg", "m4a"]))
+                .filter(|(path, _)| audio_track_file(path))
             {
                 let ext = file
                     .extension()
@@ -1283,20 +1905,25 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
             }
 
             for variant in seen_track_names {
-                link_tag(
-                    context,
+                tags.push(ScannerTagInput {
+                    namespace: "audio".to_string(),
+                    key: normalize_key(&variant),
+                    label: variant,
+                    source: "audio-folder".to_string(),
+                });
+            }
+            state
+                .db
+                .commit_scanner_work_metadata(
                     work_id,
-                    "audio",
-                    &normalize_key(&variant),
-                    &variant,
-                    "audio-folder",
+                    tags,
+                    external_ids,
+                    &context.token,
+                    &scope,
+                    &fingerprint.value,
                 )
                 .await?;
-            }
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
-            if enqueue_enrichment {
+            if enqueue_enrichment && rj.is_some() {
                 let (_, created) = state
                     .db
                     .create_work_job_once(
@@ -1314,12 +1941,10 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
             }
             count += 1;
         }
-        if walk.complete {
-            state
-                .db
-                .finish_scanner_scope(&scope, &context.token)
-                .await?;
-        }
+        state
+            .db
+            .finish_scanner_scope(&scope, &context.token)
+            .await?;
     }
     finish_kind_scopes(context, "audio", &active_scopes).await?;
     Ok((count, jobs_created))
@@ -1327,6 +1952,9 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
 
 async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
     let state = context.state;
+    if catalog_v2_coordinator_owns_kind(state, "gallery").await? {
+        return Ok(0);
+    }
     let roots = context.settings.gallery_roots();
     let active_scopes = roots
         .iter()
@@ -1335,7 +1963,8 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
     let mut count = 0;
     for root in roots {
         let scope = context.prepare_scope("gallery", &root).await?;
-        let walk = walk_matching_files(
+        let walk = walk_matching_parent_directories(
+            &state.resources,
             &root,
             1,
             None,
@@ -1347,15 +1976,44 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
         if !walk.usable || !walk.complete {
             continue;
         }
-        let mut groups: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-        for path in walk.files {
-            let parent = path.parent().unwrap_or(root.as_path()).to_path_buf();
-            groups.entry(parent).or_default().push(path);
-        }
-
-        for (folder, mut files) in groups {
+        let mut scope_complete = true;
+        for folder in walk.files {
             context.ensure_lease_valid()?;
+            let (mut files, folder_complete) = list_matching_files_in_directory(
+                &state.resources,
+                &folder,
+                context.lease_valid.clone(),
+                gallery_image_name,
+            )
+            .await?;
+            if !folder_complete {
+                scope_complete = false;
+                // Do not commit a partial folder snapshot.  The next
+                // complete reconcile will decide whether entries are truly
+                // missing, preserving the scanner's tombstone safety fence.
+                continue;
+            }
+            if files.is_empty() {
+                continue;
+            }
             files.sort_by_cached_key(|path| naturalish_key(&path_string(path)));
+            let fingerprint =
+                match fingerprint_gallery_paths(&state.resources, root.clone(), files).await {
+                    Ok(fingerprint) => fingerprint,
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %folder.display(),
+                            error = %err,
+                            "preserving gallery after file metadata changed during scan"
+                        );
+                        scope_complete = false;
+                        continue;
+                    }
+                };
+            if fingerprint.files.is_empty() {
+                scope_complete = false;
+                continue;
+            }
             let title = folder
                 .file_name()
                 .and_then(|value| value.to_str())
@@ -1367,7 +2025,6 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                 .ok()
                 .map(|value| value.to_string_lossy().to_string())
                 .filter(|value| !value.is_empty());
-            let fingerprint = fingerprint_paths(files.clone()).await?;
             let source_path = path_string(&folder);
             if let Some((work_id, previous)) = state
                 .db
@@ -1393,7 +2050,7 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                     relative.as_deref(),
                     None,
                     json!({
-                        "image_count": files.len(),
+                        "image_count": fingerprint.files.len(),
                         "root": path_string(&root),
                         "folder": path_string(&folder),
                     }),
@@ -1402,42 +2059,41 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                 )
                 .await?;
 
-            let cover_path = gallery_cover_candidate(&files).cloned();
+            let cover_file = gallery_cover_candidate(&fingerprint.files);
             let mut scanner_assets = Vec::with_capacity(
-                files
+                fingerprint
+                    .files
                     .len()
                     .min(SCANNER_ASSET_BATCH_SIZE)
-                    .saturating_add(usize::from(cover_path.is_some())),
+                    .saturating_add(usize::from(cover_file.is_some())),
             );
-            if let Some(cover) = cover_path.as_ref() {
-                let mime = mime_guess::from_path(cover)
+            if let Some(cover) = cover_file {
+                let mime = mime_guess::from_path(&cover.path)
                     .first_or_octet_stream()
                     .to_string();
-                let size = fingerprint.size(cover);
                 scanner_assets.push(ScannerAssetInput {
-                    path: path_string(cover),
+                    path: path_string(&cover.path),
                     mime,
                     role: "cover".to_string(),
                     variant: None,
                     position: None,
-                    size,
-                    meta: fingerprint.asset_meta(cover, json!({ "source": "gallery" })),
+                    size: cover.size,
+                    meta: cover.asset_meta(json!({ "source": "gallery" })),
                 });
             }
 
-            for (index, file) in files.iter().enumerate() {
-                let mime = mime_guess::from_path(file)
+            for (index, file) in fingerprint.files.iter().enumerate() {
+                let mime = mime_guess::from_path(&file.path)
                     .first_or_octet_stream()
                     .to_string();
-                let size = fingerprint.size(file);
                 scanner_assets.push(ScannerAssetInput {
-                    path: path_string(file),
+                    path: path_string(&file.path),
                     mime,
                     role: "image".to_string(),
                     variant: None,
                     position: Some(index as i64),
-                    size,
-                    meta: fingerprint.asset_meta(file, json!({ "source": "gallery" })),
+                    size: file.size,
+                    meta: file.asset_meta(json!({ "source": "gallery" })),
                 });
                 if scanner_assets.len() >= SCANNER_ASSET_BATCH_SIZE {
                     state
@@ -1457,24 +2113,20 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                     .await?;
             }
 
-            link_tag(
-                context,
-                work_id,
-                "gallery",
-                "image-set",
-                "图库",
-                "gallery-folder",
-            )
-            .await?;
-            link_tag(
-                context,
-                work_id,
-                "folder",
-                &normalize_key(&title),
-                &title,
-                "gallery-folder",
-            )
-            .await?;
+            let mut tags = vec![
+                ScannerTagInput {
+                    namespace: "gallery".to_string(),
+                    key: "image-set".to_string(),
+                    label: "图库".to_string(),
+                    source: "gallery-folder".to_string(),
+                },
+                ScannerTagInput {
+                    namespace: "folder".to_string(),
+                    key: normalize_key(&title),
+                    label: title.clone(),
+                    source: "gallery-folder".to_string(),
+                },
+            ];
             if let Some(top) = folder
                 .strip_prefix(&root)
                 .ok()
@@ -1482,37 +2134,39 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                 .and_then(|part| part.as_os_str().to_str())
                 .filter(|value| !value.trim().is_empty())
             {
-                link_tag(
-                    context,
-                    work_id,
-                    "artist",
-                    &normalize_key(top),
-                    top,
-                    "gallery-folder",
-                )
-                .await?;
+                tags.push(ScannerTagInput {
+                    namespace: "artist".to_string(),
+                    key: normalize_key(top),
+                    label: top.to_string(),
+                    source: "gallery-folder".to_string(),
+                });
             }
             let mut filename_tags = BTreeSet::new();
-            for file in &files {
-                filename_tags.extend(gallery_filename_tags(file));
+            for file in &fingerprint.files {
+                filename_tags.extend(gallery_filename_tags(&file.path));
             }
             for tag in filename_tags {
-                link_tag(
-                    context,
-                    work_id,
-                    "gallery",
-                    &normalize_key(&tag),
-                    &tag,
-                    "gallery-filename",
-                )
-                .await?;
+                tags.push(ScannerTagInput {
+                    namespace: "gallery".to_string(),
+                    key: normalize_key(&tag),
+                    label: tag,
+                    source: "gallery-filename".to_string(),
+                });
             }
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
+            state
+                .db
+                .commit_scanner_work_metadata(
+                    work_id,
+                    tags,
+                    Vec::new(),
+                    &context.token,
+                    &scope,
+                    &fingerprint.value,
+                )
                 .await?;
             count += 1;
         }
-        if walk.complete {
+        if walk.complete && scope_complete {
             state
                 .db
                 .finish_scanner_scope(&scope, &context.token)
@@ -1525,6 +2179,9 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
 
 async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
     let state = context.state;
+    if catalog_v2_coordinator_owns_kind(state, "coser-picture").await? {
+        return Ok(0);
+    }
     let roots = context.settings.coser_picture_roots();
     let qms_sources = vfs::qmediasync_scan_sources(&context.settings, "coser-picture");
     let mut active_scopes = roots
@@ -1539,7 +2196,8 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
     let mut count = 0;
     for root in roots {
         let scope = context.prepare_scope("coser-picture", &root).await?;
-        let walk = walk_matching_files(
+        let walk = open_matching_file_batches(
+            &state.resources,
             &root,
             1,
             None,
@@ -1548,31 +2206,50 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
             |path| extension_is(path, &["zip"]),
         )
         .await?;
-        if !walk.usable || !walk.complete {
+        if !walk.usable() {
+            let _ = walk.finish().await?;
             continue;
         }
-        for zip_path in walk.files {
-            context.ensure_lease_valid()?;
-            let source_path = path_string(&zip_path);
-            let fingerprint = fingerprint_paths(vec![zip_path.clone()]).await?;
-            if let Some((work_id, previous)) = state
-                .db
-                .scanner_work_fingerprint("coser-picture", &source_path)
-                .await?
-            {
-                if previous == fingerprint.value.as_str() {
-                    state
-                        .db
-                        .touch_scanner_work(work_id, &scope, &context.token)
-                        .await?;
-                    count += 1;
-                    continue;
+        while let Some(batch) = walk.next_batch().await? {
+            for zip_path in batch {
+                context.ensure_lease_valid()?;
+                let source_path = path_string(&zip_path);
+                let fingerprint =
+                    fingerprint_paths(&state.resources, vec![zip_path.clone()]).await?;
+                if let Some((work_id, previous)) = state
+                    .db
+                    .scanner_work_fingerprint("coser-picture", &source_path)
+                    .await?
+                {
+                    if previous == fingerprint.value.as_str() {
+                        state
+                            .db
+                            .touch_scanner_work(work_id, &scope, &context.token)
+                            .await?;
+                        count += 1;
+                        continue;
+                    }
                 }
-            }
-            let page_count = match count_cbz_pages_blocking(zip_path.clone()).await {
-                Ok(page_count) => page_count,
-                Err(err) => {
-                    tracing::warn!(path = %zip_path.display(), error = %err, "skipping unreadable CoserPicture archive");
+                let page_count = match count_cbz_pages_blocking(&state.resources, zip_path.clone())
+                    .await
+                {
+                    Ok(page_count) => page_count,
+                    Err(err) => {
+                        tracing::warn!(path = %zip_path.display(), error = %err, "skipping unreadable CoserPicture archive");
+                        if preserve_existing_scanner_work(
+                            context,
+                            "coser-picture",
+                            &source_path,
+                            &scope,
+                        )
+                        .await?
+                        {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                };
+                if page_count <= 0 {
                     if preserve_existing_scanner_work(
                         context,
                         "coser-picture",
@@ -1585,105 +2262,88 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
                     }
                     continue;
                 }
-            };
-            if page_count <= 0 {
-                if preserve_existing_scanner_work(context, "coser-picture", &source_path, &scope)
-                    .await?
-                {
-                    count += 1;
-                }
-                continue;
+                let title = zip_path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Untitled CoserPicture")
+                    .to_string();
+                let coser = zip_path
+                    .parent()
+                    .and_then(|path| path.file_name())
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("CoserPicture")
+                    .to_string();
+                let relative = zip_path
+                    .strip_prefix(&root)
+                    .ok()
+                    .map(|value| value.to_string_lossy().to_string())
+                    .filter(|value| !value.is_empty());
+
+                let size = fingerprint.size(&zip_path);
+                state
+                    .db
+                    .commit_scanner_work_snapshot(
+                        ScannerWorkSnapshot {
+                            kind: "coser-picture".to_string(),
+                            title: clean_title(&title),
+                            source_path: Some(source_path.clone()),
+                            category: Some("CoserPicture".to_string()),
+                            description: relative,
+                            rating: None,
+                            meta: json!({
+                                "page_count": page_count,
+                                "root": path_string(&root),
+                                "archive": path_string(&zip_path),
+                                "coser": coser.clone(),
+                            }),
+                            fingerprint: fingerprint.value.clone(),
+                            assets: vec![ScannerAssetInput {
+                                path: source_path,
+                                mime: "application/zip".to_string(),
+                                role: "archive".to_string(),
+                                variant: Some("zip".to_string()),
+                                position: None,
+                                size,
+                                meta: fingerprint.asset_meta(
+                                    &zip_path,
+                                    json!({
+                                        "source": "coser-picture",
+                                        "page_count": page_count
+                                    }),
+                                ),
+                            }],
+                            tags: vec![
+                                ScannerTagInput {
+                                    namespace: "coser-picture".to_string(),
+                                    key: "image-set".to_string(),
+                                    label: "CoserPicture".to_string(),
+                                    source: "coser-picture-zip".to_string(),
+                                },
+                                ScannerTagInput {
+                                    namespace: "folder".to_string(),
+                                    key: normalize_key(&coser),
+                                    label: coser.clone(),
+                                    source: "coser-picture-zip".to_string(),
+                                },
+                                ScannerTagInput {
+                                    namespace: "artist".to_string(),
+                                    key: normalize_key(&coser),
+                                    label: coser,
+                                    source: "coser-picture-zip".to_string(),
+                                },
+                            ],
+                            external_ids: Vec::new(),
+                        },
+                        &context.token,
+                        &scope,
+                    )
+                    .await?;
+                count += 1;
             }
-            let title = zip_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("Untitled CoserPicture")
-                .to_string();
-            let coser = zip_path
-                .parent()
-                .and_then(|path| path.file_name())
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("CoserPicture")
-                .to_string();
-            let relative = zip_path
-                .strip_prefix(&root)
-                .ok()
-                .map(|value| value.to_string_lossy().to_string())
-                .filter(|value| !value.is_empty());
-
-            let work_id = state
-                .db
-                .upsert_scanner_work(
-                    "coser-picture",
-                    &clean_title(&title),
-                    Some(&source_path),
-                    Some("CoserPicture"),
-                    relative.as_deref(),
-                    None,
-                    json!({
-                        "page_count": page_count,
-                        "root": path_string(&root),
-                        "archive": path_string(&zip_path),
-                        "coser": coser.clone(),
-                    }),
-                    &context.token,
-                    &fingerprint.value,
-                )
-                .await?;
-
-            let size = fingerprint.size(&zip_path);
-            state
-                .db
-                .upsert_scanner_asset(
-                    work_id,
-                    &source_path,
-                    "application/zip",
-                    "archive",
-                    Some("zip"),
-                    None,
-                    size,
-                    fingerprint.asset_meta(
-                        &zip_path,
-                        json!({ "source": "coser-picture", "page_count": page_count }),
-                    ),
-                    &context.token,
-                )
-                .await?;
-
-            link_tag(
-                context,
-                work_id,
-                "coser-picture",
-                "image-set",
-                "CoserPicture",
-                "coser-picture-zip",
-            )
-            .await?;
-            link_tag(
-                context,
-                work_id,
-                "folder",
-                &normalize_key(&coser),
-                &coser,
-                "coser-picture-zip",
-            )
-            .await?;
-            link_tag(
-                context,
-                work_id,
-                "artist",
-                &normalize_key(&coser),
-                &coser,
-                "coser-picture-zip",
-            )
-            .await?;
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
-            count += 1;
         }
+        let walk = walk.finish().await?;
         if walk.complete {
             state
                 .db
@@ -1715,6 +2375,7 @@ async fn scan_qmediasync_comics(
             )
             .await?;
         let walk = walk_matching_files(
+            &state.resources,
             &root,
             1,
             Some(source.scan_depth.clamp(1, 64)),
@@ -1744,7 +2405,7 @@ async fn scan_qmediasync_comics(
                 path_string(&archive_path)
             };
             let ArchiveScanState { fingerprint, cover } =
-                fingerprint_archive(archive_path.clone(), true, true).await?;
+                fingerprint_archive(&state.resources, archive_path.clone(), true, true).await?;
             if let Some((work_id, previous)) = state
                 .db
                 .scanner_work_fingerprint("comic", &archive_uri)
@@ -1760,7 +2421,7 @@ async fn scan_qmediasync_comics(
                 }
             }
             let target_url = if is_strm {
-                match read_qms_strm_url_blocking(archive_path.clone()).await {
+                match read_qms_strm_url_blocking(&state.resources, archive_path.clone()).await {
                     Ok(target_url) => Some(target_url),
                     Err(err) => {
                         tracing::warn!(
@@ -1779,7 +2440,7 @@ async fn scan_qmediasync_comics(
             } else {
                 None
             };
-            let comic_info = match read_comic_info_blocking(dir.clone()).await {
+            let comic_info = match read_comic_info_blocking(&state.resources, dir.clone()).await {
                 Ok(comic_info) => comic_info.unwrap_or_default(),
                 Err(err) => {
                     tracing::warn!(path = %dir.display(), error = %err, "preserving qmediasync comic after ComicInfo.xml read failure");
@@ -1806,7 +2467,7 @@ async fn scan_qmediasync_comics(
             let archive_page_count = if is_strm {
                 None
             } else {
-                match count_cbz_pages_blocking(archive_path.clone()).await {
+                match count_cbz_pages_blocking(&state.resources, archive_path.clone()).await {
                     Ok(page_count) => Some(page_count),
                     Err(err) => {
                         tracing::warn!(path = %archive_path.display(), error = %err, "skipping unreadable qmediasync comic archive");
@@ -1974,6 +2635,7 @@ async fn scan_qmediasync_coser_pictures(
             )
             .await?;
         let walk = walk_matching_files(
+            &state.resources,
             &root,
             1,
             Some(source.scan_depth.clamp(1, 64)),
@@ -2003,7 +2665,7 @@ async fn scan_qmediasync_coser_pictures(
                 path_string(&archive_path)
             };
             let ArchiveScanState { fingerprint, cover } =
-                fingerprint_archive(archive_path.clone(), false, true).await?;
+                fingerprint_archive(&state.resources, archive_path.clone(), false, true).await?;
             if let Some((work_id, previous)) = state
                 .db
                 .scanner_work_fingerprint("coser-picture", &archive_uri)
@@ -2019,7 +2681,7 @@ async fn scan_qmediasync_coser_pictures(
                 }
             }
             let target_url = if is_strm {
-                match read_qms_strm_url_blocking(archive_path.clone()).await {
+                match read_qms_strm_url_blocking(&state.resources, archive_path.clone()).await {
                     Ok(target_url) => Some(target_url),
                     Err(err) => {
                         tracing::warn!(
@@ -2046,7 +2708,7 @@ async fn scan_qmediasync_coser_pictures(
             let page_count = if is_strm {
                 0
             } else {
-                match count_cbz_pages_blocking(archive_path.clone()).await {
+                match count_cbz_pages_blocking(&state.resources, archive_path.clone()).await {
                     Ok(page_count) => page_count,
                     Err(err) => {
                         tracing::warn!(path = %archive_path.display(), error = %err, "skipping unreadable qmediasync CoserPicture archive");
@@ -2290,11 +2952,11 @@ struct EpubManifestItem {
     properties: String,
 }
 
-fn extract_epub_cover(
+fn extract_epub_cover_named(
     epub_path: &Path,
     generated_dir: &Path,
-    work_id: i64,
-) -> Result<Option<PathBuf>> {
+    file_prefix: &str,
+) -> Result<Option<ExtractedCover>> {
     let mut archive = open_zip_archive(epub_path, "EPUB")?;
     let opf_name = epub_opf_name(&mut archive)?;
     let opf = read_zip_text(&mut archive, &opf_name)?;
@@ -2364,14 +3026,18 @@ fn extract_epub_cover(
         // would let that stale task overwrite the current scan's cover bytes
         // even though its later database write is fenced out.
         let digest = format!("{:x}", Sha256::digest(&bytes));
-        let out = generated_dir.join(format!("epub-cover-{work_id}-{digest}.{ext}"));
+        let out = generated_dir.join(format!("{file_prefix}-{digest}.{ext}"));
         let already_published = std::fs::metadata(&out)
             .ok()
             .is_some_and(|metadata| metadata.is_file() && metadata.len() == bytes.len() as u64);
         if !already_published {
             crate::atomic_file::write_sync(&out, &bytes)?;
         }
-        return Ok(Some(out));
+        return Ok(Some(ExtractedCover {
+            path: out,
+            size: i64::try_from(bytes.len()).ok(),
+            source_version: digest,
+        }));
     }
     Ok(None)
 }
@@ -2390,12 +3056,15 @@ async fn cleanup_replaced_epub_cover(
     }
     let expected_prefix = format!("epub-cover-{work_id}-");
     let legacy_prefix = format!("epub-cover-{work_id}.");
+    let content_addressed_prefix = "epub-cover-v2-";
     let safe_generated_file = previous.parent() == Some(state.config.generated_dir.as_path())
         && previous
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                name.starts_with(&expected_prefix) || name.starts_with(&legacy_prefix)
+                name.starts_with(&expected_prefix)
+                    || name.starts_with(&legacy_prefix)
+                    || name.starts_with(content_addressed_prefix)
             });
     if !safe_generated_file {
         tracing::warn!(path = %previous.display(), "refusing to remove an unexpected old EPUB cover path");
@@ -2636,7 +3305,53 @@ fn infer_audio_variant(path: &Path) -> String {
 }
 
 fn common_rj_root(audio_dir: &Path, rj: &str, files: &[PathBuf]) -> PathBuf {
+    let normalized_rj = rj.to_ascii_uppercase();
+    let mut marker_roots = BTreeSet::new();
+    for file in files {
+        let Some(parent) = file.parent() else {
+            continue;
+        };
+        let Ok(relative_parent) = parent.strip_prefix(audio_dir) else {
+            continue;
+        };
+        let mut candidate = audio_dir.to_path_buf();
+        for component in relative_parent.components() {
+            candidate.push(component.as_os_str());
+            if component
+                .as_os_str()
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .contains(&normalized_rj)
+            {
+                marker_roots.insert(candidate.clone());
+                break;
+            }
+        }
+    }
+
+    if marker_roots.len() == 1 {
+        let marker_root = marker_roots
+            .into_iter()
+            .next()
+            .expect("one RJ marker root was confirmed");
+        let marker_is_exact_rj = marker_root
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(rj));
+        if !marker_is_exact_rj {
+            return marker_root;
+        }
+        return audio_product_root(marker_root, files);
+    }
+
     let rj_root = audio_dir.join(rj);
+    if rj_root.is_dir() {
+        return audio_product_root(rj_root, files);
+    }
+    common_audio_parent(audio_dir, files).unwrap_or(rj_root)
+}
+
+fn audio_product_root(rj_root: PathBuf, files: &[PathBuf]) -> PathBuf {
     let mut immediate_parents = BTreeSet::new();
     let mut has_direct_files = false;
     for file in files {
@@ -2660,11 +3375,20 @@ fn common_rj_root(audio_dir: &Path, rj: &str, files: &[PathBuf]) -> PathBuf {
     if rj_root.is_dir() {
         return rj_root;
     }
-    files
-        .first()
-        .and_then(|file| file.parent())
-        .map(Path::to_path_buf)
-        .unwrap_or(rj_root)
+    common_audio_parent(&rj_root, files).unwrap_or(rj_root)
+}
+
+fn common_audio_parent(audio_dir: &Path, files: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = files.first()?.parent()?.to_path_buf();
+    for file in files.iter().skip(1) {
+        let parent = file.parent()?;
+        while !parent.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    common.starts_with(audio_dir).then_some(common)
 }
 
 fn read_first_text_summary(files: &[PathBuf]) -> Option<String> {
@@ -2758,6 +3482,22 @@ fn extension_is(path: &Path, extensions: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn audio_track_file(path: &Path) -> bool {
+    extension_is(path, &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"])
+}
+
+fn is_local_comic_archive(path: &Path) -> bool {
+    extension_is(path, &["cbz", "zip"])
+}
+
+fn local_comic_archive_type(path: &Path) -> (&'static str, &'static str) {
+    if extension_is(path, &["zip"]) {
+        ("application/zip", "zip")
+    } else {
+        ("application/vnd.comicbook+zip", "cbz")
+    }
+}
+
 pub(crate) fn image_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     [".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"]
@@ -2806,11 +3546,12 @@ fn is_gallery_tag_separator(ch: char) -> bool {
     )
 }
 
-fn gallery_cover_candidate(files: &[PathBuf]) -> Option<&PathBuf> {
+fn gallery_cover_candidate(files: &[GalleryScannedPath]) -> Option<&GalleryScannedPath> {
     files
         .iter()
-        .find(|path| {
-            path.file_name()
+        .find(|file| {
+            file.path
+                .file_name()
                 .and_then(|value| value.to_str())
                 .map(|name| {
                     let lower = name.to_ascii_lowercase();
@@ -2904,16 +3645,112 @@ mod tests {
                 qmediasync_base_url: String::new(),
                 cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
                 thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
+                catalog_v2_enabled: true,
+                facet_bitmap_enabled: false,
+                inventory_scanner_enabled: false,
+                inventory_scanner_kinds: std::collections::BTreeSet::new(),
+                search_outbox_shadow_enabled: false,
+                search_shadow_canary_enabled: false,
+                search_incremental_reader_enabled: false,
+                search_reader_prewarm_enabled: false,
+                derivative_cache_v2_enabled: false,
+                jpeg_thumbnail_downscale_enabled: false,
+                derivative_cache_dir: temp.path().join("derivatives"),
+                derivative_cache_max_bytes: 1024,
+                derivative_cache_low_watermark_bytes: 512,
                 session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
+            derivatives: crate::derivative::DerivativeCache::disabled(
+                db.clone(),
+                temp.path().join("derivatives"),
+            ),
             db,
             http: reqwest::Client::new(),
+            resources: crate::resource::ResourceGovernor::standard(),
+            catalog_runtime: crate::catalog::CatalogRuntime::default(),
+            search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
             auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
             admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn gallery_fingerprint_keeps_one_ordered_snapshot_and_rejects_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("2.jpg");
+        let second = temp.path().join("10.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut files = vec![second.clone(), first.clone()];
+        files.sort_by_cached_key(|path| naturalish_key(&path_string(path)));
+
+        let fingerprint =
+            GalleryFingerprint::from_ordered_paths(temp.path().to_path_buf(), files).unwrap();
+        assert_eq!(fingerprint.files.len(), 2);
+        assert_eq!(fingerprint.files[0].path, first);
+        assert_eq!(fingerprint.files[1].path, second);
+        assert!(fingerprint.files.iter().all(|file| file.size.is_some()));
+        assert!(fingerprint.files.iter().all(|file| {
+            file.source_version.len() == 32
+                && file
+                    .source_version
+                    .chars()
+                    .all(|value| value.is_ascii_hexdigit())
+        }));
+
+        let missing = temp.path().join("missing.jpg");
+        let error =
+            GalleryFingerprint::from_ordered_paths(temp.path().to_path_buf(), vec![missing])
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("gallery metadata changed during scan"));
+    }
+
+    #[test]
+    fn gallery_legacy_and_inventory_fingerprints_are_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("gallery");
+        let folder = root.join("Artist").join("Set");
+        std::fs::create_dir_all(&folder).unwrap();
+        let first = folder.join("2.jpg");
+        let second = folder.join("10.jpg");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let mut files = vec![second.clone(), first.clone()];
+        files.sort_by_cached_key(|path| naturalish_key(&path_string(path)));
+
+        let legacy = GalleryFingerprint::from_ordered_paths(root.clone(), files).unwrap();
+        let inventory_entries = legacy
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    path_string(file.path.strip_prefix(&root).unwrap()),
+                    file.source_version.clone(),
+                    file.size.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let inventory = inspectors::gallery::gallery_fingerprint(inventory_entries.iter().map(
+            |(relative, source_version, size)| (relative.as_str(), source_version.as_str(), *size),
+        ));
+        assert_eq!(legacy.value, inventory);
+    }
+
+    #[test]
+    fn normalize_scan_kind_accepts_supported_kinds_and_rejects_unknown() {
+        assert_eq!(normalize_scan_kind(" Gallery ").unwrap(), "gallery");
+        assert_eq!(
+            normalize_scan_kind("coser-picture").unwrap(),
+            "coser-picture"
+        );
+        assert!(matches!(
+            normalize_scan_kind("everything"),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -2972,6 +3809,126 @@ mod tests {
             common_rj_root(&audio_dir, "RJ123456", &split_files),
             rj_root
         );
+
+        let nested_rj_root = audio_dir.join("Creator").join("rj234567");
+        let nested_product = nested_rj_root.join("Product Name");
+        let nested_files = vec![
+            nested_product.join("AAC").join("01.aac"),
+            nested_product.join("Opus").join("01.opus"),
+        ];
+        assert_eq!(
+            common_rj_root(&audio_dir, "RJ234567", &nested_files),
+            nested_product
+        );
+
+        let titled_root = audio_dir.join("Creator").join("[RJ345678] Titled Work");
+        let titled_files = vec![titled_root.join("tracks").join("01.flac")];
+        assert_eq!(
+            common_rj_root(&audio_dir, "RJ345678", &titled_files),
+            titled_root
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_audio_writer_stops_after_catalog_v2_ownership_cutover() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(&temp).await;
+        state.config.inventory_scanner_enabled = true;
+        std::fs::create_dir_all(&state.config.audio_dir).unwrap();
+        std::fs::write(state.config.audio_dir.join("RJ123456-track.mp3"), b"audio").unwrap();
+        sqlx::query(
+            "UPDATE catalog_kind_ownership SET authoritative_writer = 'catalog-v2' WHERE kind = 'audio'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+        let context = ScanContext {
+            state: &state,
+            settings: settings::AppSettings::defaults(&state.config),
+            token: "audio-catalog-owner".to_string(),
+            lease_valid: Arc::new(AtomicBool::new(true)),
+        };
+
+        assert_eq!(scan_audio(&context, false).await.unwrap(), (0, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM works WHERE kind = 'audio'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_v2_ownership_requires_the_inventory_coordinator() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(&temp).await;
+        sqlx::query(
+            "UPDATE catalog_kind_ownership SET authoritative_writer = 'catalog-v2' WHERE kind = 'novel'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        assert!(!catalog_v2_coordinator_owns_kind(&state, "novel")
+            .await
+            .unwrap());
+        state.config.inventory_scanner_enabled = true;
+        assert!(catalog_v2_coordinator_owns_kind(&state, "novel")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_gallery_writer_stops_only_while_catalog_v2_coordinator_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(&temp).await;
+        let folder = state.config.gallery_dir.join("artist");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("001.jpg"), b"gallery-image").unwrap();
+        sqlx::query(
+            "UPDATE catalog_kind_ownership SET authoritative_writer = 'catalog-v2' WHERE kind = 'gallery'",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        state.config.inventory_scanner_enabled = true;
+        let cutover = ScanContext {
+            state: &state,
+            settings: settings::AppSettings::defaults(&state.config),
+            token: "gallery-catalog-owner".to_string(),
+            lease_valid: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(scan_gallery(&cutover).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM works WHERE kind = 'gallery'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+
+        state.config.inventory_scanner_enabled = false;
+        let rollback = ScanContext {
+            state: &state,
+            settings: settings::AppSettings::defaults(&state.config),
+            token: "gallery-inventory-disabled".to_string(),
+            lease_valid: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(state
+            .db
+            .try_acquire_scanner_lock("library", &rollback.token, 60)
+            .await
+            .unwrap());
+        assert_eq!(scan_gallery(&rollback).await.unwrap(), 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM works WHERE kind = 'gallery'")
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -3002,11 +3959,55 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("book.epub"), b"book").unwrap();
         let lease_valid = Arc::new(AtomicBool::new(false));
-        let result = walk_matching_files(temp.path(), 1, None, "test", lease_valid, |path| {
-            extension_is(path, &["epub"])
-        })
+        let resources = ResourceGovernor::standard();
+        let result = walk_matching_files(
+            &resources,
+            temp.path(),
+            1,
+            None,
+            "test",
+            lease_valid,
+            |path| extension_is(path, &["epub"]),
+        )
         .await;
         assert!(result.err().unwrap().to_string().contains("lease was lost"));
+    }
+
+    #[tokio::test]
+    async fn batched_traversal_bounds_discovery_batch_and_completes() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..1_100 {
+            std::fs::write(temp.path().join(format!("{index}.epub")), b"book").unwrap();
+        }
+        std::fs::write(temp.path().join("ignored.txt"), b"ignored").unwrap();
+
+        let lease_valid = Arc::new(AtomicBool::new(true));
+        let resources = ResourceGovernor::standard();
+        let walker = open_matching_file_batches(
+            &resources,
+            temp.path(),
+            1,
+            None,
+            "test-batched",
+            lease_valid,
+            |path| extension_is(path, &["epub"]),
+        )
+        .await
+        .unwrap();
+        assert!(walker.usable());
+
+        let mut batches = 0;
+        let mut discovered = 0;
+        while let Some(batch) = walker.next_batch().await.unwrap() {
+            batches += 1;
+            assert!(batch.len() <= SCANNER_DISCOVERY_BATCH_SIZE);
+            discovered += batch.len();
+        }
+        let summary = walker.finish().await.unwrap();
+        assert!(batches > 1);
+        assert_eq!(discovered, 1_100);
+        assert!(summary.usable);
+        assert!(summary.complete);
     }
 
     #[test]
@@ -3247,6 +4248,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scans_plain_zip_comics_through_the_cbz_safety_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = make_test_state(&temp).await;
+        let work_dir = state.config.comics_dir.join("Author A");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let archive_path = work_dir.join("book.ZIP");
+        write_test_zip(&archive_path, &["2.jpg", "10.jpg", "1.jpg"]);
+
+        let settings = settings::AppSettings::defaults(&state.config);
+        let context = ScanContext {
+            state: &state,
+            settings,
+            token: "plain-zip-comic".to_string(),
+            lease_valid: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(state
+            .db
+            .try_acquire_scanner_lock("library", &context.token, 60)
+            .await
+            .unwrap());
+
+        assert_eq!(scan_comics(&context).await.unwrap(), 1);
+        let library = state.db.library().await.unwrap();
+        let work = library
+            .works
+            .iter()
+            .find(|work| work.kind == "comic")
+            .expect("plain ZIP comic work");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&work.meta_json)
+                .unwrap()
+                .get("page_count")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
+        let detail = state.db.work_detail(work.id).await.unwrap();
+        let archive = detail
+            .assets
+            .iter()
+            .find(|asset| asset.role == "archive")
+            .expect("plain ZIP archive asset");
+        assert_eq!(archive.path, path_string(&archive_path));
+        assert_eq!(archive.mime, "application/zip");
+        assert_eq!(archive.variant.as_deref(), Some("zip"));
+        assert_eq!(count_cbz_pages(&archive_path).unwrap(), 3);
+    }
+
+    #[tokio::test]
     async fn scans_coser_picture_zip_archives() {
         let temp = tempfile::tempdir().unwrap();
         let coser_root = temp.path().join("COS图");
@@ -3295,12 +4344,32 @@ mod tests {
                 qmediasync_base_url: String::new(),
                 cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
                 thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
+                catalog_v2_enabled: true,
+                facet_bitmap_enabled: false,
+                inventory_scanner_enabled: false,
+                inventory_scanner_kinds: std::collections::BTreeSet::new(),
+                search_outbox_shadow_enabled: false,
+                search_shadow_canary_enabled: false,
+                search_incremental_reader_enabled: false,
+                search_reader_prewarm_enabled: false,
+                derivative_cache_v2_enabled: false,
+                jpeg_thumbnail_downscale_enabled: false,
+                derivative_cache_dir: temp.path().join("derivatives"),
+                derivative_cache_max_bytes: 1024,
+                derivative_cache_low_watermark_bytes: 512,
                 session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
+            derivatives: crate::derivative::DerivativeCache::disabled(
+                db.clone(),
+                temp.path().join("derivatives"),
+            ),
             db,
             http: reqwest::Client::new(),
+            resources: crate::resource::ResourceGovernor::standard(),
+            catalog_runtime: crate::catalog::CatalogRuntime::default(),
+            search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
             auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
             admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3342,6 +4411,122 @@ mod tests {
             .expect("archive asset");
         assert_eq!(archive.mime, "application/zip");
         assert_eq!(archive.variant.as_deref(), Some("zip"));
+    }
+
+    #[tokio::test]
+    async fn unchanged_scan_does_not_requeue_search_rebuild_when_index_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = make_test_state(&temp).await;
+        let search_index_dir = state.config.data_dir.join("search-index-v2");
+        std::fs::create_dir_all(&search_index_dir).unwrap();
+        std::fs::write(search_index_dir.join("meta.json"), b"{}").unwrap();
+
+        let first = scan_all(&state, false).await.unwrap();
+        let second = scan_all(&state, false).await.unwrap();
+        assert_eq!(first.jobs_created, 0);
+        assert_eq!(second.jobs_created, 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM jobs WHERE job_type = 'rebuild-search-index'"
+            )
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_job_kind_scope_only_processes_requested_media_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = make_test_state(&temp).await;
+        state.config.inventory_scanner_enabled = true;
+        state.config.inventory_scanner_kinds = ["novel".to_string()].into_iter().collect();
+        let state = Arc::new(state);
+
+        let novel_path = state.config.novels_dir.join("scoped-book.epub");
+        std::fs::create_dir_all(&state.config.novels_dir).unwrap();
+        write_test_epub(&novel_path, "Scoped novel");
+
+        let comic_dir = state.config.comics_dir.join("Scoped Author");
+        std::fs::create_dir_all(&comic_dir).unwrap();
+        let comic_path = comic_dir.join("scoped-book.cbz");
+        write_test_zip(&comic_path, &["001.jpg", "002.jpg"]);
+
+        // Exercise the same dispatch used by the recovery worker instead of
+        // calling scan_kind directly.  A novel-scoped payload must not walk
+        // or write the comic root.
+        crate::enrich::run_job(
+            state.clone(),
+            0,
+            "scan-library",
+            json!({
+                "kind": "novel",
+                "enqueue_enrichment": false
+            }),
+        )
+        .await
+        .unwrap();
+
+        let counts_after_novel = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT\n+                 (SELECT COUNT(*) FROM works WHERE kind = 'novel'),\n+                 (SELECT COUNT(*) FROM works WHERE kind = 'comic')",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts_after_novel, (1, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM library_roots WHERE kind = 'novel'",
+            )
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM library_roots WHERE kind = 'comic'",
+            )
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+            0,
+            "an unselected scoped kind must not create a shadow inventory root"
+        );
+
+        // The second scoped job can then import the comic independently;
+        // this also proves the first job did not leave the global scan lock
+        // held or create an unusable successor state.
+        crate::enrich::run_job(
+            state.clone(),
+            0,
+            "scan-library",
+            json!({
+                "kind": "comic",
+                "enqueue_enrichment": false
+            }),
+        )
+        .await
+        .unwrap();
+
+        let counts_after_comic = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT\n+                 (SELECT COUNT(*) FROM works WHERE kind = 'novel'),\n+                 (SELECT COUNT(*) FROM works WHERE kind = 'comic')",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts_after_comic, (1, 1));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM library_roots WHERE kind = 'comic'",
+            )
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap(),
+            0,
+            "the legacy comic scan must remain independent of the novel shadow rollout"
+        );
     }
 
     #[tokio::test]
@@ -3398,6 +4583,19 @@ mod tests {
             qmediasync_base_url: String::new(),
             cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
             thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
+            catalog_v2_enabled: true,
+            facet_bitmap_enabled: false,
+            inventory_scanner_enabled: false,
+            inventory_scanner_kinds: std::collections::BTreeSet::new(),
+            search_outbox_shadow_enabled: false,
+            search_shadow_canary_enabled: false,
+            search_incremental_reader_enabled: false,
+            search_reader_prewarm_enabled: false,
+            derivative_cache_v2_enabled: false,
+            jpeg_thumbnail_downscale_enabled: false,
+            derivative_cache_dir: temp.path().join("derivatives"),
+            derivative_cache_max_bytes: 1024,
+            derivative_cache_low_watermark_bytes: 512,
             session_secret: "test-secret".to_string(),
             enable_file_watcher: false,
             watch_debounce_seconds: 20,
@@ -3410,8 +4608,15 @@ mod tests {
             .push(path_string(&qms_root));
         let state = AppState {
             config,
+            derivatives: crate::derivative::DerivativeCache::disabled(
+                db.clone(),
+                temp.path().join("derivatives"),
+            ),
             db,
             http: reqwest::Client::new(),
+            resources: crate::resource::ResourceGovernor::standard(),
+            catalog_runtime: crate::catalog::CatalogRuntime::default(),
+            search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
             auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
             admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),

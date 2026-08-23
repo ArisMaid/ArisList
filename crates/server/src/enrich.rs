@@ -14,6 +14,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::auth;
+use crate::catalog_reconciliation;
 use crate::db::{EnrichmentExternalIdInput, EnrichmentTagInput, ScannerEnrichmentInput};
 use crate::error::{AppError, Result};
 use crate::scanner;
@@ -60,12 +61,33 @@ pub async fn run_job(state: Arc<AppState>, id: i64, job_type: &str, payload: Val
                 .get("enqueue_enrichment")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            scanner::scan_all(&state, enqueue).await.map(|_| ())
+            match payload.get("kind").and_then(Value::as_str) {
+                Some(kind) => scanner::scan_kind(&state, kind, enqueue).await.map(|_| ()),
+                None => scanner::scan_all(&state, enqueue).await.map(|_| ()),
+            }
         }
         "enrich-asmr-work" => enrich_asmr_work(state, payload).await,
         "enrich-lightnovel-work" => enrich_lightnovel_work(state, payload).await,
         "generate-image-asset" => generate_image_asset(state, id, payload).await,
         "rebuild-search-index" => search::rebuild_search_index(state).await.map(|_| ()),
+        crate::search::outbox::REBUILD_SHADOW_SEARCH_JOB_TYPE => {
+            search::rebuild_shadow_search_index(state).await.map(|_| ())
+        }
+        catalog_reconciliation::RECONCILE_NOVEL_JOB_TYPE => {
+            catalog_reconciliation::reconcile_novel(state).await
+        }
+        catalog_reconciliation::RECONCILE_COMIC_JOB_TYPE => {
+            catalog_reconciliation::reconcile_comic(state).await
+        }
+        catalog_reconciliation::RECONCILE_COSER_PICTURE_JOB_TYPE => {
+            catalog_reconciliation::reconcile_coser_picture(state).await
+        }
+        catalog_reconciliation::RECONCILE_AUDIO_JOB_TYPE => {
+            catalog_reconciliation::reconcile_audio(state).await
+        }
+        catalog_reconciliation::RECONCILE_GALLERY_JOB_TYPE => {
+            catalog_reconciliation::reconcile_gallery(state).await
+        }
         _ => Err(AppError::BadRequest(format!(
             "unknown job type: {job_type}"
         ))),
@@ -207,13 +229,13 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
         tracing::info!(work_id, "skipping stale light-novel enrichment job");
         return Ok(());
     }
-    let detail = state.db.work_detail(work_id).await?;
+    let (existing_title, existing_meta) = state.db.work_title_and_meta(work_id).await?;
     let title = payload
         .get("title")
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| detail.work.title.clone());
+        .unwrap_or(existing_title);
     let series = payload
         .get("series")
         .and_then(Value::as_str)
@@ -249,7 +271,7 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
         find_lightnovel_candidate(&state, &queries, &subjects, creator).await?;
     let Some(candidate) = candidate else {
         let meta = merge_work_meta(
-            &detail.work.meta_json,
+            &existing_meta,
             json!({
                 "lightnovel": {
                     "status": "not-found",
@@ -311,7 +333,7 @@ async fn enrich_lightnovel_work(state: Arc<AppState>, payload: Value) -> Result<
         .collect::<Vec<_>>();
 
     let meta = merge_work_meta(
-        &detail.work.meta_json,
+        &existing_meta,
         json!({
             "lightnovel": {
                 "status": "ok",

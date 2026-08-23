@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "profile": "facet-bitmap-development",
+  "scope": "40k-works-800k-relations-response-cache-cold",
+  "scenarios": [
+    {
+      "id": "selective-facet-bitmap-cold",
+      "scenario": "catalog-facets-bitmap-cold",
+      "warm": "cold",
+      "concurrency": 1,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "total_ms.p95": 300
+      }
+    }
+  ]
+}

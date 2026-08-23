@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc, LazyLock, Mutex, Weak,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -13,12 +16,13 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
 use uuid::Uuid;
 
 use crate::error::{AppError, Result};
 use crate::models::Asset;
+use crate::resource::ResourceClass;
 use crate::security::ensure_asset_path_allowed_with_roots_async;
 use crate::settings::{self, AppSettings, MediaSourceSettings};
 use crate::AppState;
@@ -43,12 +47,105 @@ static VALIDATED_CLOUD_CACHES: LazyLock<Mutex<CloudCacheValidationMap>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLOUD_CACHE_QUOTAS: LazyLock<Mutex<HashMap<PathBuf, CloudCacheQuotaState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static CLOUD_CACHE_DOWNLOADS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static CLOUD_CACHE_VALIDATORS: LazyLock<Mutex<HashMap<PathBuf, CloudCacheValidator>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static STRM_CLIENTS: LazyLock<Mutex<HashMap<String, (reqwest::Client, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct QmsRuntimeCounters {
+    stream_requests: AtomicU64,
+    stream_range_requests: AtomicU64,
+    stream_full_requests: AtomicU64,
+    stream_successes: AtomicU64,
+    stream_partial_responses: AtomicU64,
+    stream_unsatisfiable_responses: AtomicU64,
+    stream_failures: AtomicU64,
+    stream_response_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    cache_not_modified: AtomicU64,
+    cache_downloads: AtomicU64,
+    cache_download_bytes: AtomicU64,
+    cache_quota_rejections: AtomicU64,
+    cache_usage_rescans: AtomicU64,
+}
+
+static QMS_RUNTIME: LazyLock<QmsRuntimeCounters> = LazyLock::new(QmsRuntimeCounters::default);
+
+struct QmsStreamFailureGuard {
+    counted: bool,
+}
+
+impl Drop for QmsStreamFailureGuard {
+    fn drop(&mut self) {
+        if !self.counted {
+            QMS_RUNTIME
+                .stream_failures
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+/// Process-local qmediasync counters used by the NAS performance Gate.
+///
+/// These are deliberately cumulative counters rather than an in-memory cache
+/// of request details: health polling can take deltas without retaining URLs,
+/// media bytes or unbounded per-asset state.
+#[derive(Debug, Clone, Serialize)]
+pub struct QmsRuntimeSnapshot {
+    pub stream_requests: u64,
+    pub stream_range_requests: u64,
+    pub stream_full_requests: u64,
+    pub stream_successes: u64,
+    pub stream_partial_responses: u64,
+    pub stream_unsatisfiable_responses: u64,
+    pub stream_failures: u64,
+    pub stream_response_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_not_modified: u64,
+    pub cache_downloads: u64,
+    pub cache_download_bytes: u64,
+    pub cache_quota_rejections: u64,
+    pub cache_usage_rescans: u64,
+}
+
+pub fn qms_runtime_snapshot() -> QmsRuntimeSnapshot {
+    QmsRuntimeSnapshot {
+        stream_requests: QMS_RUNTIME.stream_requests.load(AtomicOrdering::Relaxed),
+        stream_range_requests: QMS_RUNTIME
+            .stream_range_requests
+            .load(AtomicOrdering::Relaxed),
+        stream_full_requests: QMS_RUNTIME
+            .stream_full_requests
+            .load(AtomicOrdering::Relaxed),
+        stream_successes: QMS_RUNTIME.stream_successes.load(AtomicOrdering::Relaxed),
+        stream_partial_responses: QMS_RUNTIME
+            .stream_partial_responses
+            .load(AtomicOrdering::Relaxed),
+        stream_unsatisfiable_responses: QMS_RUNTIME
+            .stream_unsatisfiable_responses
+            .load(AtomicOrdering::Relaxed),
+        stream_failures: QMS_RUNTIME.stream_failures.load(AtomicOrdering::Relaxed),
+        stream_response_bytes: QMS_RUNTIME
+            .stream_response_bytes
+            .load(AtomicOrdering::Relaxed),
+        cache_hits: QMS_RUNTIME.cache_hits.load(AtomicOrdering::Relaxed),
+        cache_misses: QMS_RUNTIME.cache_misses.load(AtomicOrdering::Relaxed),
+        cache_not_modified: QMS_RUNTIME.cache_not_modified.load(AtomicOrdering::Relaxed),
+        cache_downloads: QMS_RUNTIME.cache_downloads.load(AtomicOrdering::Relaxed),
+        cache_download_bytes: QMS_RUNTIME
+            .cache_download_bytes
+            .load(AtomicOrdering::Relaxed),
+        cache_quota_rejections: QMS_RUNTIME
+            .cache_quota_rejections
+            .load(AtomicOrdering::Relaxed),
+        cache_usage_rescans: QMS_RUNTIME
+            .cache_usage_rescans
+            .load(AtomicOrdering::Relaxed),
+    }
+}
 
 #[derive(Clone)]
 struct CloudCacheValidator {
@@ -228,9 +325,30 @@ pub fn qmediasync_scan_sources(settings: &AppSettings, kind: &str) -> Vec<MediaS
             mount_name,
             enabled: true,
             scan_depth: 12,
+            audio_grouping: crate::scanner::audio_grouping::AudioGroupingMode::Auto,
         });
     }
     sources
+}
+
+/// Inventory roots use a provider key that keeps the qmediasync mount stable
+/// across restarts without adding the mount name to every inventory event.
+/// The public settings model still exposes `provider = qmediasync`; this
+/// namespaced value is only persisted in `library_roots`/catalog source rows.
+pub fn inventory_provider_key(source: &MediaSourceSettings) -> String {
+    format!("qmediasync:{}", source.mount_name.trim())
+}
+
+pub fn is_qmediasync_provider(provider: &str) -> bool {
+    provider == "qmediasync" || provider.strip_prefix("qmediasync:").is_some()
+}
+
+pub fn qmediasync_mount_name(provider: &str) -> Option<&str> {
+    let mount = provider
+        .strip_prefix("qmediasync:")
+        .or_else(|| (provider == "qmediasync").then_some("qms"))?;
+    let mount = mount.trim();
+    (!mount.is_empty()).then_some(mount)
 }
 
 fn unique_qmediasync_mount_name(used: &mut Vec<String>) -> String {
@@ -425,11 +543,28 @@ pub async fn stream_qms_asset(
     asset: Asset,
     headers: HeaderMap,
 ) -> Result<Response> {
+    QMS_RUNTIME
+        .stream_requests
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    let mut failure_guard = QmsStreamFailureGuard { counted: false };
     let target_url = qms_target_url_for_asset(&state, &asset).await?;
+    let remote_lease = state
+        .resources
+        .reserve(ResourceClass::RemoteSource, 0, 0)
+        .await?;
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
+    if range.is_some() {
+        QMS_RUNTIME
+            .stream_range_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    } else {
+        QMS_RUNTIME
+            .stream_full_requests
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
     let if_range = headers
         .get(header::IF_RANGE)
         .and_then(|value| value.to_str().ok())
@@ -437,6 +572,20 @@ pub async fn stream_qms_asset(
     let response =
         send_strm_get_with_range(&target_url, range.as_deref(), if_range.as_deref()).await?;
     let status = response.status();
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        QMS_RUNTIME
+            .stream_unsatisfiable_responses
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    } else if status.is_success() {
+        QMS_RUNTIME
+            .stream_successes
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        if status == StatusCode::PARTIAL_CONTENT {
+            QMS_RUNTIME
+                .stream_partial_responses
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
     if !(status.is_success() || status == StatusCode::RANGE_NOT_SATISFIABLE) {
         return Err(AppError::Other(format!(
             "qmediasync stream request failed: {status}"
@@ -457,8 +606,25 @@ pub async fn stream_qms_asset(
             builder = builder.header(name, value);
         }
     }
+    failure_guard.counted = true;
+    let stream = response.bytes_stream().map(move |chunk| {
+        let _keep_remote_lease_alive = &remote_lease;
+        match &chunk {
+            Ok(bytes) => {
+                QMS_RUNTIME
+                    .stream_response_bytes
+                    .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
+            }
+            Err(_) => {
+                QMS_RUNTIME
+                    .stream_failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        chunk
+    });
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(stream))
         .map_err(|e| AppError::Other(e.to_string()))
 }
 
@@ -476,6 +642,10 @@ pub async fn generate_qms_thumbnail(
     }
 
     let raw_url = qms_target_url_for_asset(state, asset).await?;
+    let remote_lease = state
+        .resources
+        .reserve(ResourceClass::RemoteSource, 0, 0)
+        .await?;
     let response = send_strm_get(&raw_url).await?;
     if !response.status().is_success() {
         return Err(AppError::Other(format!(
@@ -505,6 +675,7 @@ pub async fn generate_qms_thumbnail(
             )));
         }
     }
+    drop(remote_lease);
 
     let temp_path = unique_temp_path(&cache_path)?;
     let generated = match tokio::task::spawn_blocking({
@@ -625,6 +796,9 @@ async fn reserve_cloud_cache_capacity(
     let requested = expected_length
         .unwrap_or_else(|| MAX_CLOUD_CACHE_FILE_BYTES.min(available))
         .max(1);
+    QMS_RUNTIME
+        .cache_quota_rejections
+        .fetch_add(1, AtomicOrdering::Relaxed);
     Err(AppError::Other(format!(
         "cloud cache quota exceeded: {used} bytes used or reserved, {requested} requested, {quota} allowed; remove individual cached files manually or raise CLOUD_CACHE_MAX_BYTES"
     )))
@@ -657,6 +831,9 @@ async fn resync_cloud_cache_usage(
     state.initialized = true;
     state.observed_dir_modified = observed_dir_modified;
     state.last_scan = Some(Instant::now());
+    QMS_RUNTIME
+        .cache_usage_rescans
+        .fetch_add(1, AtomicOrdering::Relaxed);
     Ok(())
 }
 
@@ -792,34 +969,36 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
         let ext = qms_cache_extension(&strm_path, &raw_url);
         let cache_key = short_hash(&format!("{}\0{raw_url}", cloud_cache_key(asset)));
         let cache_path = cache_dir.join(format!("{cache_key}.{ext}"));
-        if valid_cloud_cache(&cache_path, &ext).await?
+        if valid_cloud_cache(state, &cache_path, &ext).await?
             && !cloud_cache_needs_revalidation(&cache_path)?
         {
+            QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(cache_path);
         }
 
         let lock = cache_write_lock(&cache_path)?;
         let _guard = lock.lock().await;
-        if valid_cloud_cache(&cache_path, &ext).await?
+        if valid_cloud_cache(state, &cache_path, &ext).await?
             && !cloud_cache_needs_revalidation(&cache_path)?
         {
+            QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(cache_path);
         }
-        let _download_permit = CLOUD_CACHE_DOWNLOADS
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::Other("cloud cache downloader is closed".to_string()))?;
-        if valid_cloud_cache(&cache_path, &ext).await?
+        let _remote_lease = state
+            .resources
+            .reserve(ResourceClass::RemoteSource, 0, 0)
+            .await?;
+        if valid_cloud_cache(state, &cache_path, &ext).await?
             && !cloud_cache_needs_revalidation(&cache_path)?
         {
+            QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(cache_path);
         }
         let fresh_url = read_qms_strm_url_async(strm_path.clone()).await?;
         if fresh_url != raw_url {
             continue;
         }
-        let existing_valid = valid_cloud_cache(&cache_path, &ext).await?;
+        let existing_valid = valid_cloud_cache(state, &cache_path, &ext).await?;
         let replaced_bytes = tokio::fs::metadata(&cache_path)
             .await
             .ok()
@@ -833,6 +1012,10 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
         let response = send_strm_get_conditional(&fresh_url, validator.as_ref()).await?;
         if response.status() == StatusCode::NOT_MODIFIED && existing_valid {
             remember_cloud_cache_validator(&cache_path, response.headers())?;
+            QMS_RUNTIME
+                .cache_not_modified
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
             return Ok(cache_path);
         }
         if !response.status().is_success() {
@@ -844,6 +1027,9 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
         reject_oversized_response(&response, MAX_CLOUD_CACHE_FILE_BYTES, "cloud cache")?;
         let response_headers = response.headers().clone();
         let expected_length = response.content_length();
+        QMS_RUNTIME
+            .cache_misses
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let reservation = reserve_cloud_cache_capacity(
             &cache_dir,
             state.config.cloud_cache_max_bytes,
@@ -906,7 +1092,8 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
             return Err(err.into());
         }
         drop(file);
-        if let Err(err) = validate_cloud_cache(&temp_path, &ext).await {
+        drop(_remote_lease);
+        if let Err(err) = validate_cloud_cache(&state.resources, &temp_path, &ext).await {
             remove_temp_file(&temp_path).await;
             return Err(err);
         }
@@ -925,6 +1112,12 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
         reservation.commit(downloaded, replaced_bytes, observed_dir_modified);
         remember_validated_cloud_cache(&cache_path).await?;
         remember_cloud_cache_validator(&cache_path, &response_headers)?;
+        QMS_RUNTIME
+            .cache_downloads
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        QMS_RUNTIME
+            .cache_download_bytes
+            .fetch_add(downloaded, AtomicOrdering::Relaxed);
         return Ok(cache_path);
     }
     Err(AppError::Other(
@@ -1152,7 +1345,7 @@ fn reject_oversized_response(response: &reqwest::Response, limit: u64, label: &s
     Ok(())
 }
 
-async fn valid_cloud_cache(path: &Path, extension: &str) -> Result<bool> {
+async fn valid_cloud_cache(state: &AppState, path: &Path, extension: &str) -> Result<bool> {
     let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -1176,7 +1369,7 @@ async fn valid_cloud_cache(path: &Path, extension: &str) -> Result<bool> {
             return Ok(true);
         }
     }
-    if let Err(err) = validate_cloud_cache(path, extension).await {
+    if let Err(err) = validate_cloud_cache(&state.resources, path, extension).await {
         tracing::warn!(path = %path.display(), error = %err, "cached cloud archive failed validation");
         return Ok(false);
     }
@@ -1190,13 +1383,25 @@ async fn valid_cloud_cache(path: &Path, extension: &str) -> Result<bool> {
     Ok(true)
 }
 
-async fn validate_cloud_cache(path: &Path, extension: &str) -> Result<()> {
+async fn validate_cloud_cache(
+    resources: &crate::resource::ResourceGovernor,
+    path: &Path,
+    extension: &str,
+) -> Result<()> {
     if matches!(
         extension.to_ascii_lowercase().as_str(),
         "zip" | "cbz" | "epub"
     ) {
+        let lease = resources
+            .reserve(
+                ResourceClass::ArchiveStream,
+                crate::archive::MAX_CENTRAL_DIRECTORY_BYTES.saturating_mul(2),
+                0,
+            )
+            .await?;
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let _lease = lease;
             let file = std::fs::File::open(path)?;
             let _archive = crate::archive::open_media_zip(file, "downloaded archive")?;
             Ok(())
@@ -1304,6 +1509,23 @@ mod tests {
         let (mount, path) = parse_qms_strm_uri(&uri).unwrap();
         assert_eq!(mount, "qms");
         assert_eq!(path, "/漫画/测试.cbz.strm");
+    }
+
+    #[test]
+    fn inventory_provider_key_round_trips_qmediasync_mount() {
+        let source = MediaSourceSettings {
+            kind: "comic".to_string(),
+            provider: "qmediasync".to_string(),
+            root: "/library/qms".to_string(),
+            mount_name: "remote-comics".to_string(),
+            enabled: true,
+            scan_depth: 12,
+            audio_grouping: crate::scanner::audio_grouping::AudioGroupingMode::Auto,
+        };
+        let provider = inventory_provider_key(&source);
+        assert_eq!(provider, "qmediasync:remote-comics");
+        assert!(is_qmediasync_provider(&provider));
+        assert_eq!(qmediasync_mount_name(&provider), Some("remote-comics"));
     }
 
     #[test]

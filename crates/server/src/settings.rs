@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 use crate::auth;
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::scanner::audio_grouping::AudioGroupingMode;
 use crate::AppState;
 
 #[derive(Clone)]
@@ -44,6 +45,12 @@ pub struct MediaDirectorySettings {
     pub gallery: Vec<String>,
     #[serde(default)]
     pub coser_picture: Vec<String>,
+    /// Maximum local directory depth for CBZ/ZIP discovery.  Depth is
+    /// measured from the configured root (root children are depth 1), so the
+    /// default of 3 covers the common `author/series/book.cbz` layout without
+    /// making a NAS scan walk arbitrary unrelated trees.
+    #[serde(default = "default_comic_scan_depth")]
+    pub comic_scan_depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +62,8 @@ pub struct MediaSourceSettings {
     pub enabled: bool,
     #[serde(default = "default_scan_depth")]
     pub scan_depth: usize,
+    #[serde(default)]
+    pub audio_grouping: AudioGroupingMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -114,6 +123,10 @@ pub struct QMediaSyncSettings {
 
 fn default_scan_depth() -> usize {
     12
+}
+
+fn default_comic_scan_depth() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +218,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub media_sources: Vec<MediaSourceSettings>,
     #[serde(default)]
+    pub audio_grouping: AudioGroupingMode,
+    #[serde(default)]
     pub qmediasync: QMediaSyncSettings,
     pub scan: ScanSettings,
     pub openai: OpenAiSettings,
@@ -223,9 +238,11 @@ impl AppSettings {
                 audio: vec![path_string(&config.audio_dir)],
                 gallery: vec![path_string(&config.gallery_dir)],
                 coser_picture: vec![path_string(&config.coser_picture_dir)],
+                comic_scan_depth: default_comic_scan_depth(),
             },
             cover_cache_dirs: CoverCacheDirectorySettings::defaults(config),
             media_sources: Vec::new(),
+            audio_grouping: AudioGroupingMode::default(),
             qmediasync: QMediaSyncSettings {
                 enabled: false,
                 base_url: config.qmediasync_base_url.clone(),
@@ -293,6 +310,7 @@ impl AppSettings {
         self.media_dirs.audio = normalize_dirs(self.media_dirs.audio);
         self.media_dirs.gallery = normalize_dirs(self.media_dirs.gallery);
         self.media_dirs.coser_picture = normalize_dirs(self.media_dirs.coser_picture);
+        self.media_dirs.comic_scan_depth = self.media_dirs.comic_scan_depth.clamp(1, 64);
         self.cover_cache_dirs = self.cover_cache_dirs.normalized(config);
         self.media_sources = normalize_sources(self.media_sources);
         self.qmediasync.strm_roots = normalize_dirs(self.qmediasync.strm_roots);
@@ -341,6 +359,7 @@ pub async fn update_settings(
                 "coser_picture": settings.media_dirs.coser_picture.len(),
                 "cover_cache_dirs": 5,
                 "media_sources": settings.media_sources.len(),
+                "audio_grouping": settings.audio_grouping.as_str(),
                 "qmediasync_enabled": settings.qmediasync.enabled,
                 "qmediasync_roots": settings.qmediasync.strm_roots.len(),
                 "theme": &settings.theme,
@@ -545,6 +564,46 @@ mod tests {
     }
 
     #[test]
+    fn local_comic_scan_depth_defaults_to_three() {
+        let settings = serde_json::from_value::<MediaDirectorySettings>(serde_json::json!({
+            "comics": [],
+            "novels": [],
+            "audio": [],
+            "gallery": [],
+            "coser_picture": []
+        }))
+        .unwrap();
+        assert_eq!(settings.comic_scan_depth, 3);
+    }
+
+    #[test]
+    fn legacy_media_source_without_audio_grouping_defaults_to_auto() {
+        let source = serde_json::from_value::<MediaSourceSettings>(serde_json::json!({
+            "kind": "audio",
+            "provider": "qmediasync",
+            "root": "/qms/audio",
+            "mount_name": "audio",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(source.audio_grouping, AudioGroupingMode::Auto);
+    }
+
+    #[test]
+    fn qmediasync_audio_source_preserves_explicit_folder_grouping() {
+        let sources = normalize_sources(vec![MediaSourceSettings {
+            kind: "audio".to_string(),
+            provider: "qmediasync".to_string(),
+            root: "/qms/audio".to_string(),
+            mount_name: "audio".to_string(),
+            enabled: true,
+            scan_depth: 12,
+            audio_grouping: AudioGroupingMode::Folder,
+        }]);
+        assert_eq!(sources[0].audio_grouping, AudioGroupingMode::Folder);
+    }
+
+    #[test]
     fn normalizes_legacy_openlist_sources_and_coser_picture_kind() {
         let sources = normalize_sources(vec![MediaSourceSettings {
             kind: " Coser-Picture ".to_string(),
@@ -553,6 +612,7 @@ mod tests {
             mount_name: "cloud".to_string(),
             enabled: true,
             scan_depth: 128,
+            audio_grouping: AudioGroupingMode::Auto,
         }]);
 
         assert_eq!(sources.len(), 1);
@@ -572,6 +632,7 @@ mod tests {
                 mount_name: "cloud".to_string(),
                 enabled: true,
                 scan_depth: 12,
+                audio_grouping: AudioGroupingMode::Auto,
             },
             MediaSourceSettings {
                 kind: "coser-picture".to_string(),
@@ -580,6 +641,7 @@ mod tests {
                 mount_name: "cloud".to_string(),
                 enabled: true,
                 scan_depth: 12,
+                audio_grouping: AudioGroupingMode::Auto,
             },
         ]);
 

@@ -49,9 +49,18 @@ import {
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { api, assetUrl, assetVersion, comicPageUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
+import { api, assetUrl, assetVersion, catalogAssetToAsset, comicPageUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
 import { GlassFilterProvider, GlassSurface } from "./components/material";
+import { loadRandomCatalogWork, type CatalogShelfQuery } from "./catalog/api";
+import { useCatalogContext, useCatalogJobs, useCatalogShelf } from "./catalog/useCatalog";
 import { useProgressQueue } from "./hooks/useProgressQueue";
+import {
+  AUDIO_QUEUE_WINDOW,
+  AUDIO_TRACK_MAX_CACHED,
+  AUDIO_TRACK_PAGE_SIZE,
+  mergeAudioTrackPage,
+  type AudioPlaylistState
+} from "./audioQueue";
 const NovelReader = lazy(() => import("./components/NovelReader").then((module) => ({ default: module.NovelReader })));
 
 type KindFilter = "history" | "comic" | "novel" | "audio" | "gallery" | "coser-picture";
@@ -75,18 +84,26 @@ type ActiveAudioState = {
   work: WorkDetail["work"];
   asset: Asset;
   playlist: Asset[];
+  playlistTotal: number;
   resumePosition: string | null;
   sessionId: number;
 };
 type OpenCollectionDescriptor = {
   collectionKey: string;
   kind: WorkSummary["kind"];
+  title?: string;
 };
 type AudioRepeatMode = "none" | "all" | "one";
 
 const COMIC_DEFAULT_ASPECT = 0.72;
 const COMIC_HORIZONTAL_OVERSCAN = 4;
 const COMIC_VERTICAL_OVERSCAN = 4;
+const COMIC_READER_PREFETCH_LIMIT = 4;
+const COMIC_MAX_PAGE_COUNT = 100_000;
+// The legacy fallback is kept bounded so a disabled Catalog v2 cannot pull
+// the entire library into the browser during startup.  Further pages remain
+// available through the explicit continuation control below.
+const LEGACY_BACKGROUND_PAGE_LIMIT = 5;
 
 const kindLabels: Record<string, string> = {
   comic: "漫画",
@@ -138,6 +155,10 @@ function clampComicAutoReadIntervalMs(value: unknown) {
 
 export function App() {
   const [library, setLibrary] = useState<LibraryResponse>({ works: [], tags: [], jobs: [], history: [] });
+  const [legacyLoading, setLegacyLoading] = useState(false);
+  const [catalogEnabled, setCatalogEnabled] = useState<boolean | null>(null);
+  const [catalogRefreshToken, setCatalogRefreshToken] = useState(0);
+  const [activeCollection, setActiveCollection] = useState<OpenCollectionDescriptor | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detail, setDetail] = useState<WorkDetail | null>(null);
   const [kind, setKind] = useState<KindFilter>("comic");
@@ -145,6 +166,10 @@ export function App() {
   const [localSearch, setLocalSearch] = useState<LocalSearchState>({ query: "", ids: [], status: "idle" });
   const [tagQuery, setTagQuery] = useState("");
   const [tagFilters, setTagFilters] = useState<Record<string, TagFilterMode>>({});
+  const includeTags = useMemo(
+    () => Object.entries(tagFilters).filter(([, mode]) => mode === "include").map(([key]) => key),
+    [tagFilters]
+  );
   const [tagLanguage, setTagLanguage] = useState<TagLanguage>("translated");
   const [selectedTag, setSelectedTag] = useState<Tag | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>("cover");
@@ -156,6 +181,7 @@ export function App() {
   const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [readerOpen, setReaderOpen] = useState(false);
+  const [readerDerivativesEnabled, setReaderDerivativesEnabled] = useState(false);
   const [pendingReaderId, setPendingReaderId] = useState<number | null>(null);
   const [readerResume, setReaderResume] = useState(true);
   const [readerPositionOverride, setReaderPositionOverride] = useState<string | null | undefined>(undefined);
@@ -176,6 +202,7 @@ export function App() {
   const selectedIdRef = useRef<number | null>(null);
   const libraryRequestRef = useRef<AbortController | null>(null);
   const libraryGenerationRef = useRef(0);
+  const legacyKnownWorkIdsRef = useRef(new Set<number>());
   const jobsSnapshotRef = useRef<Job[]>([]);
   const seenLibraryTerminalJobIdsRef = useRef(new Set<number>());
   const detailRequestRef = useRef<AbortController | null>(null);
@@ -184,6 +211,33 @@ export function App() {
   const openCollectionRef = useRef<OpenCollectionDescriptor | null>(null);
   const historyRequestRef = useRef<AbortController | null>(null);
   const historyGenerationRef = useRef(0);
+  const catalogEnabledRef = useRef(false);
+  const catalogRandomRequestRef = useRef<AbortController | null>(null);
+
+  const catalogShelfMode = useMemo<CatalogShelfQuery["mode"]>(() => {
+    if (kind === "history") return "history";
+    if (activeCollection) return "works";
+    if (kind === "comic" && comicDisplayMode === "collections") return "collections";
+    if (kind === "novel" && novelDisplayMode === "collections") return "collections";
+    if (kind === "coser-picture" && coserPictureDisplayMode === "collections") return "collections";
+    return "works";
+  }, [activeCollection, comicDisplayMode, coserPictureDisplayMode, kind, novelDisplayMode]);
+  const catalogQuery = useMemo<CatalogShelfQuery>(() => ({
+    kind,
+    mode: catalogShelfMode,
+    collection: activeCollection?.collectionKey ?? null,
+    includeTags,
+    query,
+    limit: 60,
+    refreshToken: catalogRefreshToken
+  }), [activeCollection?.collectionKey, catalogRefreshToken, catalogShelfMode, includeTags, kind, query]);
+  const catalogShelf = useCatalogShelf(catalogEnabled === true, catalogQuery);
+  const catalogContext = useCatalogContext(catalogEnabled === true, catalogQuery, tagQuery);
+  const { jobs: catalogJobs, setJobs: setCatalogJobs } = useCatalogJobs(catalogEnabled === true);
+
+  useEffect(() => {
+    catalogEnabledRef.current = catalogEnabled === true;
+  }, [catalogEnabled]);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
@@ -197,21 +251,47 @@ export function App() {
     }
   }, [detail, pendingReaderId]);
 
-  const refresh = useCallback(async () => {
+  const appendLegacyPage = useCallback((page: LibraryResponse, controller: AbortController, generation: number) => {
+    if (controller.signal.aborted || generation !== libraryGenerationRef.current) return false;
+    const appended = page.works.filter((work) => {
+      if (legacyKnownWorkIdsRef.current.has(work.id)) return false;
+      legacyKnownWorkIdsRef.current.add(work.id);
+      return true;
+    });
+    setLibrary((current) => {
+      if (controller.signal.aborted || generation !== libraryGenerationRef.current) return current;
+      return {
+        ...current,
+        // The API cursor already preserves updated_at order.  Appending the
+        // bounded page avoids sorting and re-indexing the entire shelf per page.
+        works: appended.length > 0 ? [...current.works, ...appended] : current.works,
+        next_cursor: page.next_cursor ?? null
+      };
+    });
+    return true;
+  }, []);
+
+  const refreshLegacy = useCallback(async () => {
     libraryRequestRef.current?.abort();
     const controller = new AbortController();
     const generation = ++libraryGenerationRef.current;
     libraryRequestRef.current = controller;
+    legacyKnownWorkIdsRef.current = new Set();
+    setLegacyLoading(true);
     setError(null);
     let firstPage: LibraryResponse;
     try {
       firstPage = await api.library({ limit: 100, includeContext: true, signal: controller.signal });
     } catch (error) {
+      if (libraryRequestRef.current === controller && generation === libraryGenerationRef.current) {
+        libraryRequestRef.current = null;
+        setLegacyLoading(false);
+      }
       if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
-      if (libraryRequestRef.current === controller) libraryRequestRef.current = null;
       throw error;
     }
     if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+    legacyKnownWorkIdsRef.current = new Set(firstPage.works.map((work) => work.id));
     markLibraryTerminalJobsSeen(firstPage.jobs, seenLibraryTerminalJobIdsRef.current);
     jobsSnapshotRef.current = firstPage.jobs;
     setLibrary((current) => (
@@ -222,8 +302,9 @@ export function App() {
     const loadRemainingPages = async () => {
       let cursor = firstPage.next_cursor ?? null;
       const seenCursors = new Set<string>();
+      let loadedPages = 0;
       try {
-        while (cursor && !seenCursors.has(cursor)) {
+        while (cursor && !seenCursors.has(cursor) && loadedPages < LEGACY_BACKGROUND_PAGE_LIMIT) {
           if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
           seenCursors.add(cursor);
           const page = await api.library({
@@ -233,23 +314,12 @@ export function App() {
             signal: controller.signal
           });
           if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
-          setLibrary((current) => {
-            if (controller.signal.aborted || generation !== libraryGenerationRef.current) return current;
-            const knownIds = new Set(current.works.map((work) => work.id));
-            const appended = page.works.filter((work) => {
-              if (knownIds.has(work.id)) return false;
-              knownIds.add(work.id);
-              return true;
-            });
-            return {
-              ...current,
-              works: appended.length > 0
-                ? [...current.works, ...appended].sort(compareWorksByUpdatedAt)
-                : current.works,
-              next_cursor: page.next_cursor
-            };
-          });
+          if (!appendLegacyPage(page, controller, generation)) return;
           cursor = page.next_cursor ?? null;
+          loadedPages += 1;
+        }
+        if (!controller.signal.aborted && generation === libraryGenerationRef.current) {
+          setLibrary((current) => ({ ...current, next_cursor: cursor }));
         }
       } catch (error) {
         if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
@@ -257,6 +327,7 @@ export function App() {
       } finally {
         if (libraryRequestRef.current === controller && generation === libraryGenerationRef.current) {
           libraryRequestRef.current = null;
+          setLegacyLoading(false);
         }
       }
     };
@@ -265,8 +336,32 @@ export function App() {
       void loadRemainingPages();
     } else if (libraryRequestRef.current === controller) {
       libraryRequestRef.current = null;
+      setLegacyLoading(false);
     }
-  }, []);
+  }, [appendLegacyPage]);
+
+  const loadMoreLegacy = useCallback(async () => {
+    if (catalogEnabledRef.current || legacyLoading || libraryRequestRef.current) return;
+    const cursor = library.next_cursor ?? null;
+    if (!cursor) return;
+    const controller = new AbortController();
+    const generation = ++libraryGenerationRef.current;
+    libraryRequestRef.current = controller;
+    setLegacyLoading(true);
+    try {
+      const page = await api.library({ cursor, limit: 500, includeContext: false, signal: controller.signal });
+      if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+      appendLegacyPage(page, controller, generation);
+    } catch (error) {
+      if (controller.signal.aborted || generation !== libraryGenerationRef.current) return;
+      setError(`加载更多作品失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (libraryRequestRef.current === controller && generation === libraryGenerationRef.current) {
+        libraryRequestRef.current = null;
+        setLegacyLoading(false);
+      }
+    }
+  }, [appendLegacyPage, legacyLoading, library.next_cursor]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -294,7 +389,24 @@ export function App() {
         setDetailMode(value.detail_mode ?? "modal");
       })
       .catch((err) => setError(err.message));
-    refresh().catch((err) => setError(err.message));
+    api
+      .health()
+      .then((health) => {
+        const enabled = health.features?.catalog_v2 ?? false;
+        setReaderDerivativesEnabled(health.features?.derivative_cache_v2 ?? false);
+        catalogEnabledRef.current = enabled;
+        setCatalogEnabled(enabled);
+        if (enabled) {
+          return api.history().then((history) => {
+            setLibrary((current) => ({ ...current, history }));
+          });
+        }
+        return refreshLegacy();
+      })
+      .catch((err) => {
+        setCatalogEnabled(null);
+        setError(err instanceof Error ? err.message : String(err));
+      });
     let disposed = false;
     let events: EventSource | null = null;
     let retryTimer: number | null = null;
@@ -315,13 +427,18 @@ export function App() {
           const snapshotChanged = !jobsEqual(previousJobs, nextJobs);
           jobsSnapshotRef.current = nextJobs;
           if (snapshotChanged) {
+            setCatalogJobs(nextJobs);
             setLibrary((prev) => jobsEqual(prev.jobs, nextJobs) ? prev : { ...prev, jobs: nextJobs });
           }
           if (refreshAfterTerminalJob) {
-            void refresh().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+            if (catalogEnabledRef.current) {
+              setCatalogRefreshToken((value) => value + 1);
+            } else {
+              void refreshLegacy().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+            }
           }
         } catch {
-          // Library refresh remains the source of truth when an event is malformed.
+          // The active catalog or legacy refresh path remains the source of truth.
         }
       });
       events.onerror = () => {
@@ -345,10 +462,51 @@ export function App() {
       historyGenerationRef.current += 1;
       historyRequestRef.current?.abort();
       historyRequestRef.current = null;
+      catalogRandomRequestRef.current?.abort();
+      catalogRandomRequestRef.current = null;
       events?.close();
       if (retryTimer !== null) window.clearTimeout(retryTimer);
     };
-  }, [refresh]);
+  }, [refreshLegacy, setCatalogJobs]);
+
+  useEffect(() => {
+    if (catalogEnabled !== true) return;
+    setLibrary((current) => ({
+      ...current,
+      works: catalogShelf.items,
+      history: catalogShelf.history.length > 0
+        ? [
+            ...catalogShelf.history,
+            ...current.history.filter((record) => !catalogShelf.history.some((item) => item.work_id === record.work_id))
+          ].slice(0, 200)
+        : current.history,
+      next_cursor: null
+    }));
+    const firstReadable = catalogShelf.items.find((work) => !work.kind.endsWith("-collection"));
+    if (firstReadable) {
+      setSelectedId((current) => (
+        current && catalogShelf.items.some((work) => work.id === current && !work.kind.endsWith("-collection"))
+          ? current
+          : firstReadable.id
+      ));
+    }
+  }, [catalogEnabled, catalogShelf.history, catalogShelf.items]);
+
+  useEffect(() => {
+    if (catalogEnabled !== true) return;
+    setLibrary((current) => ({ ...current, tags: catalogContext.tags }));
+  }, [catalogContext.tags, catalogEnabled]);
+
+  useEffect(() => {
+    if (catalogEnabled !== true) return;
+    jobsSnapshotRef.current = catalogJobs;
+    setLibrary((current) => jobsEqual(current.jobs, catalogJobs) ? current : { ...current, jobs: catalogJobs });
+  }, [catalogEnabled, catalogJobs]);
+
+  useEffect(() => {
+    const catalogError = catalogShelf.error ?? catalogContext.error;
+    if (catalogError) setError(catalogError);
+  }, [catalogContext.error, catalogShelf.error]);
 
   useEffect(() => {
     detailRequestRef.current?.abort();
@@ -360,8 +518,11 @@ export function App() {
     const generation = ++detailGenerationRef.current;
     detailRequestRef.current = controller;
     if (detailRef.current?.work.id !== selectedId) setDetail(null);
+    // The React client always uses the bounded detail shape.  The legacy
+    // server mode remains available to older external clients, while this
+    // client obtains tracks/pages/images through their dedicated cursors.
     api
-      .work(selectedId, controller.signal)
+      .work(selectedId, controller.signal, "summary")
       .then((next) => {
         if (generation === detailGenerationRef.current && selectedIdRef.current === selectedId) setDetail(next);
       })
@@ -376,6 +537,10 @@ export function App() {
   }, [selectedId]);
 
   useEffect(() => {
+    if (catalogEnabled === true) {
+      setLocalSearch({ query: query.trim(), ids: [], status: query.trim() ? "ready" : "idle", tookMs: catalogShelf.tookMs });
+      return;
+    }
     const needle = query.trim();
     if (needle.length < 2) {
       setLocalSearch({ query: "", ids: [], status: "idle" });
@@ -408,19 +573,21 @@ export function App() {
       controller.abort();
       window.clearTimeout(handle);
     };
-  }, [query, kind]);
+  }, [catalogEnabled, catalogShelf.tookMs, query, kind]);
 
   const baseWorks = useMemo(() => library.works.filter((work) => work.kind !== "generated"), [library.works]);
 
   const scopedWorks = useMemo(() => {
+    if (catalogEnabled === true) return baseWorks;
     if (kind !== "history") return baseWorks;
     const byId = new Map(baseWorks.map((work) => [work.id, work]));
     return library.history
       .map((record) => byId.get(record.work_id))
       .filter((work): work is WorkSummary => Boolean(work));
-  }, [baseWorks, kind, library.history]);
+  }, [baseWorks, catalogEnabled, kind, library.history]);
 
   const availableTagKeys = useMemo(() => {
+    if (catalogEnabled === true) return new Set(library.tags.map(tagKey));
     const keys = new Set<string>();
     for (const work of scopedWorks) {
       if (kind !== "history" && work.kind !== kind) continue;
@@ -429,9 +596,10 @@ export function App() {
       }
     }
     return keys;
-  }, [scopedWorks, kind]);
+  }, [catalogEnabled, library.tags, scopedWorks, kind]);
 
   const visibleTags = useMemo(() => {
+    if (catalogEnabled === true) return library.tags;
     if (availableTagKeys.size === 0) return [];
     const needle = tagQuery.trim().toLowerCase();
     return library.tags
@@ -441,13 +609,10 @@ export function App() {
         return `${tag.namespace}:${tag.key} ${tag.label} ${tag.translated_label ?? ""}`.toLowerCase().includes(needle);
       })
       .slice(0, 120);
-  }, [availableTagKeys, library.tags, tagQuery]);
+  }, [availableTagKeys, catalogEnabled, library.tags, tagQuery]);
 
-  const includeTags = useMemo(
-    () => Object.entries(tagFilters).filter(([, mode]) => mode === "include").map(([key]) => key),
-    [tagFilters]
-  );
   const filteredWorks = useMemo(() => {
+    if (catalogEnabled === true) return scopedWorks;
     const needle = query.trim().toLowerCase();
     const searchReady = needle.length >= 2 && localSearch.status === "ready" && localSearch.query.toLowerCase() === needle;
     const searchRank = searchReady ? new Map(localSearch.ids.map((id, index) => [id, index])) : null;
@@ -459,9 +624,20 @@ export function App() {
       const workTags = work.tag_keys ? work.tag_keys.split(",") : detail?.work.id === work.id ? detail.tags.map(tagKey) : [];
       return includeTags.every((tag) => workTags.includes(tag));
     }).sort((a, b) => (searchRank ? (searchRank.get(a.id) ?? 0) - (searchRank.get(b.id) ?? 0) : 0));
-  }, [scopedWorks, kind, query, localSearch, includeTags, detail]);
+  }, [catalogEnabled, scopedWorks, kind, query, localSearch, includeTags, detail]);
 
   const counts = useMemo(() => {
+    if (catalogEnabled === true) {
+      return {
+        history: 0,
+        comic: 0,
+        novel: 0,
+        audio: 0,
+        gallery: 0,
+        "coser-picture": 0,
+        ...catalogContext.counts
+      };
+    }
     return baseWorks.reduce<Record<string, number>>(
       (acc, work) => {
         acc[work.kind] = (acc[work.kind] ?? 0) + 1;
@@ -469,7 +645,7 @@ export function App() {
       },
       { history: library.history.length, comic: 0, novel: 0, audio: 0, gallery: 0, "coser-picture": 0 }
     );
-  }, [baseWorks, library.history.length]);
+  }, [baseWorks, catalogContext.counts, catalogEnabled, library.history.length]);
 
   const historyByWorkId = useMemo(() => new Map(library.history.map((record) => [record.work_id, record])), [library.history]);
 
@@ -533,7 +709,8 @@ export function App() {
     setError(null);
     try {
       await api.scan(false);
-      await refresh();
+      if (catalogEnabledRef.current) setCatalogRefreshToken((value) => value + 1);
+      else await refreshLegacy();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -550,7 +727,8 @@ export function App() {
     setError(null);
     try {
       await api.enrich("import-tag-translations");
-      await refresh();
+      if (catalogEnabledRef.current) setCatalogRefreshToken((value) => value + 1);
+      else await refreshLegacy();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -642,6 +820,7 @@ export function App() {
 
   const closeCollection = useCallback(() => {
     openCollectionRef.current = null;
+    setActiveCollection(null);
     setCollectionStack(null);
   }, []);
 
@@ -658,7 +837,7 @@ export function App() {
     setDetail((prev) => (prev?.work.id === id ? { ...prev, work: { ...prev.work, progress } } : prev));
   };
 
-  const playTrackInDock = (work: WorkDetail["work"], asset: Asset, playlist?: Asset[]) => {
+  const playTrackInDock = (work: WorkDetail["work"], asset: Asset, playlist?: Asset[], playlistTotal?: number) => {
     const fallback = historyByWorkId.get(work.id)?.position ?? null;
     void resolveExactHistoryPosition(work.id, fallback).then((result) => {
       if (!result.current) return;
@@ -666,6 +845,7 @@ export function App() {
         work,
         asset,
         playlist: playlist && playlist.length > 0 ? playlist : [asset],
+        playlistTotal: Math.max(playlistTotal ?? playlist?.length ?? 1, playlist?.length ?? 1),
         resumePosition: result.position,
         sessionId: ++audioSessionIdRef.current
       });
@@ -673,18 +853,23 @@ export function App() {
   };
 
   const collectionShelfWorks = useMemo(() => {
+    if (catalogEnabled === true) return filteredWorks;
     if (kind === "comic" && comicDisplayMode === "collections") return buildComicCollections(filteredWorks);
     if (kind === "novel" && novelDisplayMode === "collections") return buildNovelCollections(filteredWorks);
     if (kind === "coser-picture" && coserPictureDisplayMode === "collections") return buildCoserPictureCollections(filteredWorks);
     return filteredWorks;
-  }, [comicDisplayMode, coserPictureDisplayMode, filteredWorks, kind, novelDisplayMode]);
+  }, [catalogEnabled, comicDisplayMode, coserPictureDisplayMode, filteredWorks, kind, novelDisplayMode]);
 
   const displayedWorks = useMemo(
-    () => collectionStack ?? collectionShelfWorks,
-    [collectionShelfWorks, collectionStack]
+    () => catalogEnabled === true ? collectionShelfWorks : collectionStack ?? collectionShelfWorks,
+    [catalogEnabled, collectionShelfWorks, collectionStack]
   );
+  const collectionNavigationStack = catalogEnabled === true && activeCollection
+    ? displayedWorks
+    : collectionStack;
 
   useEffect(() => {
+    if (catalogEnabled === true) return;
     const descriptor = openCollectionRef.current;
     if (!descriptor) return;
     const collection = collectionShelfWorks.find((work) => {
@@ -707,7 +892,7 @@ export function App() {
       }
       return volumes;
     });
-  }, [collectionShelfWorks, filteredWorks]);
+  }, [catalogEnabled, collectionShelfWorks, filteredWorks]);
 
   const openWorkPreview = (work: WorkSummary) => {
     cancelHistoryLookup();
@@ -758,6 +943,14 @@ export function App() {
     cancelHistoryLookup();
     setPendingReaderId(null);
     const meta = parseMeta<{ collection_key?: string; first_work_id?: number; volume_ids?: number[] }>(work.meta_json);
+    if (catalogEnabled === true && meta.collection_key) {
+      const descriptor = { collectionKey: meta.collection_key, kind: work.kind, title: work.title };
+      openCollectionRef.current = descriptor;
+      setActiveCollection(descriptor);
+      setCollectionStack([]);
+      setDetailModalOpen(false);
+      return;
+    }
     const volumes = (meta.volume_ids ?? [])
       .map((id) => filteredWorks.find((item) => item.id === id))
       .filter((item): item is WorkSummary => Boolean(item));
@@ -774,6 +967,24 @@ export function App() {
   };
 
   const openRandomComic = () => {
+    if (catalogEnabled === true) {
+      catalogRandomRequestRef.current?.abort();
+      const controller = new AbortController();
+      catalogRandomRequestRef.current = controller;
+      void loadRandomCatalogWork({ ...catalogQuery, kind: "comic", mode: "works" }, controller.signal)
+        .then((work) => {
+          if (!work || controller.signal.aborted) return;
+          void openComicReader(work, false, "start");
+        })
+        .catch((err) => {
+          if (err instanceof DOMException && err.name === "AbortError") return;
+          setError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => {
+          if (catalogRandomRequestRef.current === controller) catalogRandomRequestRef.current = null;
+        });
+      return;
+    }
     const candidates = (collectionStack ?? filteredWorks).filter((work) => work.kind === "comic");
     if (candidates.length === 0) return;
     const work = candidates[Math.floor(Math.random() * candidates.length)];
@@ -796,14 +1007,18 @@ export function App() {
           selectedTag={selectedTag}
           tagFilters={tagFilters}
           tagLanguage={tagLanguage}
-          tagQuery={tagQuery}
-          visibleTags={visibleTags}
-          onKindChange={setKind}
-          onSelectedTagChange={setSelectedTag}
-          onTagFiltersChange={setTagFilters}
-          onTagLanguageChange={setTagLanguage}
-          onTagQueryChange={setTagQuery}
-        />
+           tagQuery={tagQuery}
+           visibleTags={visibleTags}
+           hasMoreTags={catalogEnabled === true && Boolean(catalogContext.tagNextCursor)}
+           tagLoadingMore={catalogContext.tagLoadingMore}
+           tagLimitReached={catalogContext.tagLimitReached}
+           onKindChange={setKind}
+           onSelectedTagChange={setSelectedTag}
+           onTagFiltersChange={setTagFilters}
+           onTagLanguageChange={setTagLanguage}
+           onTagQueryChange={setTagQuery}
+           onLoadMoreTags={catalogContext.loadMoreTags}
+         />
       </GlassSurface>
       ) : (
       <aside className="rail">
@@ -814,14 +1029,18 @@ export function App() {
           selectedTag={selectedTag}
           tagFilters={tagFilters}
           tagLanguage={tagLanguage}
-          tagQuery={tagQuery}
-          visibleTags={visibleTags}
-          onKindChange={setKind}
-          onSelectedTagChange={setSelectedTag}
-          onTagFiltersChange={setTagFilters}
-          onTagLanguageChange={setTagLanguage}
-          onTagQueryChange={setTagQuery}
-        />
+           tagQuery={tagQuery}
+           visibleTags={visibleTags}
+           hasMoreTags={catalogEnabled === true && Boolean(catalogContext.tagNextCursor)}
+           tagLoadingMore={catalogContext.tagLoadingMore}
+           tagLimitReached={catalogContext.tagLimitReached}
+           onKindChange={setKind}
+           onSelectedTagChange={setSelectedTag}
+           onTagFiltersChange={setTagFilters}
+           onTagLanguageChange={setTagLanguage}
+           onTagQueryChange={setTagQuery}
+           onLoadMoreTags={catalogContext.loadMoreTags}
+         />
       </aside>
       )}
 
@@ -829,9 +1048,9 @@ export function App() {
         {isLiquid ? (
         <GlassSurface as="header" className="toolbar" variant="panel">
           <ToolbarContent
-            collectionStack={collectionStack}
+            collectionStack={collectionNavigationStack}
             comicDisplayMode={comicDisplayMode}
-            comicCount={(collectionStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
+            comicCount={catalogEnabled === true ? counts.comic ?? 0 : (collectionNavigationStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
             coserPictureDisplayMode={coserPictureDisplayMode}
             kind={kind}
             localSearch={localSearch}
@@ -851,9 +1070,9 @@ export function App() {
         ) : (
         <header className="toolbar">
           <ToolbarContent
-            collectionStack={collectionStack}
+            collectionStack={collectionNavigationStack}
             comicDisplayMode={comicDisplayMode}
-            comicCount={(collectionStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
+            comicCount={catalogEnabled === true ? counts.comic ?? 0 : (collectionNavigationStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
             coserPictureDisplayMode={coserPictureDisplayMode}
             kind={kind}
             localSearch={localSearch}
@@ -876,6 +1095,25 @@ export function App() {
           <motion.div className="error-strip" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}>
             {error}
           </motion.div>
+        )}
+
+        {catalogEnabled === null && (
+          <div className="catalog-status" role="status">
+            <Loader2 className="spin" size={16} />
+            <span>正在确认书架服务状态…</span>
+          </div>
+        )}
+        {catalogEnabled === true && catalogShelf.backfillPending && (
+          <div className="catalog-status" role="status">
+            <Loader2 className="spin" size={16} />
+            <span>正在生成合集摘要，完成后会自动显示…</span>
+          </div>
+        )}
+        {catalogEnabled === true && catalogShelf.loading && !catalogShelf.backfillPending && (
+          <div className="catalog-status" role="status">
+            <Loader2 className="spin" size={16} />
+            <span>正在加载第 {catalogShelf.pageIndex + 1} 页…</span>
+          </div>
         )}
 
         <VirtualShelf
@@ -903,6 +1141,28 @@ export function App() {
             />
           )}
         />
+        {catalogEnabled === true && displayedWorks.length > 0 && !catalogShelf.backfillPending && (
+          <nav className="catalog-pager" aria-label="书架分页">
+            <button onClick={catalogShelf.previous} disabled={!catalogShelf.canPrevious || catalogShelf.loading}>
+              <ChevronLeft size={16} />
+              <span>上一页</span>
+            </button>
+            <span>第 {catalogShelf.pageIndex + 1} 页</span>
+            <button onClick={catalogShelf.next} disabled={!catalogShelf.canNext || catalogShelf.loading}>
+              <span>下一页</span>
+              <ChevronRight size={16} />
+            </button>
+          </nav>
+        )}
+        {catalogEnabled === false && library.next_cursor && (
+          <nav className="catalog-pager legacy-pager" aria-label="旧版书架续页">
+            <button onClick={() => void loadMoreLegacy()} disabled={legacyLoading}>
+              {legacyLoading ? <Loader2 className="spin" size={16} /> : <ChevronRight size={16} />}
+              <span>{legacyLoading ? "正在加载…" : "加载更多"}</span>
+            </button>
+            <span>已加载 {baseWorks.length} 项</span>
+          </nav>
+        )}
       </main>
 
       {detailMode === "docked" && (
@@ -977,7 +1237,9 @@ export function App() {
               setPendingReaderId(null);
               setReaderOpen(false);
             }}
+            onPlayTrack={playTrackInDock}
             onProgressSaved={syncProgress}
+            readerDerivativesEnabled={readerDerivativesEnabled}
             resumePosition={readerResume ? readerPositionOverride ?? historyByWorkId.get(detail.work.id)?.position ?? null : "start"}
             liquid={isLiquid}
             comicAutoReadIntervalMs={comicAutoReadIntervalMs}
@@ -998,11 +1260,15 @@ function RailContent({
   tagLanguage,
   tagQuery,
   visibleTags,
+  hasMoreTags,
+  tagLoadingMore,
+  tagLimitReached,
   onKindChange,
   onSelectedTagChange,
   onTagFiltersChange,
   onTagLanguageChange,
-  onTagQueryChange
+  onTagQueryChange,
+  onLoadMoreTags
 }: {
   counts: Record<string, number>;
   includeTags: string[];
@@ -1012,11 +1278,15 @@ function RailContent({
   tagLanguage: TagLanguage;
   tagQuery: string;
   visibleTags: Tag[];
+  hasMoreTags: boolean;
+  tagLoadingMore: boolean;
+  tagLimitReached: boolean;
   onKindChange: (kind: KindFilter) => void;
   onSelectedTagChange: (tag: Tag | null) => void;
   onTagFiltersChange: (next: Record<string, TagFilterMode> | ((prev: Record<string, TagFilterMode>) => Record<string, TagFilterMode>)) => void;
   onTagLanguageChange: (next: TagLanguage | ((prev: TagLanguage) => TagLanguage)) => void;
   onTagQueryChange: (value: string) => void;
+  onLoadMoreTags: () => void;
 }) {
   return (
     <>
@@ -1077,6 +1347,19 @@ function RailContent({
             </div>
           );
         })}
+        {hasMoreTags && (
+          <button
+            className="tag-load-more"
+            type="button"
+            onClick={onLoadMoreTags}
+            disabled={tagLoadingMore}
+            aria-label="加载更多标签"
+          >
+            {tagLoadingMore ? <Loader2 className="spin" size={14} /> : <ChevronRight size={14} />}
+            <span>{tagLoadingMore ? "加载中" : "加载更多标签"}</span>
+          </button>
+        )}
+        {tagLimitReached && <span className="tag-limit-note">已达到标签显示上限</span>}
       </div>
     </>
   );
@@ -1374,7 +1657,8 @@ function SettingsOverlay({
     onAppearanceChange(patch);
   };
 
-  const addDir = (kind: keyof AppSettings["media_dirs"]) => {
+  type MediaDirectoryKey = "comics" | "novels" | "audio" | "gallery" | "coser_picture";
+  const addDir = (kind: MediaDirectoryKey) => {
     const value = dirInputs[kind].trim();
     if (!value) return;
     updateDraft((prev) => ({
@@ -1387,7 +1671,7 @@ function SettingsOverlay({
     setDirInputs((prev) => ({ ...prev, [kind]: "" }));
   };
 
-  const removeDir = (kind: keyof AppSettings["media_dirs"], value: string) => {
+  const removeDir = (kind: MediaDirectoryKey, value: string) => {
     updateDraft((prev) => ({
       ...prev,
       media_dirs: {
@@ -1397,7 +1681,7 @@ function SettingsOverlay({
     }));
   };
 
-  const mediaLabels: Record<keyof AppSettings["media_dirs"], string> = {
+  const mediaLabels: Record<MediaDirectoryKey, string> = {
     comics: "漫画目录",
     novels: "轻小说目录",
     audio: "音声目录",
@@ -1440,7 +1724,8 @@ function SettingsOverlay({
         root,
         mount_name: mount,
         enabled: true,
-        scan_depth: scanDepth
+        scan_depth: scanDepth,
+        audio_grouping: "auto" as const
       };
       const exists = prev.media_sources.some((item) =>
         item.kind === source.kind &&
@@ -1606,7 +1891,7 @@ function SettingsOverlay({
               {draft && (
                 <section className="settings-section">
                   <h3>媒体目录</h3>
-                  {(["comics", "novels", "audio", "gallery", "coser_picture"] as Array<keyof AppSettings["media_dirs"]>).map((dirKind) => (
+                  {(["comics", "novels", "audio", "gallery", "coser_picture"] as MediaDirectoryKey[]).map((dirKind) => (
                     <div className="directory-editor" key={dirKind}>
                       <b>{mediaLabels[dirKind]}</b>
                       <div className="directory-add">
@@ -1634,6 +1919,42 @@ function SettingsOverlay({
                       </div>
                     </div>
                   ))}
+                  <label className="setting-field">
+                    <span>本地漫画扫描深度</span>
+                    <input
+                      min={1}
+                      max={64}
+                      step={1}
+                      type="number"
+                      value={draft.media_dirs.comic_scan_depth}
+                      onChange={(event) => {
+                        const value = Number.parseInt(event.currentTarget.value, 10);
+                        updateDraft((prev) => ({
+                          ...prev,
+                          media_dirs: {
+                            ...prev.media_dirs,
+                            comic_scan_depth: Math.min(Math.max(Number.isFinite(value) ? value : 3, 1), 64)
+                          }
+                        }));
+                      }}
+                    />
+                  </label>
+                  <p className="settings-hint">从漫画根目录开始计数；默认 3 可覆盖“作者/系列/文件.cbz”，最大 64。</p>
+                  <label className="setting-field">
+                    <span>音声分组策略</span>
+                    <select
+                      value={draft.audio_grouping ?? "auto"}
+                      onChange={(event) => {
+                        const value = event.currentTarget.value as AppSettings["audio_grouping"];
+                        updateDraft((prev) => ({ ...prev, audio_grouping: value }));
+                      }}
+                    >
+                      <option value="auto">自动（RJ 优先，普通目录回退）</option>
+                      <option value="rj">RJ 编号</option>
+                      <option value="folder">文件夹</option>
+                    </select>
+                  </label>
+                  <p className="settings-hint">音声目录会将该策略写入 Inventory root，监听、重命名和删除事件保持同一 work identity。</p>
                 </section>
               )}
 
@@ -1972,12 +2293,12 @@ function DetailPane({
   variant: "modal" | "docked";
   onClose: () => void;
   onTagPick: (key: string) => void;
-  onPlayTrack: (work: WorkDetail["work"], asset: Asset, playlist?: Asset[]) => void;
+  onPlayTrack: (work: WorkDetail["work"], asset: Asset, playlist?: Asset[], playlistTotal?: number) => void;
   onOpenReader: (resume?: boolean) => void;
   liquid?: boolean;
 }) {
   const [jobOpen, setJobOpen] = useState(false);
-  const tracks = detail?.assets.filter((asset) => asset.role === "track") ?? [];
+  const tracks = detail?.assets.filter((asset) => asset.role === "track" || asset.mime.startsWith("audio/")) ?? [];
   const displayTracks = preferredTrackVariants(tracks);
   const generatedImages = detail?.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/")) ?? [];
   const routeAsset = detail?.assets.find((asset) => asset.path.startsWith("qms-strm://")) ?? null;
@@ -2084,7 +2405,11 @@ function DetailPane({
                   const trackMeta = parseMeta<{ title?: string; quality?: string }>(track.meta_json);
                   return (
                     <div className="track-line" key={track.id}>
-                      <button className="inline-play" onClick={() => detail && onPlayTrack(detail.work, track, displayTracks)} aria-label="播放">
+                      <button
+                        className="inline-play"
+                        onClick={() => detail && onPlayTrack(detail.work, track, displayTracks, detail.track_count ?? displayTracks.length)}
+                        aria-label="播放"
+                      >
                         <Play size={14} />
                       </button>
                       <span>{trackMeta.title ?? shortName(track.path)}</span>
@@ -2092,6 +2417,11 @@ function DetailPane({
                     </div>
                   );
                 })}
+                {(detail.track_count ?? displayTracks.length) > displayTracks.length && (
+                  <small className="track-more-hint">
+                    已加载 {displayTracks.length} / {detail.track_count} 首，播放列表会按需继续加载
+                  </small>
+                )}
               </div>
             )}
             {generatedImages.length > 0 && (
@@ -2182,9 +2512,28 @@ function AudioDock({
   const [repeatMode, setRepeatMode] = useState<AudioRepeatMode>("none");
   const [queueOpen, setQueueOpen] = useState(false);
   const [volume, setVolume] = useState(1);
+  const initialPlaylistState = useMemo<AudioPlaylistState>(() => {
+    const seed = active?.playlist ?? (active?.asset ? [active.asset] : []);
+    return {
+      items: seed,
+      nextCursor: null,
+      hasMore: Boolean(active && (active.playlistTotal ?? seed.length) > seed.length),
+      startIndex: 0,
+      nextPageStartIndex: seed.length,
+      pageCursors: [{ startIndex: 0, cursor: null }],
+      total: Math.max(active?.playlistTotal ?? seed.length, seed.length)
+    };
+  }, [active]);
+  const [playlistState, setPlaylistState] = useState<AudioPlaylistState>(initialPlaylistState);
+  const playlistStateRef = useRef<AudioPlaylistState>(initialPlaylistState);
+  const playlistLoadingRef = useRef(false);
+  const playlistRequestRef = useRef<AbortController | null>(null);
+  const playlistGenerationRef = useRef(0);
+  const [playlistLoading, setPlaylistLoading] = useState(false);
   const meta = parseMeta<{ title?: string }>(currentAsset?.meta_json);
-  const playlist = useMemo(() => active?.playlist ?? (active?.asset ? [active.asset] : []), [active]);
+  const playlist = playlistState.items;
   const currentIndex = Math.max(0, playlist.findIndex((asset) => asset.id === currentAsset?.id));
+  const absoluteCurrentIndex = playlistState.startIndex + currentIndex;
   const progressPercent = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
   const repeatLabel = repeatMode === "one" ? "单曲循环" : repeatMode === "all" ? "列表循环" : "不循环";
   const { flush: flushProgress, schedule: scheduleProgress } = useProgressQueue(
@@ -2193,6 +2542,109 @@ function AudioDock({
     onProgressSaved,
     1200
   );
+
+  const commitPlaylistState = useCallback((next: AudioPlaylistState) => {
+    playlistStateRef.current = next;
+    setPlaylistState(next);
+  }, []);
+
+  const loadTrackPage = useCallback(async (
+    cursor: string | null,
+    replace = false,
+    direction: "append" | "prepend" = "append",
+    requestedStartIndex?: number
+  ) => {
+    if (!active || playlistLoadingRef.current) return false;
+    playlistLoadingRef.current = true;
+    setPlaylistLoading(true);
+    const generation = playlistGenerationRef.current;
+    const controller = new AbortController();
+    playlistRequestRef.current = controller;
+    try {
+      const response = await api.workAssets(active.work.id, {
+        role: "track",
+        cursor,
+        limit: AUDIO_TRACK_PAGE_SIZE,
+        signal: controller.signal
+      });
+      if (controller.signal.aborted || generation !== playlistGenerationRef.current) return false;
+      const fetched = response.items.map(catalogAssetToAsset);
+      const current = playlistStateRef.current;
+      const next = mergeAudioTrackPage({
+        current,
+        fetched,
+        pageCursor: cursor,
+        responseNextCursor: response.next_cursor ?? null,
+        responseTotal: response.total,
+        activeAsset: active.asset,
+        currentAssetId: currentAsset?.id,
+        replace,
+        direction,
+        requestedStartIndex,
+        maxCached: AUDIO_TRACK_MAX_CACHED
+      });
+      commitPlaylistState({
+        ...next,
+        total: Math.max(next.total, active.playlistTotal ?? 0)
+      });
+      return true;
+    } catch {
+      if (controller.signal.aborted || generation !== playlistGenerationRef.current) return false;
+      // A failed prefetch must not stop the current track.  The next/queue
+      // action can retry the same cursor.
+      return false;
+    } finally {
+      if (playlistRequestRef.current === controller) {
+        playlistRequestRef.current = null;
+        playlistLoadingRef.current = false;
+        setPlaylistLoading(false);
+      }
+    }
+  }, [active, commitPlaylistState, currentAsset?.id]);
+
+  const ensureNextTrackPage = useCallback(async () => {
+    const current = playlistStateRef.current;
+    if (!current.hasMore) return false;
+    // The initial detail payload is a seed and does not carry its opaque
+    // cursor.  Re-read page zero once to obtain a stable cursor before
+    // advancing beyond it.
+    return loadTrackPage(current.nextCursor, current.nextCursor === null);
+  }, [loadTrackPage]);
+
+  const ensurePreviousTrackPage = useCallback(async () => {
+    const current = playlistStateRef.current;
+    if (current.startIndex <= 0) return false;
+    const targetStart = Math.max(0, current.startIndex - AUDIO_TRACK_PAGE_SIZE);
+    const page = current.pageCursors
+      .filter((candidate) => candidate.startIndex < current.startIndex)
+      .sort((left, right) => right.startIndex - left.startIndex)[0];
+    if (!page) return false;
+    return loadTrackPage(page.cursor, false, "prepend", page.startIndex ?? targetStart);
+  }, [loadTrackPage]);
+
+  useEffect(() => {
+    playlistGenerationRef.current += 1;
+    playlistRequestRef.current?.abort();
+    playlistRequestRef.current = null;
+    playlistStateRef.current = initialPlaylistState;
+    setPlaylistState(initialPlaylistState);
+    playlistLoadingRef.current = false;
+    setPlaylistLoading(false);
+    if (
+      active &&
+      initialPlaylistState.hasMore
+    ) {
+      void loadTrackPage(null, true);
+    }
+    return () => {
+      playlistGenerationRef.current += 1;
+      playlistRequestRef.current?.abort();
+      playlistRequestRef.current = null;
+      playlistLoadingRef.current = false;
+    };
+  // The queue is reset only for a new playback session.  Track changes inside
+  // the dock must not re-seed or refetch the queue.
+  }, [active?.sessionId]);
 
   useEffect(() => {
     setCurrentAsset(active?.asset ?? null);
@@ -2233,21 +2685,44 @@ function AudioDock({
     };
   }, [currentAsset?.id, flushProgress, saveAudioProgress]);
 
-  const changeTrack = (offset: number, flushCurrent = true) => {
-    if (playlist.length === 0) return false;
+  const changeTrack = async (offset: number, flushCurrent = true) => {
+    if (playlistStateRef.current.items.length === 0) return false;
     const audio = audioRef.current;
     if (flushCurrent && audio) {
       saveAudioProgress(audio.currentTime, audio.duration || duration, audio.ended, true);
       void flushProgress();
     }
-    const nextIndex = currentIndex + offset;
-    if (nextIndex < 0 || nextIndex >= playlist.length) {
-      if (repeatMode !== "all") return false;
-      setCurrentAsset(playlist[(nextIndex + playlist.length) % playlist.length]);
+    let state = playlistStateRef.current;
+    let currentLocalIndex = state.items.findIndex((asset) => asset.id === currentAsset?.id);
+    if (currentLocalIndex < 0) currentLocalIndex = 0;
+    let nextIndex = currentLocalIndex + offset;
+    if (offset > 0 && nextIndex >= state.items.length && state.hasMore) {
+      const loaded = await ensureNextTrackPage();
+      if (loaded) {
+        state = playlistStateRef.current;
+        currentLocalIndex = state.items.findIndex((asset) => asset.id === currentAsset?.id);
+        if (currentLocalIndex < 0) currentLocalIndex = 0;
+        nextIndex = currentLocalIndex + offset;
+      }
+    }
+    if (offset < 0 && nextIndex < 0 && state.startIndex > 0) {
+      const loaded = await ensurePreviousTrackPage();
+      if (loaded) {
+        state = playlistStateRef.current;
+        currentLocalIndex = state.items.findIndex((asset) => asset.id === currentAsset?.id);
+        if (currentLocalIndex < 0) currentLocalIndex = 0;
+        nextIndex = currentLocalIndex + offset;
+      }
+    }
+    if (nextIndex < 0 || nextIndex >= state.items.length) {
+      if (nextIndex < 0 && state.startIndex > 0) return false;
+      if (nextIndex >= state.items.length && state.hasMore) return false;
+      if (repeatMode !== "all" || state.items.length === 0) return false;
+      setCurrentAsset(state.items[(nextIndex + state.items.length) % state.items.length]);
       lastProgressWrite.current = 0;
       return true;
     }
-    setCurrentAsset(playlist[nextIndex]);
+    setCurrentAsset(state.items[nextIndex]);
     lastProgressWrite.current = 0;
     return true;
   };
@@ -2286,6 +2761,10 @@ function AudioDock({
 
   if (!active || !currentAsset) return null;
 
+  const queueStartIndex = Math.max(0, currentIndex - AUDIO_QUEUE_WINDOW);
+  const queueEndIndex = Math.min(playlist.length, currentIndex + AUDIO_QUEUE_WINDOW + 1);
+  const queueItems = playlist.slice(queueStartIndex, queueEndIndex);
+
   const audioContent = (
     <>
       <button className="icon-btn compact audio-queue-toggle" onClick={() => setQueueOpen((value) => !value)} aria-label="播放列表">
@@ -2293,7 +2772,7 @@ function AudioDock({
       </button>
       <span className="audio-title">{meta.title ?? shortName(currentAsset.path)}</span>
       <div className="audio-controls">
-        <button className="icon-btn compact" onClick={() => changeTrack(-1)} disabled={playlist.length < 2 && repeatMode !== "all"} aria-label="上一首">
+        <button className="icon-btn compact" onClick={() => void changeTrack(-1)} disabled={playlist.length < 2 && repeatMode !== "all"} aria-label="上一首">
           <SkipBack size={15} />
         </button>
         <button
@@ -2304,7 +2783,7 @@ function AudioDock({
         >
           {isPlaying ? <Pause size={15} /> : <Play size={15} />}
         </button>
-        <button className="icon-btn compact" onClick={() => changeTrack(1)} disabled={playlist.length < 2 && repeatMode !== "all"} aria-label="下一首">
+        <button className="icon-btn compact" onClick={() => void changeTrack(1)} disabled={playlist.length < 2 && repeatMode !== "all" || playlistLoading} aria-label="下一首">
           <SkipForward size={15} />
         </button>
         <button
@@ -2373,7 +2852,9 @@ function AudioDock({
           saveAudioProgress(event.currentTarget.duration, event.currentTarget.duration, true);
           void flushProgress();
           if (repeatMode === "one") return;
-          if (!changeTrack(1, false)) onClose();
+          void changeTrack(1, false).then((changed) => {
+            if (!changed) onClose();
+          });
         }}
         onPause={(event) => {
           setIsPlaying(false);
@@ -2399,9 +2880,10 @@ function AudioDock({
           <motion.div className="audio-queue" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 8 }}>
             <div className="audio-queue-head">
               <b>播放列表</b>
-              <span>{currentIndex + 1}/{playlist.length}</span>
+              <span>{absoluteCurrentIndex + 1}/{playlistState.total}</span>
             </div>
-            {playlist.map((asset, index) => {
+            {queueStartIndex > 0 && <small className="audio-queue-window-hint">已隐藏前方轨道</small>}
+            {queueItems.map((asset, index) => {
               const trackMeta = parseMeta<{ title?: string }>(asset.meta_json);
               return (
                 <button
@@ -2417,11 +2899,16 @@ function AudioDock({
                     lastProgressWrite.current = 0;
                   }}
                 >
-                  <em>{index + 1}</em>
+                  <em>{queueStartIndex + index + playlistState.startIndex + 1}</em>
                   <span>{trackMeta.title ?? shortName(asset.path)}</span>
                 </button>
               );
             })}
+            {queueEndIndex < playlist.length || playlistState.hasMore ? (
+              <small className="audio-queue-window-hint">
+                {playlistLoading ? "正在加载下一批…" : `已缓存 ${playlist.length} / ${playlistState.total} 首`}
+              </small>
+            ) : null}
           </motion.div>
         )}
       </AnimatePresence>
@@ -2446,7 +2933,9 @@ function ReaderOverlay({
   comicAutoReadIntervalMs = defaultReaderSettings.comic_auto_read_interval_ms,
   detail,
   onClose,
+  onPlayTrack,
   onProgressSaved,
+  readerDerivativesEnabled,
   resumePosition,
   liquid = false
 }: {
@@ -2454,11 +2943,14 @@ function ReaderOverlay({
   comicAutoReadIntervalMs?: number;
   detail: WorkDetail;
   onClose: () => void;
+  onPlayTrack: (work: WorkDetail["work"], asset: Asset, playlist?: Asset[], playlistTotal?: number) => void;
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
+  readerDerivativesEnabled: boolean;
   resumePosition?: string | null;
   liquid?: boolean;
 }) {
   const [pages, setPages] = useState<ComicPageInfo[]>([]);
+  const [comicPageCount, setComicPageCount] = useState(0);
   const [page, setPage] = useState(0);
   const [comicMode, setComicMode] = useState<ComicReaderMode>("horizontal");
   const [comicZoom, setComicZoom] = useState(1);
@@ -2468,7 +2960,6 @@ function ReaderOverlay({
   const [comicAutoRead, setComicAutoRead] = useState(false);
   const [comicError, setComicError] = useState<string | null>(null);
   const [readerChromeVisible, setReaderChromeVisible] = useState(false);
-  const lastAudioProgressWrite = useRef(0);
   const comicStageRef = useRef<HTMLDivElement | null>(null);
   const readerChromeTimerRef = useRef<number | null>(null);
   const resumeAppliedRef = useRef(false);
@@ -2479,7 +2970,7 @@ function ReaderOverlay({
   const comicScrollFrameRef = useRef<number | null>(null);
   const comicPendingScrollRef = useRef<{ left: number; top: number; page: number } | null>(null);
   const comicLayoutKeyRef = useRef<string | null>(null);
-  const activeReaderAudioRef = useRef<{ asset: Asset; element: HTMLAudioElement } | null>(null);
+  const comicPagePreloadsRef = useRef(new Map<string, HTMLImageElement>());
   const mediaImages = detail.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/"));
   const comicArchiveVersion = assetVersion(detail.assets.find((asset) => asset.role === "archive"), detail.work.updated_at);
   const resumeTarget = useMemo(() => parseReadingPosition(resumePosition), [resumePosition]);
@@ -2489,6 +2980,12 @@ function ReaderOverlay({
     canPersistProgress,
     onProgressSaved
   );
+
+  useLayoutEffect(() => {
+    return () => {
+      void flushProgress();
+    };
+  }, [detail.work.id, flushProgress]);
 
   useEffect(() => {
     const body = document.body;
@@ -2510,6 +3007,7 @@ function ReaderOverlay({
   useEffect(() => {
     setPage(0);
     setPages([]);
+    setComicPageCount(0);
     setComicMode("horizontal");
     setComicZoom(1);
     setComicViewport({ width: 0, height: 0 });
@@ -2538,12 +3036,20 @@ function ReaderOverlay({
       api
         .comicPages(detail.work.id, controller.signal, comicArchiveVersion)
         .then((res) => {
-          setPages(res.pages.map(normalizeComicPageInfo));
+          const loaded = res.pages.map(normalizeComicPageInfo);
+          // The server now returns a bounded manifest slice plus its total.
+          // Keep only the bounded manifest sample.  The total page count is
+          // tracked separately, so a 100k-page archive does not allocate a
+          // placeholder object for every unloaded index.
+          const total = Math.min(COMIC_MAX_PAGE_COUNT, Math.max(res.total ?? loaded.length, loaded.length));
+          setPages(loaded.slice(0, total));
+          setComicPageCount(total);
           setComicError(null);
         })
         .catch((err) => {
           if (err instanceof DOMException && err.name === "AbortError") return;
           setPages([]);
+          setComicPageCount(0);
           setComicError(err instanceof Error ? err.message : String(err));
         });
       return () => controller.abort();
@@ -2570,6 +3076,54 @@ function ReaderOverlay({
   const comicFallbackHeight = typeof window === "undefined" ? 720 : Math.max(360, window.innerHeight - 72);
   const comicMeasuredHeight = comicViewport.height > 24 ? comicViewport.height : comicFallbackHeight;
   const comicMeasuredWidth = comicViewport.width > 24 ? comicViewport.width : typeof window === "undefined" ? 960 : window.innerWidth;
+  // Reader derivatives are an optimization behind Derivative Cache v2.  The
+  // server falls back to the original page while the feature is disabled or
+  // a derivative generation attempt fails.  Zooming beyond 1.25x requests
+  // the original so the optional downsample never becomes a quality trap.
+  const comicReaderSize = comicZoom > 1.25 ? undefined : comicMeasuredWidth >= 1440 ? 1920 : 1280;
+  const comicReaderPrefetchRadius = useMemo(() => getComicReaderPrefetchRadius(), []);
+
+  useEffect(() => {
+    const cache = comicPagePreloadsRef.current;
+    if (
+      !readerDerivativesEnabled ||
+      !isArchiveReader ||
+      !comicReaderSize ||
+      comicPageCount <= 1 ||
+      comicReaderPrefetchRadius <= 0
+    ) {
+      clearGalleryPreloads(cache);
+      return;
+    }
+
+    const desired = new Set<string>();
+    const safePage = Math.min(Math.max(page, 0), comicPageCount - 1);
+    for (let distance = 1; distance <= comicReaderPrefetchRadius; distance += 1) {
+      for (const candidate of [safePage + distance, safePage - distance]) {
+        if (candidate < 0 || candidate >= comicPageCount) continue;
+        desired.add(comicPageUrl(detail.work.id, candidate, comicArchiveVersion, comicReaderSize));
+      }
+    }
+    for (const url of desired) {
+      rememberGalleryPreload(cache, url, false, COMIC_READER_PREFETCH_LIMIT);
+    }
+    for (const [url, image] of cache) {
+      if (desired.has(url)) continue;
+      image.removeAttribute("src");
+      cache.delete(url);
+    }
+  }, [
+    comicArchiveVersion,
+    comicPageCount,
+    comicReaderPrefetchRadius,
+    comicReaderSize,
+    detail.work.id,
+    isArchiveReader,
+    page,
+    readerDerivativesEnabled
+  ]);
+
+  useEffect(() => () => clearGalleryPreloads(comicPagePreloadsRef.current), []);
   const comicSlotWidth = comicHorizontalSlotWidthFromSize(comicMeasuredWidth, comicMeasuredHeight, comicAspect, comicZoom);
   const comicWindowStart = comicMode === "horizontal" && comicMeasuredWidth > 0
     ? Math.max(0, Math.floor(comicScrollLeft / comicSlotWidth) - COMIC_HORIZONTAL_OVERSCAN)
@@ -2577,35 +3131,35 @@ function ReaderOverlay({
   const comicWindowEnd = comicMode === "horizontal"
     ? comicMeasuredWidth > 0
       ? Math.min(
-        pages.length,
+        comicPageCount,
         Math.ceil((comicScrollLeft + comicMeasuredWidth) / comicSlotWidth) + COMIC_HORIZONTAL_OVERSCAN
       )
-      : Math.min(pages.length, COMIC_HORIZONTAL_OVERSCAN * 2 + 1)
-    : pages.length;
+      : Math.min(comicPageCount, COMIC_HORIZONTAL_OVERSCAN * 2 + 1)
+    : comicPageCount;
   const horizontalComicIndexes = useMemo(
     () => Array.from({ length: Math.max(0, comicWindowEnd - comicWindowStart) }, (_, index) => comicWindowStart + index),
     [comicWindowEnd, comicWindowStart]
   );
-  const comicTotalWidth = comicMode === "horizontal" ? comicSlotWidth * pages.length : 0;
+  const comicTotalWidth = comicMode === "horizontal" ? comicSlotWidth * comicPageCount : 0;
   const comicVerticalMetrics = useMemo(() => {
     const horizontalPadding = Math.max(14, comicMeasuredWidth * 0.05) * 2;
     const imageWidth = Math.max(1, comicMeasuredWidth - horizontalPadding) * comicZoom;
-    const offsets = new Array<number>(pages.length + 1);
-    offsets[0] = 0;
-    for (let index = 0; index < pages.length; index += 1) {
-      offsets[index + 1] = offsets[index] + imageWidth / comicPageAspect(pages[index]) + 16;
-    }
-    return { imageWidth, offsets, totalHeight: offsets[pages.length] ?? 0 };
-  }, [comicMeasuredWidth, comicZoom, pages]);
+    const itemHeight = Math.max(1, imageWidth / comicAspect + 16);
+    return { imageWidth, itemHeight, totalHeight: itemHeight * comicPageCount };
+  }, [comicAspect, comicMeasuredWidth, comicPageCount, comicZoom]);
   const comicVerticalWindowStart = comicMode === "scroll"
-    ? Math.max(0, comicPageFromOffsets(comicVerticalMetrics.offsets, comicScrollTop) - COMIC_VERTICAL_OVERSCAN)
+    ? Math.max(
+      0,
+      comicPageFromVerticalPosition(comicScrollTop, comicVerticalMetrics.itemHeight, comicPageCount) - COMIC_VERTICAL_OVERSCAN
+    )
     : 0;
   const comicVerticalWindowEnd = comicMode === "scroll"
     ? Math.min(
-      pages.length,
-      comicPageFromOffsets(
-        comicVerticalMetrics.offsets,
-        comicScrollTop + Math.max(1, comicMeasuredHeight)
+      comicPageCount,
+      comicPageFromVerticalPosition(
+        comicScrollTop + Math.max(1, comicMeasuredHeight),
+        comicVerticalMetrics.itemHeight,
+        comicPageCount
       ) + COMIC_VERTICAL_OVERSCAN + 1
     )
     : 0;
@@ -2645,23 +3199,23 @@ function ReaderOverlay({
   };
 
   useEffect(() => {
-    if (!isArchiveReader || pages.length === 0 || resumeAppliedRef.current) return;
+    if (!isArchiveReader || comicPageCount === 0 || resumeAppliedRef.current) return;
     let target = resumeTarget.kind === "page"
       ? resumeTarget.index
       : resumeTarget.kind === "start"
         ? 0
-        : Math.floor((detail.work.progress || 0) * Math.max(0, pages.length - 1));
-    target = Math.min(Math.max(target, 0), Math.max(0, pages.length - 1));
+        : Math.floor((detail.work.progress || 0) * Math.max(0, comicPageCount - 1));
+    target = Math.min(Math.max(target, 0), Math.max(0, comicPageCount - 1));
     setPage(target);
     resumeAppliedRef.current = true;
     suppressNextProgressRef.current = Boolean(resumeTarget.kind && resumeTarget.kind !== "start");
     resumeComicPageRef.current = target;
     comicUserInteractedRef.current = false;
     needsComicResumeScrollRef.current = target > 0;
-  }, [detail.work.progress, isArchiveReader, pages.length, resumeTarget]);
+  }, [comicPageCount, detail.work.progress, isArchiveReader, resumeTarget]);
 
   useEffect(() => {
-    if (!isArchiveReader || !needsComicResumeScrollRef.current || pages.length < 2 || comicMode === "paged") return;
+    if (!isArchiveReader || !needsComicResumeScrollRef.current || comicPageCount < 2 || comicMode === "paged") return;
     const targetPage = resumeComicPageRef.current;
     const delays = [0, 250, 900, 1800, 3200];
     const timers = delays.map((delay, index) =>
@@ -2670,10 +3224,10 @@ function ReaderOverlay({
         scrollComicStageToPage(
           comicStageRef.current,
           targetPage,
-          pages.length,
+          comicPageCount,
           comicAspect,
           comicZoom,
-          comicVerticalMetrics.offsets
+          comicVerticalMetrics.itemHeight
         );
         if (index === delays.length - 1) {
           needsComicResumeScrollRef.current = false;
@@ -2681,7 +3235,7 @@ function ReaderOverlay({
       }, delay)
     );
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [comicAspect, comicMode, comicVerticalMetrics.offsets, comicZoom, isArchiveReader, pages.length]);
+  }, [comicAspect, comicMode, comicPageCount, comicVerticalMetrics.itemHeight, comicZoom, isArchiveReader]);
 
   useEffect(() => {
     if (!isArchiveReader || comicMode === "paged") return;
@@ -2694,7 +3248,7 @@ function ReaderOverlay({
     return observeElementResize(stage, measure);
   }, [comicMode, isArchiveReader]);
 
-  const comicLayoutKey = `${comicMode}:${comicZoom}:${comicMeasuredWidth}:${comicMeasuredHeight}:${pages.length}`;
+  const comicLayoutKey = `${comicMode}:${comicZoom}:${comicMeasuredWidth}:${comicMeasuredHeight}:${comicPageCount}`;
   useLayoutEffect(() => {
     const previous = comicLayoutKeyRef.current;
     comicLayoutKeyRef.current = comicLayoutKey;
@@ -2703,37 +3257,37 @@ function ReaderOverlay({
       previous === comicLayoutKey ||
       !isArchiveReader ||
       !resumeAppliedRef.current ||
-      pages.length === 0 ||
+      comicPageCount === 0 ||
       comicMode === "paged"
     ) return;
     const stage = comicStageRef.current;
     if (!stage) return;
-    const targetPage = Math.min(Math.max(page, 0), pages.length - 1);
+    const targetPage = Math.min(Math.max(page, 0), comicPageCount - 1);
     const frame = window.requestAnimationFrame(() => {
       scrollComicStageToPage(
         stage,
         targetPage,
-        pages.length,
+        comicPageCount,
         comicAspect,
         comicZoom,
-        comicVerticalMetrics.offsets
+        comicVerticalMetrics.itemHeight
       );
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [comicAspect, comicLayoutKey, comicMode, comicVerticalMetrics.offsets, comicZoom, isArchiveReader, pages.length]);
+  }, [comicAspect, comicLayoutKey, comicMode, comicPageCount, comicVerticalMetrics.itemHeight, comicZoom, isArchiveReader]);
 
   useEffect(() => {
-    if (!isArchiveReader || pages.length === 0) return;
+    if (!isArchiveReader || comicPageCount === 0) return;
     if (!resumeAppliedRef.current) return;
     if (suppressNextProgressRef.current) {
       suppressNextProgressRef.current = false;
       return;
     }
-    persistProgress((page + 1) / pages.length, `page:${page}`);
-  }, [isArchiveReader, page, pages.length]);
+    persistProgress((page + 1) / comicPageCount, `page:${page}`);
+  }, [comicPageCount, isArchiveReader, page]);
 
   const moveComic = (offset: number) => {
-    setPage((value) => Math.min(Math.max(value + offset, 0), Math.max(0, pages.length - 1)));
+    setPage((value) => Math.min(Math.max(value + offset, 0), Math.max(0, comicPageCount - 1)));
   };
 
   const navigateComic = (offset: number, source: "manual" | "auto" = "manual") => {
@@ -2751,7 +3305,7 @@ function ReaderOverlay({
     if (comicMode === "horizontal") {
       const stage = comicStageRef.current;
       if (!stage) return;
-      const targetPage = Math.min(Math.max(page + offset, 0), Math.max(0, pages.length - 1));
+      const targetPage = Math.min(Math.max(page + offset, 0), Math.max(0, comicPageCount - 1));
       stage.scrollTo({
         left: comicHorizontalSlotWidth(stage, comicAspect, comicZoom) * targetPage,
         behavior: "smooth"
@@ -2763,8 +3317,8 @@ function ReaderOverlay({
   };
 
   useEffect(() => {
-    if (!isArchiveReader || !comicAutoRead || pages.length === 0) return;
-    if (page >= pages.length - 1) {
+    if (!isArchiveReader || !comicAutoRead || comicPageCount === 0) return;
+    if (page >= comicPageCount - 1) {
       setComicAutoRead(false);
       return;
     }
@@ -2772,7 +3326,7 @@ function ReaderOverlay({
       navigateComic(1, "auto");
     }, safeComicAutoReadIntervalMs);
     return () => window.clearTimeout(timer);
-  }, [comicAspect, comicAutoRead, comicMode, comicZoom, isArchiveReader, page, pages.length, safeComicAutoReadIntervalMs]);
+  }, [comicAspect, comicAutoRead, comicMode, comicPageCount, comicZoom, isArchiveReader, page, safeComicAutoReadIntervalMs]);
 
   const changeComicZoom = (delta: number) => {
     setComicZoom((value) => Math.min(1.8, Math.max(0.7, Number((value + delta).toFixed(2)))));
@@ -2793,13 +3347,14 @@ function ReaderOverlay({
   };
 
   const onComicScroll = (event: UIEvent<HTMLDivElement>) => {
-    if ((comicMode !== "scroll" && comicMode !== "horizontal") || pages.length < 2) return;
+    if ((comicMode !== "scroll" && comicMode !== "horizontal") || comicPageCount < 2) return;
     const target = event.currentTarget;
     const nextPage = comicMode === "horizontal"
-      ? comicPageFromHorizontalScroll(target, pages.length, comicAspect, comicZoom)
-      : comicPageFromOffsets(
-        comicVerticalMetrics.offsets,
-        target.scrollTop + target.clientHeight / 2
+      ? comicPageFromHorizontalScroll(target, comicPageCount, comicAspect, comicZoom)
+      : comicPageFromVerticalPosition(
+        target.scrollTop + target.clientHeight / 2,
+        comicVerticalMetrics.itemHeight,
+        comicPageCount
       );
     scheduleComicScrollState(target.scrollLeft, target.scrollTop, nextPage);
   };
@@ -2816,7 +3371,7 @@ function ReaderOverlay({
     scheduleComicScrollState(
       stage.scrollLeft,
       stage.scrollTop,
-      comicPageFromHorizontalScroll(stage, pages.length, comicAspect, comicZoom)
+      comicPageFromHorizontalScroll(stage, comicPageCount, comicAspect, comicZoom)
     );
   };
 
@@ -2844,32 +3399,12 @@ function ReaderOverlay({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [closeReader, comicAspect, comicMode, comicZoom, isArchiveReader, isGallery, page, pages.length]);
-
-  const saveTrackProgress = useCallback((asset: Asset, currentTime: number, duration: number, ended = false, force = false) => {
-    if (!canPersistProgress || !Number.isFinite(duration) || duration <= 0) return;
-    const now = Date.now();
-    if (!ended && !force && now - lastAudioProgressWrite.current < 12000) return;
-    lastAudioProgressWrite.current = now;
-    const progress = ended ? 1 : Math.min(0.995, Math.max(0, currentTime / duration));
-    persistProgress(progress, `track:${asset.id}:${Math.round(currentTime)}`, ended || force);
-  }, [canPersistProgress, persistProgress]);
-
-  useLayoutEffect(() => {
-    return () => {
-      const activeAudio = activeReaderAudioRef.current;
-      if (activeAudio) {
-        const { asset, element } = activeAudio;
-        saveTrackProgress(asset, element.currentTime, element.duration, element.ended, true);
-      }
-      void flushProgress();
-    };
-  }, [detail.work.id, flushProgress, saveTrackProgress]);
+  }, [closeReader, comicAspect, comicMode, comicPageCount, comicZoom, isArchiveReader, isGallery, page]);
 
   const readerActionsContent = (
     <>
-        {isArchiveReader && <b>{pages.length ? `${page + 1}/${pages.length}` : "0/0"}</b>}
-        {isArchiveReader && pages.length > 0 && (
+        {isArchiveReader && <b>{comicPageCount ? `${page + 1}/${comicPageCount}` : "0/0"}</b>}
+        {isArchiveReader && comicPageCount > 0 && (
           <>
             <button className="icon-btn" onClick={() => navigateComic(-1)} aria-label="上一页">
               <ChevronLeft size={16} />
@@ -2970,16 +3505,16 @@ function ReaderOverlay({
             ref={comicStageRef}
           >
             {comicError && <div className="reader-error archive-reader-error">{comicError}</div>}
-            {pages.length > 0 && comicMode === "paged" ? (
+            {comicPageCount > 0 && comicMode === "paged" ? (
               <motion.img
                 key={page}
-                src={comicPageUrl(detail.work.id, page, comicArchiveVersion)}
+                src={comicPageUrl(detail.work.id, page, comicArchiveVersion, comicReaderSize)}
                 alt=""
                 initial={{ opacity: 0, x: 16 }}
                 animate={{ opacity: 1, x: 0 }}
                 style={{ position: "absolute", inset: 0, width: "100%", height: "100%", maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
               />
-            ) : pages.length > 0 ? (
+            ) : comicPageCount > 0 ? (
               comicMode === "horizontal" ? (
                 <div className="comic-strip-spacer" style={{ width: `${comicTotalWidth}px` }}>
                   <div
@@ -2987,12 +3522,11 @@ function ReaderOverlay({
                     style={{ transform: `translateX(${Math.round(comicWindowStart * comicSlotWidth)}px)` }}
                   >
                     {horizontalComicIndexes.map((index) => {
-                      const comicPage = pages[index];
                       return (
                         <div
                           className="comic-page-slot"
                           data-page-index={index}
-                          key={comicPage.name || index}
+                          key={`comic-page-${index}`}
                           style={{
                             height: `${Math.round(comicZoom * 100)}%`,
                             width: `${comicSlotWidth}px`
@@ -3001,7 +3535,7 @@ function ReaderOverlay({
                           <img
                             alt=""
                             loading="lazy"
-                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion)}
+                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion, comicReaderSize)}
                           />
                         </div>
                       );
@@ -3016,27 +3550,22 @@ function ReaderOverlay({
                   <div
                     className="comic-vertical-window"
                     style={{
-                      transform: `translateY(${Math.round(comicVerticalMetrics.offsets[comicVerticalWindowStart] ?? 0)}px)`
+                      transform: `translateY(${Math.round(comicVerticalWindowStart * comicVerticalMetrics.itemHeight)}px)`
                     }}
                   >
                     {verticalComicIndexes.map((index) => {
-                      const comicPage = pages[index];
-                      const slotHeight = Math.max(
-                        1,
-                        (comicVerticalMetrics.offsets[index + 1] ?? 0) -
-                        (comicVerticalMetrics.offsets[index] ?? 0) - 16
-                      );
+                      const slotHeight = Math.max(1, comicVerticalMetrics.itemHeight - 16);
                       return (
                         <div
                           className="comic-vertical-slot"
                           data-page-index={index}
-                          key={comicPage.name || index}
+                          key={`comic-page-${index}`}
                           style={{ height: `${slotHeight}px` }}
                         >
                           <img
                             alt=""
                             loading="lazy"
-                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion)}
+                            src={comicPageUrl(detail.work.id, index, comicArchiveVersion, comicReaderSize)}
                             style={{
                               height: `${slotHeight}px`,
                               width: `${Math.round(comicZoom * 100)}%`
@@ -3095,49 +3624,30 @@ function ReaderOverlay({
           <div className="audio-stage">
             <Headphones size={40} />
             <h2>{detail.work.title}</h2>
-            {detail.assets
-              .filter((asset) => asset.role === "track")
-              .map((asset) => (
-                <div className="track-line" key={asset.id}>
-                  <Play size={15} />
-                  <span>{shortName(asset.path)}</span>
-                  <audio
-                    controls
-                    preload="none"
-                    src={assetUrl(asset.id, assetVersion(asset, detail.work.updated_at))}
-                    onLoadedMetadata={(event) => {
-                      if (resumeTarget.kind === "track" && resumeTarget.assetId === asset.id && resumeTarget.seconds > 0) {
-                        event.currentTarget.currentTime = Math.min(resumeTarget.seconds, Math.max(0, event.currentTarget.duration - 0.5));
-                      }
-                    }}
-                    onPlay={(event) => {
-                      const previous = activeReaderAudioRef.current;
-                      if (previous && previous.element !== event.currentTarget) {
-                        saveTrackProgress(
-                          previous.asset,
-                          previous.element.currentTime,
-                          previous.element.duration,
-                          previous.element.ended,
-                          true
-                        );
-                        previous.element.pause();
-                        void flushProgress();
-                      }
-                      activeReaderAudioRef.current = { asset, element: event.currentTarget };
-                      lastAudioProgressWrite.current = 0;
-                    }}
-                    onPause={(event) => {
-                      saveTrackProgress(asset, event.currentTarget.currentTime, event.currentTarget.duration, event.currentTarget.ended, true);
-                      void flushProgress();
-                    }}
-                    onEnded={(event) => {
-                      saveTrackProgress(asset, event.currentTarget.duration, event.currentTarget.duration, true, true);
-                      void flushProgress();
-                    }}
-                    onTimeUpdate={(event) => saveTrackProgress(asset, event.currentTarget.currentTime, event.currentTarget.duration)}
-                  />
-                </div>
-              ))}
+            {(() => {
+              const tracks = preferredTrackVariants(
+                detail.assets.filter((asset) => asset.role === "track" || asset.mime.startsWith("audio/"))
+              );
+              return tracks.length > 0 ? (
+                <>
+                  <p className="audio-reader-hint">
+                    播放器已移至底部播放栏，轨道会按需分页加载（{tracks.length}/{detail.track_count ?? tracks.length}）
+                  </p>
+                  {tracks.slice(0, 32).map((asset) => (
+                    <button
+                      className="track-line audio-track-button"
+                      key={asset.id}
+                      onClick={() => onPlayTrack(detail.work, asset, tracks, detail.track_count ?? tracks.length)}
+                    >
+                      <Play size={15} />
+                      <span>{parseMeta<{ title?: string }>(asset.meta_json).title ?? shortName(asset.path)}</span>
+                    </button>
+                  ))}
+                </>
+              ) : (
+                <p className="audio-reader-hint">未找到可播放轨道</p>
+              );
+            })()}
           </div>
         )}
       </motion.div>
@@ -3194,6 +3704,10 @@ function GalleryStage({
   const preloadedThumbsRef = useRef(new Map<string, HTMLImageElement>());
   const preloadedOriginalsRef = useRef(new Map<string, HTMLImageElement>());
   const fetchControllersRef = useRef(new Map<number, AbortController>());
+  // Maps a page start index to the opaque cursor that precedes it.  A deep
+  // virtualized jump may still use one legacy numeric offset lookup, but all
+  // sequential pages after that anchor advance by keyset.
+  const galleryPageCursorsRef = useRef(new Map<number, string | null>([[0, null]]));
   const [itemsByIndex, setItemsByIndex] = useState<Record<number, Asset>>({});
   const [total, setTotal] = useState(0);
   const [loadedOnce, setLoadedOnce] = useState(false);
@@ -3241,8 +3755,13 @@ function GalleryStage({
     const controller = new AbortController();
     fetchControllersRef.current.set(aligned, controller);
     try {
-      const res = await api.galleryPage(detail.work.id, aligned, GALLERY_PAGE_SIZE, controller.signal, galleryVersion);
+      const pageCursor = galleryPageCursorsRef.current.get(aligned);
+      const requestCursor = pageCursor === undefined ? aligned : pageCursor;
+      const res = await api.galleryPage(detail.work.id, requestCursor, GALLERY_PAGE_SIZE, controller.signal, galleryVersion);
       if (controller.signal.aborted || fetchControllersRef.current.get(aligned) !== controller) return;
+      if (res.next_cursor) {
+        galleryPageCursorsRef.current.set(aligned + res.items.length, res.next_cursor);
+      }
       const responsePage = Math.floor(aligned / GALLERY_PAGE_SIZE);
       const centerPage = cacheCenterPageRef.current;
       const pageRadius = Math.floor(GALLERY_MAX_CACHED_PAGES / 2);
@@ -3327,6 +3846,8 @@ function GalleryStage({
     for (const controller of fetchControllersRef.current.values()) controller.abort();
     fetchControllersRef.current.clear();
     loadedOffsetsRef.current.clear();
+    galleryPageCursorsRef.current.clear();
+    galleryPageCursorsRef.current.set(0, null);
     cacheCenterPageRef.current = Math.floor(startIndex / GALLERY_PAGE_SIZE);
     pendingScrollIndexRef.current = startIndex;
     lastProgressWriteRef.current = Date.now();
@@ -3983,16 +4504,9 @@ function comicPageFromHorizontalScroll(stage: HTMLDivElement, pageCount: number,
   return Math.min(Math.max(Math.round(centerPage), 0), Math.max(0, pageCount - 1));
 }
 
-function comicPageFromOffsets(offsets: number[], position: number) {
-  if (offsets.length <= 1) return 0;
-  let low = 0;
-  let high = offsets.length - 1;
-  while (low < high) {
-    const middle = Math.floor((low + high + 1) / 2);
-    if (offsets[middle] <= position) low = middle;
-    else high = middle - 1;
-  }
-  return Math.min(Math.max(low, 0), offsets.length - 2);
+function comicPageFromVerticalPosition(position: number, itemHeight: number, pageCount: number) {
+  if (pageCount <= 1 || itemHeight <= 0) return 0;
+  return Math.min(Math.max(Math.floor(position / itemHeight), 0), pageCount - 1);
 }
 
 function scrollComicStageToPage(
@@ -4001,7 +4515,7 @@ function scrollComicStageToPage(
   pageCount: number,
   aspect = COMIC_DEFAULT_ASPECT,
   zoom = 1,
-  verticalOffsets: number[] = []
+  verticalItemHeight = 0
 ) {
   if (!stage || pageCount < 2) return;
   const slot = stage.querySelector<HTMLElement>(`[data-page-index="${page}"]`);
@@ -4013,8 +4527,8 @@ function scrollComicStageToPage(
     stage.scrollTo({ left: comicHorizontalSlotWidth(stage, aspect, zoom) * page, behavior: "auto" });
     return;
   }
-  if (stage.dataset.mode === "scroll" && verticalOffsets.length > page) {
-    stage.scrollTo({ left: 0, top: verticalOffsets[page], behavior: "auto" });
+  if (stage.dataset.mode === "scroll" && verticalItemHeight > 0) {
+    stage.scrollTo({ left: 0, top: verticalItemHeight * page, behavior: "auto" });
     return;
   }
   const maxScroll = stage.scrollHeight - stage.clientHeight;
@@ -4086,11 +4600,6 @@ function novelParentFolder(path?: string | null) {
 
 function normalizeNovelFolder(value: string) {
   return value.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
-}
-
-function compareWorksByUpdatedAt(left: WorkSummary, right: WorkSummary) {
-  const updated = right.updated_at.localeCompare(left.updated_at);
-  return updated || right.id - left.id;
 }
 
 const LIBRARY_MUTATING_JOB_TYPES = new Set([
@@ -4201,7 +4710,8 @@ function normalizeSettingsDraft(settings: AppSettings): AppSettings {
       novels: settings.media_dirs?.novels ?? [],
       audio: settings.media_dirs?.audio ?? [],
       gallery: settings.media_dirs?.gallery ?? [],
-      coser_picture: settings.media_dirs?.coser_picture ?? []
+      coser_picture: settings.media_dirs?.coser_picture ?? [],
+      comic_scan_depth: Math.min(Math.max(Math.trunc(settings.media_dirs?.comic_scan_depth ?? 3), 1), 64)
     },
     cover_cache_dirs: {
       comic: settings.cover_cache_dirs?.comic ?? "",
@@ -4210,7 +4720,11 @@ function normalizeSettingsDraft(settings: AppSettings): AppSettings {
       gallery: settings.cover_cache_dirs?.gallery ?? "",
       coser_picture: settings.cover_cache_dirs?.coser_picture ?? ""
     },
-    media_sources: settings.media_sources ?? [],
+    media_sources: (settings.media_sources ?? []).map((source) => ({
+      ...source,
+      audio_grouping: source.audio_grouping ?? "auto"
+    })),
+    audio_grouping: settings.audio_grouping ?? "auto",
     qmediasync: settings.qmediasync ?? {
       enabled: false,
       base_url: "",
@@ -4349,6 +4863,18 @@ function allowsOriginalPreload() {
   }).connection;
   if (connection?.saveData) return false;
   return !connection?.effectiveType || !["slow-2g", "2g", "3g"].includes(connection.effectiveType);
+}
+
+function getComicReaderPrefetchRadius() {
+  if (typeof navigator === "undefined") return 1;
+  const connection = (navigator as Navigator & {
+    connection?: { saveData?: boolean; effectiveType?: string };
+  }).connection;
+  if (connection?.saveData || connection?.effectiveType === "slow-2g") return 0;
+  if (connection?.effectiveType === "2g" || connection?.effectiveType === "3g") return 1;
+  const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+  if (typeof deviceMemory === "number" && deviceMemory > 0 && deviceMemory <= 2) return 1;
+  return 2;
 }
 
 function preferredTrackVariants(tracks: Asset[]) {

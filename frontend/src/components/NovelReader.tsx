@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlignJustify,
   BookOpen,
@@ -816,6 +816,131 @@ function SettingRow({ children, label }: { children: React.ReactNode; label: str
   );
 }
 
+const LEGACY_CHAPTER_ROW_HEIGHT = 48;
+const LEGACY_CHAPTER_OVERSCAN = 8;
+const EPUB_MANIFEST_PAGE_SIZE = 200;
+
+function VirtualChapterList({
+  chapters,
+  chapterCount,
+  chapter,
+  hasCover,
+  showCover,
+  status,
+  onRequestRange,
+  onSelectChapter,
+  onSelectCover
+}: {
+  chapters: ReadonlyMap<number, EpubChapter>;
+  chapterCount: number;
+  chapter: number;
+  hasCover: boolean;
+  showCover: boolean;
+  status?: ReactNode;
+  onRequestRange: (start: number, end: number) => void;
+  onSelectChapter: (index: number) => void;
+  onSelectCover: () => void;
+}) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef<number | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const rowCount = chapterCount + (hasCover ? 1 : 0);
+  const firstRow = Math.max(0, Math.floor(scrollTop / LEGACY_CHAPTER_ROW_HEIGHT) - LEGACY_CHAPTER_OVERSCAN);
+  const lastRow = Math.min(
+    rowCount,
+    Math.ceil((scrollTop + Math.max(1, viewportHeight)) / LEGACY_CHAPTER_ROW_HEIGHT) + LEGACY_CHAPTER_OVERSCAN
+  );
+
+  useEffect(() => {
+    const offset = hasCover ? 1 : 0;
+    const start = Math.max(0, firstRow - offset);
+    const end = Math.min(chapterCount, Math.max(start, lastRow - offset));
+    if (end > start) onRequestRange(start, end);
+  }, [chapterCount, firstRow, hasCover, lastRow, onRequestRange]);
+
+  useEffect(() => {
+    const node = listRef.current;
+    if (!node) return;
+    const measure = () => setViewportHeight(node.clientHeight);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) window.cancelAnimationFrame(frameRef.current);
+    };
+  }, []);
+
+  const onScroll = () => {
+    const next = listRef.current?.scrollTop ?? 0;
+    if (frameRef.current !== null) return;
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null;
+      setScrollTop((current) => current === next ? current : next);
+    });
+  };
+
+  return (
+    <div className="chapter-list" ref={listRef} onScroll={onScroll}>
+      {status ? <div className="chapter-list-status">{status}</div> : null}
+      <div className="chapter-list-spacer" style={{ height: `${Math.max(1, rowCount * LEGACY_CHAPTER_ROW_HEIGHT)}px` }}>
+        <div
+          className="chapter-list-window"
+          style={{ transform: `translateY(${firstRow * LEGACY_CHAPTER_ROW_HEIGHT}px)` }}
+        >
+          {Array.from({ length: Math.max(0, lastRow - firstRow) }, (_, offset) => {
+            const row = firstRow + offset;
+            if (hasCover && row === 0) {
+              return (
+                <button
+                  key="cover"
+                  className={showCover ? "active" : ""}
+                  style={{ height: `${LEGACY_CHAPTER_ROW_HEIGHT - 8}px` }}
+                  onClick={onSelectCover}
+                >
+                  <span>1</span>
+                  <b>封面</b>
+                </button>
+              );
+            }
+            const index = row - (hasCover ? 1 : 0);
+            const item = chapters.get(index);
+            if (!item) {
+              return (
+                <button
+                  key={`chapter-${index}`}
+                  disabled
+                  className="chapter-loading"
+                  style={{ height: `${LEGACY_CHAPTER_ROW_HEIGHT - 8}px` }}
+                  aria-label={`加载第 ${index + 1} 章`}
+                >
+                  <span>{hasCover ? index + 2 : index + 1}</span>
+                  <b>正在加载…</b>
+                </button>
+              );
+            }
+            return (
+              <button
+                key={item.index}
+                className={!showCover && item.index === chapter ? "active" : ""}
+                style={{ height: `${LEGACY_CHAPTER_ROW_HEIGHT - 8}px` }}
+                onClick={() => onSelectChapter(item.index)}
+              >
+                <span>{hasCover ? item.index + 2 : item.index + 1}</span>
+                <b>{item.title}</b>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function LegacyNovelReader({
   canPersistProgress,
   detail,
@@ -827,7 +952,8 @@ function LegacyNovelReader({
   engineError: string | null;
   scheduleProgress: (progress: number, position: string, immediate?: boolean, keepalive?: boolean) => void;
 }) {
-  const [chapters, setChapters] = useState<EpubChapter[]>([]);
+  const [chapters, setChapters] = useState<Map<number, EpubChapter>>(() => new Map());
+  const [chapterCount, setChapterCount] = useState(0);
   const [chapter, setChapter] = useState(0);
   const [showCover, setShowCover] = useState(Boolean(detail.work.cover_asset_id));
   const [chapterHtml, setChapterHtml] = useState("");
@@ -840,26 +966,94 @@ function LegacyNovelReader({
   const resumeTarget = useMemo(() => parseNovelResumeTarget(resumePosition), [resumePosition]);
   const appliedRef = useRef(false);
   const suppressNextProgressRef = useRef(false);
+  const manifestControllerRef = useRef<AbortController | null>(null);
+  const manifestGenerationRef = useRef(0);
+  const manifestLoadedPagesRef = useRef(new Set<number>());
+  const manifestLoadingPagesRef = useRef(new Set<number>());
+
+  const loadManifestPage = useCallback(async (pageStart: number, initial = false) => {
+    const controller = manifestControllerRef.current;
+    const generation = manifestGenerationRef.current;
+    if (!controller || controller.signal.aborted) return;
+    const normalizedStart = Math.max(0, Math.trunc(pageStart));
+    if (
+      manifestLoadedPagesRef.current.has(normalizedStart)
+      || manifestLoadingPagesRef.current.has(normalizedStart)
+    ) return;
+    manifestLoadingPagesRef.current.add(normalizedStart);
+    try {
+      const response = await api.epubManifest(
+        detail.work.id,
+        controller.signal,
+        bookVersion,
+        initial ? null : normalizedStart,
+        initial ? undefined : EPUB_MANIFEST_PAGE_SIZE
+      );
+      if (controller.signal.aborted || generation !== manifestGenerationRef.current) return;
+      const total = Math.max(
+        normalizedStart + response.chapters.length,
+        Number.isFinite(response.total) ? Math.max(0, Math.trunc(response.total)) : 0
+      );
+      setChapterCount((current) => Math.max(current, total));
+      setChapters((current) => {
+        const next = new Map(current);
+        for (const item of response.chapters) next.set(item.index, item);
+        return next;
+      });
+      manifestLoadedPagesRef.current.add(normalizedStart);
+      setError(null);
+    } catch (err) {
+      if (controller.signal.aborted || generation !== manifestGenerationRef.current) return;
+      if (!(err instanceof DOMException && err.name === "AbortError")) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (generation === manifestGenerationRef.current) {
+        manifestLoadingPagesRef.current.delete(normalizedStart);
+      }
+    }
+  }, [bookVersion, detail.work.id]);
+
+  const requestManifestRange = useCallback(async (start: number, end: number) => {
+    const first = Math.max(0, Math.trunc(start));
+    const last = Math.max(first, Math.trunc(end));
+    const pages = [];
+    for (
+      let pageStart = Math.floor(first / EPUB_MANIFEST_PAGE_SIZE) * EPUB_MANIFEST_PAGE_SIZE;
+      pageStart < last;
+      pageStart += EPUB_MANIFEST_PAGE_SIZE
+    ) {
+      pages.push(pageStart);
+    }
+    await Promise.all(pages.map((pageStart) => loadManifestPage(pageStart)));
+  }, [loadManifestPage]);
 
   useEffect(() => {
     const controller = new AbortController();
+    manifestControllerRef.current?.abort();
+    manifestControllerRef.current = controller;
+    manifestGenerationRef.current += 1;
+    manifestLoadedPagesRef.current.clear();
+    manifestLoadingPagesRef.current.clear();
+    setChapters(new Map());
+    setChapterCount(0);
+    setChapter(0);
+    setChapterHtml("");
     setError(null);
-    api
-      .epubManifest(detail.work.id, controller.signal, bookVersion)
-      .then((res) => {
-        setChapters(res.chapters);
-        setError(null);
-      })
-      .catch((err) => {
-        if (!(err instanceof DOMException && err.name === "AbortError")) {
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      });
-    return () => controller.abort();
-  }, [bookVersion, detail.work.id]);
+    appliedRef.current = false;
+    suppressNextProgressRef.current = false;
+    void loadManifestPage(0, true);
+    return () => {
+      controller.abort();
+      if (manifestControllerRef.current === controller) manifestControllerRef.current = null;
+      manifestGenerationRef.current += 1;
+      manifestLoadedPagesRef.current.clear();
+      manifestLoadingPagesRef.current.clear();
+    };
+  }, [bookVersion, detail.work.id, loadManifestPage]);
 
   useEffect(() => {
-    if (chapters.length === 0 || appliedRef.current) return;
+    if (chapterCount === 0 || appliedRef.current) return;
     if (resumeTarget.kind === "cover") {
       suppressNextProgressRef.current = true;
       setShowCover(Boolean(detail.work.cover_asset_id));
@@ -868,17 +1062,19 @@ function LegacyNovelReader({
         resumeTarget.kind === "chapter"
           ? resumeTarget.index
           : resumeTarget.kind === "start"
-            ? 0
-             : Math.floor((detail.work.progress || 0) * Math.max(0, chapters.length - 1));
+          ? 0
+             : Math.floor((detail.work.progress || 0) * Math.max(0, chapterCount - 1));
       suppressNextProgressRef.current = resumeTarget.kind !== null;
       setShowCover(false);
-      setChapter(Math.min(Math.max(target, 0), Math.max(0, chapters.length - 1)));
+      const boundedTarget = Math.min(Math.max(target, 0), Math.max(0, chapterCount - 1));
+      setChapter(boundedTarget);
+      void requestManifestRange(boundedTarget, boundedTarget + 1);
     }
     appliedRef.current = true;
-  }, [chapters.length, detail.work.cover_asset_id, detail.work.progress, resumeTarget]);
+  }, [chapterCount, detail.work.cover_asset_id, detail.work.progress, requestManifestRange, resumeTarget]);
 
   useEffect(() => {
-    if (showCover || chapters.length === 0) return;
+    if (showCover || chapterCount === 0) return;
     const controller = new AbortController();
     setChapterHtml("");
     setError(null);
@@ -894,18 +1090,18 @@ function LegacyNovelReader({
         }
       });
     return () => controller.abort();
-  }, [bookVersion, chapter, chapters.length, detail.work.id, showCover]);
+  }, [bookVersion, chapter, chapterCount, detail.work.id, showCover]);
 
   useEffect(() => {
-    if (!canPersistProgress || chapters.length === 0 || !appliedRef.current) return;
+    if (!canPersistProgress || chapterCount === 0 || !appliedRef.current) return;
     if (suppressNextProgressRef.current) {
       suppressNextProgressRef.current = false;
       return;
     }
-    const progress = showCover ? 0 : (chapter + 1) / chapters.length;
+    const progress = showCover ? 0 : (chapter + 1) / chapterCount;
     const position = showCover ? "cover" : `chapter:${chapter}`;
     scheduleProgress(progress, position);
-  }, [canPersistProgress, chapter, chapters.length, scheduleProgress, showCover]);
+  }, [canPersistProgress, chapter, chapterCount, scheduleProgress, showCover]);
 
   const moveChapter = (offset: number) => {
     if (showCover && offset > 0) {
@@ -918,7 +1114,7 @@ function LegacyNovelReader({
       return;
     }
     setShowCover(false);
-    setChapter((value) => Math.min(Math.max(value + offset, 0), Math.max(0, chapters.length - 1)));
+    setChapter((value) => Math.min(Math.max(value + offset, 0), Math.max(0, chapterCount - 1)));
   };
 
   return (
@@ -937,22 +1133,17 @@ function LegacyNovelReader({
         </div>
       </div>
       <div className="novel-stage legacy-novel-stage">
-        <div className="chapter-list">
-          {engineError && <div className="reader-error">Foliate 阅读器启动失败，已切换到兼容模式：{engineError}</div>}
-          {chapters.length === 0 && !error ? <Loader2 className="spin" /> : null}
-          {detail.work.cover_asset_id && (
-            <button className={showCover ? "active" : ""} onClick={() => setShowCover(true)}>
-              <span>1</span>
-              <b>封面</b>
-            </button>
-          )}
-          {chapters.map((item) => (
-            <button key={item.index} className={!showCover && item.index === chapter ? "active" : ""} onClick={() => { setShowCover(false); setChapter(item.index); }}>
-              <span>{detail.work.cover_asset_id ? item.index + 2 : item.index + 1}</span>
-              <b>{item.title}</b>
-            </button>
-          ))}
-        </div>
+        <VirtualChapterList
+          chapters={chapters}
+          chapterCount={chapterCount}
+          chapter={chapter}
+          hasCover={Boolean(detail.work.cover_asset_id)}
+          showCover={showCover}
+          status={engineError ? <div className="reader-error">Foliate 阅读器启动失败，已切换到兼容模式：{engineError}</div> : chapterCount === 0 && !error ? <Loader2 className="spin" /> : null}
+          onRequestRange={requestManifestRange}
+          onSelectCover={() => setShowCover(true)}
+          onSelectChapter={(index) => { setShowCover(false); setChapter(index); }}
+        />
         <div className="chapter-reader">
           <div className="legacy-novel-actions">
             <button className="icon-btn" onClick={() => moveChapter(-1)} aria-label="上一章">
@@ -972,7 +1163,7 @@ function LegacyNovelReader({
               <img src={coverAssetUrl} alt="" />
             </div>
           ) : chapterHtml ? (
-            <iframe title={chapters[chapter]?.title ?? detail.work.title} sandbox="" srcDoc={applyLegacyNovelTheme(chapterHtml, theme)} />
+            <iframe title={chapters.get(chapter)?.title ?? detail.work.title} sandbox="" srcDoc={applyLegacyNovelTheme(chapterHtml, theme)} />
           ) : (
             <Loader2 className="spin" />
           )}

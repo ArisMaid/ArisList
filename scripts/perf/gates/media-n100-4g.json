@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "profile": "nas-n100-4g",
+  "scope": "media-preview-filter-and-startup",
+  "scenarios": [
+    {
+      "id": "catalog-first-page",
+      "scenario": "catalog-first-page",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 500 }
+    },
+    {
+      "id": "tag-filter",
+      "scenario": "tag-filter",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 300, "total_ms.p99": 500 }
+    },
+    {
+      "id": "gallery-thumbnail-warm",
+      "scenario": "gallery-thumbnail",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 150 }
+    },
+    {
+      "id": "gallery-thumbnail-cold",
+      "scenario": "gallery-thumbnail",
+      "warm": "cold",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "ttfb_ms.p50": 400, "total_ms.p95": 1500 }
+    },
+    {
+      "id": "comic-page-cold",
+      "scenario": "comic-page",
+      "warm": "cold",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 500 }
+    },
+    {
+      "id": "coser-picture-page-cold",
+      "scenario": "coser-picture-page",
+      "warm": "cold",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 1000 }
+    },
+    {
+      "id": "audio-startup-range",
+      "scenario": "audio-startup-range",
+      "warm": "cold",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 500 }
+    },
+    {
+      "id": "novel-summary-detail",
+      "scenario": "novel-summary-detail",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": { "requests": 30, "succeeded": 30 },
+      "maximum": { "failed": 0, "status_503": 0, "total_ms.p95": 300 }
+    }
+  ]
+}

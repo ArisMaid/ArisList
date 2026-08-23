@@ -53,6 +53,11 @@ pub struct Work {
     pub meta_json: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// A tombstoned work keeps its stable identity and reading history but is
+    /// excluded from active catalog/search views until a later mutation
+    /// revives it.
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_reason: Option<String>,
 }
 
 impl_sqlite_from_row!(Work {
@@ -69,6 +74,8 @@ impl_sqlite_from_row!(Work {
     meta_json,
     created_at,
     updated_at,
+    deleted_at,
+    deleted_reason,
 });
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,11 +249,38 @@ pub struct WorkDetail {
     pub assets: Vec<Asset>,
     pub tags: Vec<Tag>,
     pub external_ids: Vec<ExternalId>,
+    /// Exact number of assets belonging to the work.  The `assets` field can
+    /// be intentionally truncated for very large media works (audio and
+    /// archive readers), so clients must use this value instead of inferring
+    /// a count from the returned vector.
+    pub asset_count: i64,
+    /// Exact number of playable audio assets.  This is returned for every
+    /// work for a stable response shape, and is normally zero for non-audio
+    /// works.
+    pub track_count: i64,
+    /// Whether `assets` is a complete representation of the work.  A false
+    /// value means the caller should use the paged assets endpoint for the
+    /// remaining records.
+    pub assets_complete: bool,
+}
+
+/// Controls how much of a work's asset list is embedded in the interactive
+/// detail response.  The legacy mode is retained for older clients while the
+/// summary mode makes the response size independent of a work's total asset
+/// count.  Remaining assets are available through the cursor-based assets
+/// endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkDetailAssetMode {
+    Legacy,
+    Summary,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ScanRequest {
     pub enqueue_enrichment: Option<bool>,
+    /// When present, only the selected media kind is reconciled.  The
+    /// default remains a full library scan for existing clients.
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

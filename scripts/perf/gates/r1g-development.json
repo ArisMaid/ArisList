@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "profile": "r1g-development",
+  "scope": "developer-machine-http-evidence",
+  "scenarios": [
+    {
+      "id": "catalog-works-warm",
+      "scenario": "r1g-catalog-works",
+      "warm": "warm",
+      "concurrency": 3,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "status_503": 0,
+        "total_ms.p95": 300,
+        "total_ms.p99": 500
+      }
+    },
+    {
+      "id": "catalog-counts-warm",
+      "scenario": "r1g-catalog-counts",
+      "warm": "warm",
+      "concurrency": 3,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "status_503": 0,
+        "total_ms.p95": 300,
+        "total_ms.p99": 500
+      }
+    },
+    {
+      "id": "catalog-facets-warm",
+      "scenario": "r1g-catalog-facets",
+      "warm": "warm",
+      "concurrency": 3,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "status_503": 0,
+        "total_ms.p95": 300,
+        "total_ms.p99": 500
+      }
+    }
+  ]
+}

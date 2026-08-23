@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "profile": "tag-filter-development",
+  "scope": "40k-works-800k-relations-http-evidence",
+  "scenarios": [
+    {
+      "id": "audio-preaggregated-first-page",
+      "scenario": "catalog-facets-audio-preaggregated",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "total_ms.p95": 300
+      }
+    },
+    {
+      "id": "global-universal-tag-shortcut",
+      "scenario": "catalog-facets-global-full-tag",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "total_ms.p95": 300
+      }
+    },
+    {
+      "id": "audio-half-coverage-tag",
+      "scenario": "catalog-facets-audio-half-tag",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "total_ms.p95": 300
+      }
+    },
+    {
+      "id": "global-half-coverage-tag",
+      "scenario": "catalog-facets-global-half-tag",
+      "warm": "warm",
+      "concurrency": 1,
+      "minimum": {
+        "requests": 30,
+        "succeeded": 30
+      },
+      "maximum": {
+        "failed": 0,
+        "total_ms.p95": 300
+      }
+    }
+  ]
+}

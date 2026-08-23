@@ -28,6 +28,31 @@ export type Asset = {
   created_at: string;
 };
 
+/**
+ * Path-redacted asset shape returned by the paged catalog endpoint.  The
+ * server deliberately exposes only a display name here; callers that need to
+ * stream an asset should use its id with `assetUrl`.
+ */
+export type CatalogAssetItem = {
+  id: number;
+  work_id: number;
+  name: string;
+  mime: string;
+  role: string;
+  variant?: string | null;
+  position?: number | null;
+  size?: number | null;
+  meta_json: string;
+  created_at: string;
+};
+
+export type CatalogAssetsResponse = {
+  items: CatalogAssetItem[];
+  next_cursor?: string | null;
+  total: number;
+  source_version: string;
+};
+
 export type Tag = {
   id: number;
   namespace: string;
@@ -100,7 +125,12 @@ export type WorkDetail = {
   assets: Asset[];
   tags: Tag[];
   external_ids: Array<{ source: string; external_id: string; token?: string | null; url?: string | null }>;
+  asset_count?: number;
+  track_count?: number;
+  assets_complete?: boolean;
 };
+
+export type WorkDetailAssetMode = "legacy" | "summary";
 
 export type EpubChapter = {
   index: number;
@@ -110,6 +140,8 @@ export type EpubChapter = {
 
 export type EpubManifestResponse = {
   chapters: EpubChapter[];
+  total: number;
+  next_cursor?: number | null;
 };
 
 export type ComicPageInfo = {
@@ -118,9 +150,15 @@ export type ComicPageInfo = {
   height?: number | null;
 };
 
+export type ComicPagesResponse = {
+  pages: Array<ComicPageInfo | string>;
+  total?: number;
+  next_cursor?: number | null;
+};
+
 export type GalleryPageResponse = {
   items: Asset[];
-  next_cursor?: number | null;
+  next_cursor?: string | null;
   total: number;
 };
 
@@ -133,6 +171,13 @@ export type SearchResponse = {
   query: string;
   rebuilt: boolean;
   took_ms: number;
+  reader: "production" | "shadow";
+  canary?: {
+    production_count: number;
+    shadow_count: number;
+    id_match: boolean;
+    order_match: boolean;
+  };
   hits: Array<{ work_id: number; score: number; title: string; kind: string }>;
 };
 
@@ -140,6 +185,15 @@ export type AuthSession = {
   authenticated: boolean;
   csrf?: string | null;
   user?: string | null;
+};
+
+export type HealthResponse = {
+  status: string;
+  features?: {
+    catalog_v2?: boolean;
+    derivative_cache_v2?: boolean;
+    file_watcher?: boolean;
+  };
 };
 
 export type ThemeMode = "light" | "dark";
@@ -176,6 +230,7 @@ export type AppSettings = {
     audio: string[];
     gallery: string[];
     coser_picture: string[];
+    comic_scan_depth: number;
   };
   cover_cache_dirs: {
     comic: string;
@@ -191,7 +246,9 @@ export type AppSettings = {
     mount_name: string;
     enabled: boolean;
     scan_depth: number;
+    audio_grouping: "rj" | "folder" | "auto";
   }>;
+  audio_grouping: "rj" | "folder" | "auto";
   qmediasync: {
     enabled: boolean;
     base_url: string;
@@ -248,6 +305,7 @@ async function requestText(url: string, init?: RequestInit): Promise<string> {
 }
 
 export const api = {
+  health: () => request<HealthResponse>("/api/health"),
   authSession: async () => {
     const session = await request<AuthSession>("/api/auth/session");
     setCsrfToken(session.csrf);
@@ -289,7 +347,18 @@ export const api = {
     }),
   search: (q: string, limit = 48, signal?: AbortSignal) =>
     request<SearchResponse>(`/api/search?q=${encodeURIComponent(q)}&limit=${limit}`, { signal }),
-  work: (id: number, signal?: AbortSignal) => request<WorkDetail>(`/api/works/${id}`, { signal }),
+  work: (id: number, signal?: AbortSignal, assetMode: WorkDetailAssetMode = "legacy") => {
+    const params = new URLSearchParams({ asset_mode: assetMode });
+    return request<WorkDetail>(`/api/works/${id}?${params.toString()}`, { signal });
+  },
+  workAssets: (id: number, options: { role?: string; cursor?: string | null; limit?: number; signal?: AbortSignal } = {}) => {
+    const params = new URLSearchParams();
+    if (options.role) params.set("role", options.role);
+    if (options.cursor) params.set("cursor", options.cursor);
+    const limit = options.limit ?? 128;
+    params.set("limit", String(Math.min(200, Math.max(1, Math.trunc(limit)))));
+    return request<CatalogAssetsResponse>(`/api/works/${id}/assets?${params.toString()}`, { signal: options.signal });
+  },
   workHistory: (id: number, signal?: AbortSignal) => request<HistoryRecord | null>(`/api/works/${id}/history`, { signal }),
   updateProgress: (id: number, progress: number, position: string | undefined, updateToken: number, options: ProgressRequestOptions = {}) =>
     request<{ status: string; accepted: boolean; progress: number; position?: string | null }>(`/api/works/${id}/progress`, {
@@ -305,8 +374,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  galleryPage: (id: number, cursor = 0, limit = 120, signal?: AbortSignal, version?: string | null) =>
-    request<GalleryPageResponse>(withVersion(`/api/works/${id}/gallery?cursor=${cursor}&limit=${limit}`, version), { signal }),
+  galleryPage: (id: number, cursor: string | number | null = null, limit = 120, signal?: AbortSignal, version?: string | null) => {
+    const params = new URLSearchParams();
+    if (cursor !== null && cursor !== undefined) params.set("cursor", String(cursor));
+    params.set("limit", String(Math.min(240, Math.max(1, Math.trunc(limit)))));
+    return request<GalleryPageResponse>(withVersion(`/api/works/${id}/gallery?${params.toString()}`, version), { signal });
+  },
   assetRoute: (id: number, signal?: AbortSignal) => request<AssetRouteInfo>(`/api/assets/${id}/route`, { signal }),
   scan: (enqueue_enrichment = false) => request<{ job_id: number; status: "queued" | "already-queued" }>("/api/scan", {
     method: "POST",
@@ -322,10 +395,31 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
-  comicPages: (id: number, signal?: AbortSignal, version?: string | null) =>
-    request<{ pages: Array<ComicPageInfo | string> }>(withVersion(`/api/works/${id}/pages`, version), { signal }),
-  epubManifest: (id: number, signal?: AbortSignal, version?: string | null) =>
-    request<EpubManifestResponse>(withVersion(`/api/works/${id}/epub`, version), { signal }),
+  comicPages: (id: number, signal?: AbortSignal, version?: string | null, cursor?: number | null, limit = 200) => {
+    const params = new URLSearchParams();
+    if (cursor !== undefined && cursor !== null) params.set("cursor", String(Math.max(0, Math.trunc(cursor))));
+    params.set("limit", String(Math.min(500, Math.max(1, Math.trunc(limit)))));
+    if (version) params.set("v", version);
+    return request<ComicPagesResponse>(`/api/works/${id}/pages?${params.toString()}`, { signal });
+  },
+  epubManifest: (
+    id: number,
+    signal?: AbortSignal,
+    version?: string | null,
+    cursor?: number | null,
+    limit?: number
+  ) => {
+    const params = new URLSearchParams();
+    if (cursor !== undefined && cursor !== null) {
+      params.set("cursor", String(Math.max(0, Math.trunc(cursor))));
+    }
+    if (limit !== undefined) {
+      params.set("limit", String(Math.min(500, Math.max(1, Math.trunc(limit)))));
+    }
+    if (version) params.set("v", version);
+    const query = params.toString();
+    return request<EpubManifestResponse>(`/api/works/${id}/epub${query ? `?${query}` : ""}`, { signal });
+  },
   epubChapterHtml: (id: number, chapter: number, signal?: AbortSignal, version?: string | null) =>
     requestText(withVersion(`/api/works/${id}/epub/${chapter}/html`, version), { signal })
 };
@@ -337,6 +431,25 @@ function withVersion(url: string, version?: string | null) {
 export function assetVersion(asset?: Pick<Asset, "created_at" | "size"> | null, _workVersion?: string | null) {
   if (!asset) return undefined;
   return `${asset.created_at}:${asset.size ?? "unknown"}`;
+}
+
+/** Convert the path-redacted catalog item to the legacy local asset shape.
+ * `path` is intentionally only the display name and is never used to resolve
+ * a filesystem path; streaming remains id-based through `assetUrl`.
+ */
+export function catalogAssetToAsset(item: CatalogAssetItem): Asset {
+  return {
+    id: item.id,
+    work_id: item.work_id,
+    path: item.name,
+    mime: item.mime,
+    role: item.role,
+    variant: item.variant,
+    position: item.position,
+    size: item.size,
+    meta_json: item.meta_json,
+    created_at: item.created_at
+  };
 }
 
 export function assetUrl(id?: number | null, version?: string | null) {
@@ -351,8 +464,9 @@ export function coverUrl(id?: number | null, size = 480, version?: string | null
   return id ? withVersion(`/api/works/${id}/cover?size=${size}`, version) : "";
 }
 
-export function comicPageUrl(workId: number, page: number, version?: string | null) {
-  return withVersion(`/api/works/${workId}/pages/${page}/stream`, version);
+export function comicPageUrl(workId: number, page: number, version?: string | null, size?: number) {
+  const query = size && size > 0 ? `?size=${Math.round(size)}` : "";
+  return withVersion(`/api/works/${workId}/pages/${page}/stream${query}`, version);
 }
 
 export function parseMeta<T extends Record<string, unknown>>(value?: string | null): T {

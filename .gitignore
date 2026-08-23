@@ -18,6 +18,7 @@ qms-strm/
 frontend/vite.config.js
 frontend/vite.config.d.ts
 cover-cache/
+perf-results/
 COS图/
 图库/
 漫画/

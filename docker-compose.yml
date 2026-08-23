@@ -24,6 +24,9 @@ services:
     # 使用独立 init 进程转发信号并回收子进程，避免扫描/转码任务残留。
     init: true
 
+    # N100 NAS 默认把容器硬限制在 4GiB；可在 .env 中覆盖。
+    mem_limit: ${APP_MEMORY_LIMIT:-4g}
+
     # 可选 .env 文件。需要覆盖密码、qmediasync 地址等配置时，优先改 .env。
     env_file:
       - path: .env
@@ -53,6 +56,55 @@ services:
       COVER_CACHE_DIR: /app/cover-cache
       CLOUD_CACHE_MAX_BYTES: ${CLOUD_CACHE_MAX_BYTES:-68719476736}
       THUMBNAIL_CACHE_MAX_BYTES_PER_DIR: ${THUMBNAIL_CACHE_MAX_BYTES_PER_DIR:-8589934592}
+      # Catalog v2 使用服务端分页、筛选和合集，避免浏览器加载全部作品。
+      CATALOG_V2_ENABLED: ${CATALOG_V2_ENABLED:-true}
+      # Experimental bounded bitmap for cold selective Facets; keep disabled until its N100 Gate passes.
+      FACET_BITMAP_ENABLED: ${FACET_BITMAP_ENABLED:-false}
+      # Shadow inventory only records bounded discovery state and never mutates works/assets/tags.
+      INVENTORY_SCANNER_ENABLED: ${INVENTORY_SCANNER_ENABLED:-false}
+      # Gradual rollout subset; use novel first, then add comic/coser-picture/audio/gallery.
+      INVENTORY_SCANNER_KINDS: ${INVENTORY_SCANNER_KINDS:-all}
+      # Builds and incrementally maintains a separate Tantivy shadow index; production reads stay unchanged.
+      SEARCH_OUTBOX_SHADOW_ENABLED: ${SEARCH_OUTBOX_SHADOW_ENABLED:-false}
+      # Allows only explicit reader=shadow canary requests after the shadow index is ready.
+      SEARCH_SHADOW_CANARY_ENABLED: ${SEARCH_SHADOW_CANARY_ENABLED:-false}
+      # Atomic-on-restart production reader cutover; requires shadow + canary workers,
+      # a ready/reconciled index, and all ownership Gate checks.
+      SEARCH_INCREMENTAL_READER_ENABLED: ${SEARCH_INCREMENTAL_READER_ENABLED:-false}
+      # Reader mmap/segment setup before readiness; opt-in until N100 startup/RSS Gate passes.
+      SEARCH_READER_PREWARM_ENABLED: ${SEARCH_READER_PREWARM_ENABLED:-false}
+      # v2 默认保持关闭，完成 NAS 实机 Gate 后再切换。目录应位于本机 SSD。
+      DERIVATIVE_CACHE_V2_ENABLED: ${DERIVATIVE_CACHE_V2_ENABLED:-false}
+      # MozJPEG DCT-scaled thumbnails are opt-in until the target NAS Gate passes.
+      JPEG_THUMBNAIL_DOWNSCALE_ENABLED: ${JPEG_THUMBNAIL_DOWNSCALE_ENABLED:-false}
+      DERIVATIVE_CACHE_DIR: ${DERIVATIVE_CACHE_DIR:-/app/data/derivatives}
+      DERIVATIVE_CACHE_MAX_BYTES: ${DERIVATIVE_CACHE_MAX_BYTES:-34359738368}
+      DERIVATIVE_CACHE_LOW_WATERMARK_BYTES: ${DERIVATIVE_CACHE_LOW_WATERMARK_BYTES:-30064771072}
+
+      # N100/4GiB 资源治理基线。先使用保守预算，实机基准通过后再上调。
+      RESOURCE_PROFILE: ${RESOURCE_PROFILE:-nas-n100-4g}
+      # SQLite、WAL 和索引必须位于 /app/data 对应的本机 SSD。
+      SQLITE_MAX_CONNECTIONS: ${SQLITE_MAX_CONNECTIONS:-5}
+      SQLITE_CACHE_KIB_PER_CONNECTION: ${SQLITE_CACHE_KIB_PER_CONNECTION:-24576}
+      SQLITE_MMAP_SIZE_BYTES: ${SQLITE_MMAP_SIZE_BYTES:-67108864}
+      SQLITE_BUSY_TIMEOUT_MILLIS: ${SQLITE_BUSY_TIMEOUT_MILLIS:-10000}
+      SQLITE_ACQUIRE_TIMEOUT_MILLIS: ${SQLITE_ACQUIRE_TIMEOUT_MILLIS:-10000}
+      SQLITE_WAL_AUTOCHECKPOINT_PAGES: ${SQLITE_WAL_AUTOCHECKPOINT_PAGES:-4000}
+      SQLITE_JOURNAL_SIZE_LIMIT_BYTES: ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES:-268435456}
+      SQLITE_WRITER_QUEUE_MAX_DEPTH: ${SQLITE_WRITER_QUEUE_MAX_DEPTH:-32}
+      SQLITE_WRITER_QUEUE_MAX_BYTES: ${SQLITE_WRITER_QUEUE_MAX_BYTES:-67108864}
+      PROCESSING_MEMORY_BUDGET_BYTES: ${PROCESSING_MEMORY_BUDGET_BYTES:-1073741824}
+      INFLIGHT_MEDIA_BUDGET_BYTES: ${INFLIGHT_MEDIA_BUDGET_BYTES:-268435456}
+      MEMORY_SOFT_LIMIT_BYTES: ${MEMORY_SOFT_LIMIT_BYTES:-3221225472}
+      MEMORY_RESUME_LIMIT_BYTES: ${MEMORY_RESUME_LIMIT_BYTES:-2818572288}
+      ARCHIVE_MANIFEST_CACHE_BYTES: ${ARCHIVE_MANIFEST_CACHE_BYTES:-268435456}
+      RESOURCE_WAIT_TIMEOUT_MILLIS: ${RESOURCE_WAIT_TIMEOUT_MILLIS:-10000}
+      THUMBNAIL_WORKERS: ${THUMBNAIL_WORKERS:-1}
+      ARCHIVE_STREAM_WORKERS: ${ARCHIVE_STREAM_WORKERS:-2}
+      LOCAL_MEDIA_STREAM_WORKERS: ${LOCAL_MEDIA_STREAM_WORKERS:-2}
+      SCAN_IO_CONCURRENCY: ${SCAN_IO_CONCURRENCY:-1}
+      SEARCH_WRITER_HEAP_BYTES: ${SEARCH_WRITER_HEAP_BYTES:-33554432}
+      ENRICHMENT_CONCURRENCY: ${ENRICHMENT_CONCURRENCY:-1}
 
       # qmediasync 服务地址，可在 .env 中设置，例如：
       # QMEDIASYNC_BASE_URL=http://192.168.31.39:8095
