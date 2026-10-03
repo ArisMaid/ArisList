@@ -5,13 +5,13 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-aes-gcm = "0.10"
 anyhow = "1"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+flate2 = "1"
 html-escape = "0.2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 lofty = "0.22"

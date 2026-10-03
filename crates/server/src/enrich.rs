@@ -2,7 +2,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
@@ -13,7 +12,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::auth;
 use crate::catalog_reconciliation;
 use crate::db::{EnrichmentExternalIdInput, EnrichmentTagInput, ScannerEnrichmentInput};
 use crate::error::{AppError, Result};
@@ -31,10 +29,8 @@ pub struct EnrichRequest {
 
 pub async fn enqueue_enrich(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(input): Json<EnrichRequest>,
 ) -> Result<Json<Value>> {
-    auth::require_csrf(&state, &headers, "enrich").await?;
     let kind = input
         .kind
         .unwrap_or_else(|| "import-tag-translations".to_string());
@@ -61,10 +57,15 @@ pub async fn run_job(state: Arc<AppState>, id: i64, job_type: &str, payload: Val
                 .get("enqueue_enrichment")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            match payload.get("kind").and_then(Value::as_str) {
-                Some(kind) => scanner::scan_kind(&state, kind, enqueue).await.map(|_| ()),
-                None => scanner::scan_all(&state, enqueue).await.map(|_| ()),
-            }
+            let scan_result = match payload.get("kind").and_then(Value::as_str) {
+                Some(kind) => scanner::scan_kind(&state, kind, enqueue).await,
+                None => scanner::scan_all(&state, enqueue).await,
+            }?;
+            let mut completed_payload = payload;
+            completed_payload["scan_result"] = serde_json::to_value(&scan_result)
+                .map_err(|err| AppError::Other(format!("failed to encode scan result: {err}")))?;
+            state.db.update_job_payload(id, completed_payload).await?;
+            Ok(())
         }
         "enrich-asmr-work" => enrich_asmr_work(state, payload).await,
         "enrich-lightnovel-work" => enrich_lightnovel_work(state, payload).await,

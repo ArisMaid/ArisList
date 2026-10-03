@@ -13,7 +13,8 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::json;
 
 use super::super::{
-    clean_title, count_cbz_pages_blocking, fingerprint_archive, normalize_key, path_string,
+    count_cbz_pages_blocking, fingerprint_archive_with_sidecar_version, normalize_key, path_string,
+    read_comic_info_blocking,
 };
 use crate::catalog_writer::{
     AssetMutation, MutationFence, MutationOwner, MutationSource, TagMutation, WorkMutation,
@@ -23,7 +24,7 @@ use crate::error::{AppError, Result};
 use crate::resource::ResourceGovernor;
 use crate::vfs;
 
-const COSER_PICTURE_INSPECTOR_VERSION: &str = "coser-picture-v1";
+const COSER_PICTURE_INSPECTOR_VERSION: &str = "coser-picture-v2";
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoserPictureInspectionRequest {
@@ -52,7 +53,13 @@ pub(crate) async fn inspect(
     }
 
     let is_qmediasync = vfs::is_qmediasync_provider(&request.provider);
-    let archive_state = fingerprint_archive(resources, archive_path.clone(), false, true).await?;
+    let archive_state = fingerprint_archive_with_sidecar_version(
+        resources,
+        archive_path.clone(),
+        true,
+        COSER_PICTURE_INSPECTOR_VERSION,
+    )
+    .await?;
     let fingerprint = archive_state.fingerprint;
     let source_version = fingerprint
         .source_version(&archive_path)
@@ -82,12 +89,17 @@ pub(crate) async fn inspect(
         )));
     }
 
-    let title = archive_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(clean_title)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Untitled CoserPicture".to_string());
+    let sidecar = read_comic_info_blocking(
+        resources,
+        archive_path
+            .parent()
+            .unwrap_or(request.root.as_path())
+            .to_path_buf(),
+    )
+    .await?;
+    let sidecar_missing = sidecar.is_missing();
+    let comic_info = sidecar.into_info();
+    let title = comic_info.display_title(&archive_state.fallback_title);
     let coser = archive_path
         .parent()
         .and_then(|path| path.file_name())
@@ -96,7 +108,7 @@ pub(crate) async fn inspect(
         .unwrap_or("CoserPicture")
         .to_string();
 
-    let mut tags = Vec::with_capacity(3);
+    let mut tags = Vec::with_capacity(3 + comic_info.tags().len());
     let mut identities = BTreeSet::new();
     push_tag(
         &mut tags,
@@ -108,6 +120,15 @@ pub(crate) async fn inspect(
     let coser_key = normalize_key(&coser);
     push_tag(&mut tags, &mut identities, "folder", &coser_key, &coser);
     push_tag(&mut tags, &mut identities, "artist", &coser_key, &coser);
+    for tag in comic_info.tags() {
+        push_tag(
+            &mut tags,
+            &mut identities,
+            &tag.namespace,
+            &tag.key,
+            &tag.label,
+        );
+    }
 
     let archive_path_reference = if is_qmediasync {
         let mount_name = request
@@ -116,12 +137,16 @@ pub(crate) async fn inspect(
             .expect("validated qmediasync mount name");
         let target_url =
             super::super::read_qms_strm_url_blocking(resources, archive_path.clone()).await?;
-        let meta = vfs::qms_strm_meta_json(
+        let volume_paths = super::super::qms_volume_paths(&request.root, mount_name, &archive_path);
+        let missing_volumes = super::super::qms_volume_missing_names(&archive_path);
+        let meta = vfs::qms_strm_meta_json_with_volumes(
             mount_name,
             &request.root,
             &archive_path,
             &request.work_key,
             &target_url,
+            &volume_paths,
+            &missing_volumes,
         )
         .await;
         (vfs::qms_strm_uri(mount_name, &request.work_key), meta)
@@ -147,21 +172,27 @@ pub(crate) async fn inspect(
             root_generation: request.root_generation,
             scan_token: request.scan_token,
             complete_snapshot: true,
+            preserve_scanner_tags: sidecar_missing,
         },
-        fingerprint: format!("{COSER_PICTURE_INSPECTOR_VERSION}:{}", fingerprint.value),
+        fingerprint: fingerprint.value.clone(),
         work: WorkMutationFields {
             title,
             subtitle: None,
             category: Some("CoserPicture".to_string()),
-            description: None,
-            rating: None,
+            description: comic_info.description(),
+            rating: comic_info.community_rating,
             source_path: archive_path_reference.0.clone(),
-            meta: json!({
-                "page_count": page_count,
-                "root": path_string(&request.root),
-                "archive": path_string(&archive_path),
-                "coser": coser,
-            }),
+            meta: {
+                let mut meta = comic_info.meta(page_count);
+                meta["page_count"] = json!(page_count);
+                meta["root"] = json!(path_string(&request.root));
+                meta["archive"] = json!(path_string(&archive_path));
+                meta["coser"] = json!(coser);
+                if sidecar_missing {
+                    meta["comic_info"]["sidecar_status"] = json!("missing");
+                }
+                meta
+            },
         },
         assets: vec![AssetMutation {
             path: archive_path_reference.0,
@@ -325,7 +356,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["coser-picture", "folder", "artist"]
         );
-        assert_eq!(mutation.fingerprint.len(), "coser-picture-v1:".len() + 64);
+        assert_eq!(mutation.fingerprint.len(), "coser-picture-v2:".len() + 64);
     }
 
     #[tokio::test]

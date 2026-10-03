@@ -78,6 +78,15 @@ pub struct WorkArchiveSource {
     pub meta_json: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArchiveAssetEntryRecord {
+    pub parent_asset_id: i64,
+    pub entry_key: String,
+    pub derived_asset_id: i64,
+    pub entry_path: String,
+    pub source_version: String,
+}
+
 /// One logical searchable mutation may touch a work, several tag links, and
 /// every work sharing a changed tag.  All of those outbox rows must carry one
 /// monotonic source revision so a consumer can acknowledge exactly the facts
@@ -1927,6 +1936,31 @@ impl Db {
         seen_token: &str,
         scope: &str,
     ) -> Result<i64> {
+        self.commit_scanner_work_snapshot_with_tag_policy(snapshot, seen_token, scope, false)
+            .await
+    }
+
+    /// Commit a complete snapshot while keeping the existing scanner-owned
+    /// tag links.  A missing sidecar is not evidence that metadata was
+    /// removed, so the scanner must not turn an absent XML file into an empty
+    /// tag snapshot for an existing work.
+    pub async fn commit_scanner_work_snapshot_preserving_tags(
+        &self,
+        snapshot: ScannerWorkSnapshot,
+        seen_token: &str,
+        scope: &str,
+    ) -> Result<i64> {
+        self.commit_scanner_work_snapshot_with_tag_policy(snapshot, seen_token, scope, true)
+            .await
+    }
+
+    async fn commit_scanner_work_snapshot_with_tag_policy(
+        &self,
+        snapshot: ScannerWorkSnapshot,
+        seen_token: &str,
+        scope: &str,
+        preserve_scanner_tags: bool,
+    ) -> Result<i64> {
         let _write_slot = self.acquire_write_slot(256 * 1024).await?;
         let mut transaction = self.begin_tracked_transaction().await?;
         require_scanner_lease(&mut transaction, "library", seen_token).await?;
@@ -1997,6 +2031,7 @@ impl Db {
             scope,
             seen_token,
             &snapshot.fingerprint,
+            preserve_scanner_tags,
             &mut publication,
         )
         .await?;
@@ -2018,6 +2053,49 @@ impl Db {
         seen_token: &str,
         scope: &str,
         fingerprint: &str,
+    ) -> Result<()> {
+        self.commit_scanner_work_metadata_with_tag_policy(
+            work_id,
+            tags,
+            external_ids,
+            seen_token,
+            scope,
+            fingerprint,
+            false,
+        )
+        .await
+    }
+
+    pub async fn commit_scanner_work_metadata_preserving_tags(
+        &self,
+        work_id: i64,
+        tags: Vec<ScannerTagInput>,
+        external_ids: Vec<ScannerExternalIdInput>,
+        seen_token: &str,
+        scope: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.commit_scanner_work_metadata_with_tag_policy(
+            work_id,
+            tags,
+            external_ids,
+            seen_token,
+            scope,
+            fingerprint,
+            true,
+        )
+        .await
+    }
+
+    async fn commit_scanner_work_metadata_with_tag_policy(
+        &self,
+        work_id: i64,
+        tags: Vec<ScannerTagInput>,
+        external_ids: Vec<ScannerExternalIdInput>,
+        seen_token: &str,
+        scope: &str,
+        fingerprint: &str,
+        preserve_scanner_tags: bool,
     ) -> Result<()> {
         let _write_slot = self.acquire_write_slot(64 * 1024).await?;
         let mut transaction = self.begin_tracked_transaction().await?;
@@ -2058,9 +2136,41 @@ impl Db {
             scope,
             seen_token,
             fingerprint,
+            preserve_scanner_tags,
             &mut publication,
         )
         .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_archive_asset_entry(
+        &self,
+        parent_asset_id: i64,
+        entry_key: &str,
+    ) -> Result<()> {
+        let _write_slot = self.acquire_write_slot(64 * 1024).await?;
+        let mut transaction = self.begin_tracked_transaction().await?;
+        let derived_id = sqlx::query_scalar::<_, i64>(
+            "SELECT derived_asset_id FROM archive_asset_entries WHERE parent_asset_id = ?1 AND entry_key = ?2",
+        )
+        .bind(parent_asset_id)
+        .bind(entry_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM archive_asset_entries WHERE parent_asset_id = ?1 AND entry_key = ?2",
+        )
+        .bind(parent_asset_id)
+        .bind(entry_key)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(derived_id) = derived_id {
+            sqlx::query("DELETE FROM assets WHERE id = ?1")
+                .bind(derived_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -2115,6 +2225,135 @@ impl Db {
         enqueue_search_upsert_outbox_for_work(&mut transaction, work_id, &mut publication).await?;
         transaction.commit().await?;
         Ok(asset_id)
+    }
+
+    pub async fn upsert_archive_asset_entry(
+        &self,
+        parent_asset_id: i64,
+        entry_key: &str,
+        derived_asset_id: i64,
+        entry_path: &str,
+        source_version: &str,
+    ) -> Result<()> {
+        let _write_slot = self.acquire_write_slot(64 * 1024).await?;
+        let mut transaction = self.begin_tracked_transaction().await?;
+        let previous_derived_id = sqlx::query_scalar::<_, i64>(
+            "SELECT derived_asset_id FROM archive_asset_entries WHERE parent_asset_id = ?1 AND entry_key = ?2",
+        )
+        .bind(parent_asset_id)
+        .bind(entry_key)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO archive_asset_entries (
+                parent_asset_id, entry_key, derived_asset_id, entry_path, source_version
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(parent_asset_id, entry_key) DO UPDATE SET
+                derived_asset_id = excluded.derived_asset_id,
+                entry_path = excluded.entry_path,
+                source_version = excluded.source_version
+            "#,
+        )
+        .bind(parent_asset_id)
+        .bind(entry_key)
+        .bind(derived_asset_id)
+        .bind(entry_path)
+        .bind(source_version)
+        .execute(&mut *transaction)
+        .await?;
+        if previous_derived_id.is_some_and(|id| id != derived_asset_id) {
+            sqlx::query("DELETE FROM assets WHERE id = ?1")
+                .bind(previous_derived_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn archive_asset_entry(
+        &self,
+        parent_asset_id: i64,
+        entry_key: &str,
+    ) -> Result<Option<ArchiveAssetEntryRecord>> {
+        let row = sqlx::query_as::<_, (i64, String, i64, String, String)>(
+            r#"
+            SELECT parent_asset_id, entry_key, derived_asset_id, entry_path, source_version
+            FROM archive_asset_entries
+            WHERE parent_asset_id = ?1 AND entry_key = ?2
+            "#,
+        )
+        .bind(parent_asset_id)
+        .bind(entry_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(parent_asset_id, entry_key, derived_asset_id, entry_path, source_version)| {
+                ArchiveAssetEntryRecord {
+                    parent_asset_id,
+                    entry_key,
+                    derived_asset_id,
+                    entry_path,
+                    source_version,
+                }
+            },
+        ))
+    }
+
+    pub async fn archive_asset_entries(
+        &self,
+        parent_asset_id: i64,
+    ) -> Result<Vec<ArchiveAssetEntryRecord>> {
+        let rows = sqlx::query_as::<_, (i64, String, i64, String, String)>(
+            r#"
+            SELECT parent_asset_id, entry_key, derived_asset_id, entry_path, source_version
+            FROM archive_asset_entries
+            WHERE parent_asset_id = ?1
+            ORDER BY entry_key
+            "#,
+        )
+        .bind(parent_asset_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(parent_asset_id, entry_key, derived_asset_id, entry_path, source_version)| {
+                    ArchiveAssetEntryRecord {
+                        parent_asset_id,
+                        entry_key,
+                        derived_asset_id,
+                        entry_path,
+                        source_version,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn clear_archive_asset_entries(&self, parent_asset_id: i64) -> Result<()> {
+        let _write_slot = self.acquire_write_slot(256 * 1024).await?;
+        let mut transaction = self.begin_tracked_transaction().await?;
+        let derived_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT derived_asset_id FROM archive_asset_entries WHERE parent_asset_id = ?1",
+        )
+        .bind(parent_asset_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM archive_asset_entries WHERE parent_asset_id = ?1")
+            .bind(parent_asset_id)
+            .execute(&mut *transaction)
+            .await?;
+        for derived_id in derived_ids {
+            sqlx::query("DELETE FROM assets WHERE id = ?1")
+                .bind(derived_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2311,6 +2550,29 @@ impl Db {
         seen_token: &str,
         fingerprint: &str,
     ) -> Result<()> {
+        self.finish_scanner_work_with_tag_policy(work_id, scope, seen_token, fingerprint, false)
+            .await
+    }
+
+    pub async fn finish_scanner_work_preserving_tags(
+        &self,
+        work_id: i64,
+        scope: &str,
+        seen_token: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.finish_scanner_work_with_tag_policy(work_id, scope, seen_token, fingerprint, true)
+            .await
+    }
+
+    async fn finish_scanner_work_with_tag_policy(
+        &self,
+        work_id: i64,
+        scope: &str,
+        seen_token: &str,
+        fingerprint: &str,
+        preserve_scanner_tags: bool,
+    ) -> Result<()> {
         let _write_slot = self.acquire_write_slot(64 * 1024).await?;
         let mut transaction = self.begin_tracked_transaction().await?;
         require_scanner_lease(&mut transaction, "library", seen_token).await?;
@@ -2321,6 +2583,7 @@ impl Db {
             scope,
             seen_token,
             fingerprint,
+            preserve_scanner_tags,
             &mut publication,
         )
         .await?;
@@ -3057,6 +3320,19 @@ impl Db {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_job_payload(&self, id: i64, payload: Value) -> Result<()> {
+        let _write_slot = self.acquire_write_slot(32 * 1024).await?;
+        let mut transaction = self.begin_tracked_transaction().await?;
+        sqlx::query("UPDATE jobs SET payload_json = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(payload.to_string())
+            .bind(Utc::now())
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -3972,6 +4248,16 @@ impl Db {
         .ok_or_else(|| AppError::NotFound(format!("work {id} not found")))
     }
 
+    pub async fn work_kind(&self, id: i64) -> Result<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT kind FROM works WHERE id = ?1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("work {id} not found")))
+    }
+
     pub async fn asset(&self, id: i64) -> Result<Asset> {
         sqlx::query_as::<_, Asset>(
             "SELECT assets.* FROM assets JOIN works ON works.id = assets.work_id WHERE assets.id = ?1 AND works.deleted_at IS NULL",
@@ -4486,14 +4772,51 @@ async fn upsert_scanner_work_in_transaction(
     if let Some(object) = meta.as_object_mut() {
         object.insert("_scanner_fingerprint".to_string(), json!(fingerprint));
     }
+    let mapped = meta.get("comic_info").is_some();
+    let mut resolved_title = title.to_string();
+    let mut resolved_description = description.map(ToOwned::to_owned);
+    let mut subtitle = None;
+    if mapped {
+        let previous = sqlx::query("SELECT title, subtitle, description, meta_json FROM works WHERE kind = ?1 AND source_path IS ?2")
+            .bind(kind).bind(source_path).fetch_optional(&mut **transaction).await?;
+        let previous_meta = previous
+            .as_ref()
+            .and_then(|row| serde_json::from_str::<Value>(&row.get::<String, _>("meta_json")).ok())
+            .unwrap_or_default();
+        let previous_fields = previous.as_ref().map(|row| {
+            (
+                row.get::<String, _>("title"),
+                row.get::<Option<String>, _>("subtitle"),
+                row.get::<Option<String>, _>("description"),
+            )
+        });
+        (resolved_title, subtitle, resolved_description) =
+            crate::scanner::comic_info::merge_existing_fields(
+                title,
+                meta["comic_info"]["subtitle"].as_str(),
+                description,
+                &meta,
+                previous_fields
+                    .as_ref()
+                    .map(|(title, subtitle, description)| {
+                        (
+                            title.as_str(),
+                            subtitle.as_deref(),
+                            description.as_deref(),
+                            &previous_meta,
+                        )
+                    }),
+            );
+    }
     let row = sqlx::query(
         r#"
-        INSERT INTO works (kind, title, category, description, rating, source_path, meta_json, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO works (kind, title, category, description, rating, source_path, meta_json, updated_at, subtitle)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT(kind, source_path) DO UPDATE SET
             title = excluded.title,
             category = excluded.category,
-            description = COALESCE(excluded.description, works.description),
+            subtitle = CASE WHEN ?10 THEN excluded.subtitle ELSE works.subtitle END,
+            description = CASE WHEN ?10 THEN excluded.description ELSE COALESCE(excluded.description, works.description) END,
             rating = COALESCE(excluded.rating, works.rating),
             meta_json = json_patch(
                 CASE WHEN json_valid(works.meta_json) THEN works.meta_json ELSE '{}' END,
@@ -4504,7 +4827,8 @@ async fn upsert_scanner_work_in_transaction(
             updated_at = excluded.updated_at
         WHERE works.title IS NOT excluded.title
            OR works.category IS NOT excluded.category
-           OR works.description IS NOT COALESCE(excluded.description, works.description)
+           OR works.subtitle IS NOT CASE WHEN ?10 THEN excluded.subtitle ELSE works.subtitle END
+           OR works.description IS NOT CASE WHEN ?10 THEN excluded.description ELSE COALESCE(excluded.description, works.description) END
            OR works.rating IS NOT COALESCE(excluded.rating, works.rating)
            OR works.meta_json IS NOT json_patch(
                 CASE WHEN json_valid(works.meta_json) THEN works.meta_json ELSE '{}' END,
@@ -4516,13 +4840,15 @@ async fn upsert_scanner_work_in_transaction(
         "#,
     )
     .bind(kind)
-    .bind(title)
+    .bind(&resolved_title)
     .bind(category)
-    .bind(description)
+    .bind(&resolved_description)
     .bind(rating)
     .bind(source_path)
     .bind(meta.to_string())
     .bind(Utc::now())
+    .bind(&subtitle)
+    .bind(mapped)
     .fetch_optional(&mut **transaction)
     .await?;
     if let Some(row) = row {
@@ -4883,6 +5209,7 @@ async fn finish_scanner_work_in_transaction(
     scope: &str,
     seen_token: &str,
     fingerprint: &str,
+    preserve_scanner_tags: bool,
     publication: &mut SearchOutboxPublication,
 ) -> Result<()> {
     sqlx::query(
@@ -4929,26 +5256,28 @@ async fn finish_scanner_work_in_transaction(
     .bind(seen_token)
     .execute(&mut **transaction)
     .await?;
-    sqlx::query(
-        "DELETE FROM work_tag_sources WHERE work_id = ?1 AND owner = 'scanner' AND seen_token != ?2",
-    )
-    .bind(work_id)
-    .bind(seen_token)
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query(
-        r#"
-        DELETE FROM work_tags
-        WHERE work_id = ?1
-          AND NOT EXISTS (
-              SELECT 1 FROM work_tag_sources source
-              WHERE source.work_id = work_tags.work_id AND source.tag_id = work_tags.tag_id
-          )
-        "#,
-    )
-    .bind(work_id)
-    .execute(&mut **transaction)
-    .await?;
+    if !preserve_scanner_tags {
+        sqlx::query(
+            "DELETE FROM work_tag_sources WHERE work_id = ?1 AND owner = 'scanner' AND seen_token != ?2",
+        )
+        .bind(work_id)
+        .bind(seen_token)
+        .execute(&mut **transaction)
+        .await?;
+        sqlx::query(
+            r#"
+            DELETE FROM work_tags
+            WHERE work_id = ?1
+              AND NOT EXISTS (
+                  SELECT 1 FROM work_tag_sources source
+                  WHERE source.work_id = work_tags.work_id AND source.tag_id = work_tags.tag_id
+              )
+            "#,
+        )
+        .bind(work_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
     enqueue_search_upsert_outbox_for_work(transaction, work_id, publication).await?;
     Ok(())
 }
@@ -5573,7 +5902,7 @@ mod tests {
         let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
         let db = Db::connect(&url).await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 24);
+        assert_eq!(db.schema_version().await.unwrap(), 26);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM works")
                 .fetch_one(db.pool())
@@ -5612,6 +5941,9 @@ mod tests {
             "DROP INDEX IF EXISTS idx_archive_manifest_cache_eviction",
             "DROP TABLE IF EXISTS archive_manifest_cache_state",
             "DROP TABLE IF EXISTS archive_manifest_cache",
+            "DROP INDEX IF EXISTS idx_archive_asset_entries_derived",
+            "DROP TRIGGER IF EXISTS archive_asset_entries_parent_cleanup",
+            "DROP TABLE IF EXISTS archive_asset_entries",
             // Keep this synthetic downgrade faithful to the v16 schema.  The
             // test deliberately removes migration records before re-applying
             // every later migration, so v24's additive state and columns must
@@ -5700,7 +6032,7 @@ mod tests {
         );
 
         db.migrate().await.unwrap();
-        assert_eq!(db.schema_version().await.unwrap(), 24);
+        assert_eq!(db.schema_version().await.unwrap(), 26);
         let revisions_before_v17_progress = db.revision_snapshot().await.unwrap();
         db.update_work_progress(work_id, 0.5, Some("chapter-2"), 2)
             .await

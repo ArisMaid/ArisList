@@ -2835,6 +2835,7 @@ async fn enqueue_archive_temp_catalog_events(
                      WHERE source.kind = ?2
                        AND source.root_id = ?1
                        AND source.work_key = batch.work_key
+                       AND source.fingerprint GLOB ?3
                  )
               )
               AND EXISTS (
@@ -2849,6 +2850,7 @@ async fn enqueue_archive_temp_catalog_events(
     )
     .bind(root_id)
     .bind(kind)
+    .bind(if kind == "comic" { format!("{}*", crate::scanner::comic_info::COMIC_FINGERPRINT_PREFIX) } else { "*".to_string() })
     .fetch_one(&mut **transaction)
     .await?;
     let candidate_count = candidates.get::<i64, _>("candidate_count").max(0);
@@ -2915,6 +2917,7 @@ async fn enqueue_archive_temp_catalog_events(
                  WHERE source.kind = ?2
                    AND source.root_id = ?1
                    AND source.work_key = batch.work_key
+                       AND source.fingerprint GLOB ?3
              )
           )
           AND EXISTS (
@@ -2931,6 +2934,11 @@ async fn enqueue_archive_temp_catalog_events(
     )
     .bind(root_id)
     .bind(kind)
+    .bind(if kind == "comic" {
+        format!("{}*", crate::scanner::comic_info::COMIC_FINGERPRINT_PREFIX)
+    } else {
+        "*".to_string()
+    })
     .execute(&mut **transaction)
     .await?
     .rows_affected();
@@ -2994,6 +3002,7 @@ async fn enqueue_archive_event_catalog_events(
                      WHERE source.kind = ?3
                        AND source.root_id = ?1
                        AND source.work_key = json_extract(input.value, '$.w')
+                       AND source.fingerprint GLOB ?4
                  )
               )
               AND EXISTS (
@@ -3009,6 +3018,7 @@ async fn enqueue_archive_event_catalog_events(
     .bind(event.root_id)
     .bind(payload)
     .bind(kind)
+    .bind(if kind == "comic" { format!("{}*", crate::scanner::comic_info::COMIC_FINGERPRINT_PREFIX) } else { "*".to_string() })
     .fetch_one(&mut **transaction)
     .await?;
     let candidate_count = candidates.get::<i64, _>("candidate_count").max(0);
@@ -3073,6 +3083,7 @@ async fn enqueue_archive_event_catalog_events(
                  WHERE source.kind = ?3
                    AND source.root_id = ?1
                    AND source.work_key = json_extract(input.value, '$.w')
+                       AND source.fingerprint GLOB ?4
              )
           )
           AND EXISTS (
@@ -3090,6 +3101,7 @@ async fn enqueue_archive_event_catalog_events(
     .bind(event.root_id)
     .bind(payload)
     .bind(kind)
+    .bind(if kind == "comic" { format!("{}*", crate::scanner::comic_info::COMIC_FINGERPRINT_PREFIX) } else { "*".to_string() })
     .execute(&mut **transaction)
     .await?
     .rows_affected();
@@ -4818,6 +4830,7 @@ async fn apply_novel_catalog_event(
         root_generation: event.generation,
         scan_token: fence_token.to_string(),
         complete_snapshot: true,
+        preserve_scanner_tags: false,
     };
     let source = MutationSource {
         kind: "novel".to_string(),
@@ -4906,6 +4919,7 @@ async fn apply_comic_catalog_event(
         root_generation: event.generation,
         scan_token: fence_token.to_string(),
         complete_snapshot: true,
+        preserve_scanner_tags: false,
     };
     let source = MutationSource {
         kind: "comic".to_string(),
@@ -4983,6 +4997,7 @@ async fn apply_coser_picture_catalog_event(
         root_generation: event.generation,
         scan_token: fence_token.to_string(),
         complete_snapshot: true,
+        preserve_scanner_tags: false,
     };
     let source = MutationSource {
         kind: "coser-picture".to_string(),
@@ -5064,6 +5079,7 @@ async fn apply_audio_catalog_event(
         root_generation: event.generation,
         scan_token: fence_token.to_string(),
         complete_snapshot: true,
+        preserve_scanner_tags: false,
     };
     let source = MutationSource {
         kind: "audio".to_string(),
@@ -5161,6 +5177,7 @@ async fn apply_gallery_catalog_event(
         root_generation: event.generation,
         scan_token: fence_token.to_string(),
         complete_snapshot: true,
+        preserve_scanner_tags: false,
     };
     let source = MutationSource {
         kind: "gallery".to_string(),

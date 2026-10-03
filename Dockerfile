@@ -19,7 +19,7 @@ RUN cargo build --release -p media-shelf-server
 FROM mcr.microsoft.com/devcontainers/base:bookworm
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0
+    && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0 p7zip-full
 WORKDIR /app
 COPY --from=server /app/target/release/media-shelf-server /usr/local/bin/media-shelf-server
 COPY --from=web /app/frontend/dist /app/public

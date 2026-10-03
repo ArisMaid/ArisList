@@ -1,9 +1,3 @@
-use aes_gcm::aead::rand_core::RngCore;
-use aes_gcm::aead::{Aead, KeyInit, OsRng};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -18,61 +12,6 @@ static CANONICAL_ROOT_CACHE: LazyLock<RwLock<HashMap<PathBuf, PathBuf>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static PATH_CANONICALIZE_WORKERS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(4)));
-
-pub fn encrypt_secret(secret: &str, plaintext: &str) -> Result<String> {
-    let key_bytes = Sha256::digest(secret.as_bytes());
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-    let mut nonce_bytes = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|e| AppError::Other(format!("credential encryption failed: {e}")))?;
-    Ok(format!(
-        "{}.{}",
-        STANDARD.encode(nonce_bytes),
-        STANDARD.encode(ciphertext)
-    ))
-}
-
-#[allow(dead_code)]
-pub fn decrypt_secret(secret: &str, packed: &str) -> Result<String> {
-    const MAX_PACKED_SECRET_LEN: usize = 16 * 1024;
-    const AES_GCM_NONCE_LEN: usize = 12;
-    const AES_GCM_TAG_LEN: usize = 16;
-
-    if packed.len() > MAX_PACKED_SECRET_LEN {
-        return Err(AppError::BadRequest(
-            "encrypted value is too large".to_string(),
-        ));
-    }
-    let (nonce_b64, ciphertext_b64) = packed
-        .split_once('.')
-        .ok_or_else(|| AppError::BadRequest("invalid encrypted value".to_string()))?;
-    let nonce = STANDARD
-        .decode(nonce_b64)
-        .map_err(|e| AppError::BadRequest(format!("invalid nonce: {e}")))?;
-    let ciphertext = STANDARD
-        .decode(ciphertext_b64)
-        .map_err(|e| AppError::BadRequest(format!("invalid ciphertext: {e}")))?;
-    if nonce.len() != AES_GCM_NONCE_LEN {
-        return Err(AppError::BadRequest(format!(
-            "invalid nonce length: expected {AES_GCM_NONCE_LEN} bytes"
-        )));
-    }
-    if ciphertext.len() < AES_GCM_TAG_LEN {
-        return Err(AppError::BadRequest(
-            "invalid ciphertext length".to_string(),
-        ));
-    }
-    let key_bytes = Sha256::digest(secret.as_bytes());
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-    let plaintext = cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-        .map_err(|e| AppError::Unauthorized(format!("credential decrypt failed: {e}")))?;
-    String::from_utf8(plaintext)
-        .map_err(|e| AppError::BadRequest(format!("credential is not utf8: {e}")))
-}
 
 pub fn ensure_asset_path_allowed_with_roots(
     config: &Config,
@@ -277,7 +216,6 @@ pub fn path_mime(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn test_config(root: &Path) -> Config {
         Config {
@@ -296,9 +234,6 @@ mod tests {
             gallery_dir: root.join("gallery"),
             coser_picture_dir: root.join("coser-picture"),
             generated_dir: root.join("generated"),
-            app_admin_password: "admin".to_string(),
-            admin_password_persisted: false,
-            admin_password_ephemeral: false,
             lightnovel_api_bases: Vec::new(),
             lightnovel_access_token: None,
             enrichment_concurrency: 1,
@@ -306,6 +241,7 @@ mod tests {
             openai_api_key: None,
             openai_image_model: "gpt-image-2".to_string(),
             qmediasync_base_url: String::new(),
+            qmediasync_strm_dir: None,
             cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
             thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
             catalog_v2_enabled: true,
@@ -321,48 +257,9 @@ mod tests {
             derivative_cache_dir: root.join("derivatives"),
             derivative_cache_max_bytes: 1024,
             derivative_cache_low_watermark_bytes: 512,
-            session_secret: "test".to_string(),
             enable_file_watcher: false,
             watch_debounce_seconds: 20,
         }
-    }
-
-    #[test]
-    fn encrypted_secret_round_trips() {
-        let packed = encrypt_secret("test-secret", "session claims").unwrap();
-
-        assert_eq!(
-            decrypt_secret("test-secret", &packed).unwrap(),
-            "session claims"
-        );
-    }
-
-    #[test]
-    fn malformed_nonce_is_rejected_without_panicking() {
-        for nonce_len in [0, 1, 11, 13, 64] {
-            let packed = format!(
-                "{}.{}",
-                STANDARD.encode(vec![0_u8; nonce_len]),
-                STANDARD.encode(vec![0_u8; 16])
-            );
-            let result = catch_unwind(AssertUnwindSafe(|| decrypt_secret("test-secret", &packed)));
-
-            assert!(result.is_ok(), "nonce length {nonce_len} panicked");
-            assert!(result.unwrap().is_err());
-        }
-    }
-
-    #[test]
-    fn malformed_cookie_ciphertext_is_bounded_and_rejected() {
-        let short_ciphertext = format!(
-            "{}.{}",
-            STANDARD.encode([0_u8; 12]),
-            STANDARD.encode([0_u8; 15])
-        );
-        assert!(decrypt_secret("test-secret", &short_ciphertext).is_err());
-
-        let oversized = "a".repeat(16 * 1024 + 1);
-        assert!(decrypt_secret("test-secret", &oversized).is_err());
     }
 
     #[test]

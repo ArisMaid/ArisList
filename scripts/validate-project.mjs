@@ -25,8 +25,10 @@ const requiredFiles = [
   "frontend/package.json",
   "frontend/src/App.tsx",
   "frontend/src/audioQueue.ts",
+  "frontend/src/features/library/libraryLayout.ts",
+  "frontend/src/ui/motion.ts",
+  "frontend/src/ui/MotionProvider.tsx",
   "frontend/src/styles.css",
-  "frontend/public/assets/ambient-shelf.png",
   "docs/reference-research.md",
   "scripts/inspect-media.mjs",
   "scripts/perf/capture-baseline.mjs",
@@ -77,9 +79,6 @@ const requiredFiles = [
 ];
 
 const requiredRoutes = [
-  "/auth/session",
-  "/auth/login",
-  "/auth/logout",
   "/library",
   "/catalog/works",
   "/catalog/ownership",
@@ -305,10 +304,9 @@ n100EnvironmentLib.includes('"incomplete"')
   : fail("N100 environment preflight is incomplete or not fail-closed");
 const catalogWriterPromotion = readFileSync(join(root, "crates/server/src/catalog_writer.rs"), "utf8");
 routes.includes("change_catalog_ownership") &&
-routes.includes("require_csrf(&state, &headers, \"catalog.ownership\")") &&
-routes.includes("change_catalog_kind_ownership_checked") &&
-catalogWriterPromotion.includes("search_promotion_snapshot_in")
-  ? pass("catalog kind cutover is explicit, CSRF-protected, and audited")
+  routes.includes("change_catalog_kind_ownership_checked") &&
+  catalogWriterPromotion.includes("search_promotion_snapshot_in")
+  ? pass("catalog kind cutover is explicit and audited")
   : fail("catalog kind cutover control plane is missing its safety boundary");
 
 const catalogReconciliation = readFileSync(join(root, "crates/server/src/catalog_reconciliation.rs"), "utf8");
@@ -413,9 +411,15 @@ jobs.includes("enrichment_concurrency.clamp") && jobs.includes("claim_next_queue
 const config = readFileSync(join(root, "crates/server/src/config.rs"), "utf8");
 const envExample = readFileSync(join(root, ".env.example"), "utf8");
 const prewarmRunner = readFileSync(join(root, "scripts/perf/run-r1g-prewarm-ab.mjs"), "utf8");
-config.includes("APP_ADMIN_PASSWORD")
-  ? pass("admin password config is wired")
-  : fail("APP_ADMIN_PASSWORD config is missing");
+!config.includes("APP_ADMIN_PASSWORD") &&
+  !config.includes("admin-password") &&
+  !config.includes("SESSION_SECRET") &&
+  !compose.includes("APP_ADMIN_PASSWORD") &&
+  !compose.includes("SESSION_SECRET") &&
+  !envExample.includes("APP_ADMIN_PASSWORD") &&
+  !envExample.includes("SESSION_SECRET")
+  ? pass("admin password and session-secret mechanisms are removed")
+  : fail("admin password or session-secret configuration remains");
 config.includes("LIGHTNOVEL_API_BASES")
   ? pass("LightNovelShelf API bases are configurable")
   : fail("LIGHTNOVEL_API_BASES config is missing");
@@ -532,11 +536,6 @@ for (const needle of ["notify::recommended_watcher", "RecursiveMode::Recursive",
   const text = needle === "WATCH_DEBOUNCE_SECONDS" ? config : watcher;
   text.includes(needle) ? pass(`file watcher contains ${needle}`) : fail(`file watcher missing ${needle}`);
 }
-
-const auth = readFileSync(join(root, "crates/server/src/auth.rs"), "utf8");
-auth.includes("x-csrf-token") && auth.includes("media_shelf_session") && auth.includes("require_csrf")
-  ? pass("single-user session and CSRF guard are implemented")
-  : fail("session/CSRF guard is missing");
 
 const db = readFileSync(join(root, "crates/server/src/db.rs"), "utf8");
 const catalog = readFileSync(join(root, "crates/server/src/catalog.rs"), "utf8");
@@ -972,15 +971,13 @@ inventory.includes("enqueue_missing_gallery_catalog_events")
   ? pass("gallery inspector streams bounded directory snapshots through the fenced coordinator")
   : fail("gallery inspector chunk, finalize, path-safety, reconcile, or coordinator safeguards are incomplete");
 
-const protectedBackend = [
-  ["settings.rs", readFileSync(join(root, "crates/server/src/settings.rs"), "utf8"), "settings update", 'auth::require_csrf(&state, &headers, "settings.update")'],
-  ["routes.rs", routes, "scan", 'auth::require_csrf(&state, &headers, "scan")'],
-  ["enrich.rs", enrich, "enrich", 'auth::require_csrf(&state, &headers, "enrich")'],
-  ["assets.rs", assets, "asset generation", 'auth::require_csrf(&state, &headers, "assets.generate")']
-];
-for (const [file, text, label, needle] of protectedBackend) {
-  text.includes(needle) ? pass(`${label} is CSRF protected in ${file}`) : fail(`${label} is not CSRF protected in ${file}`);
-}
+!routes.includes("auth::") &&
+  !enrich.includes("auth::") &&
+  !assets.includes("auth::") &&
+  !search.includes("auth::") &&
+  !readFileSync(join(root, "crates/server/src/settings.rs"), "utf8").includes("auth::")
+  ? pass("backend no longer depends on administrator password authentication")
+  : fail("legacy administrator authentication remains in backend routes");
 searchOutbox.includes("claim_items") &&
 searchOutbox.includes("delete_term") &&
 searchOutbox.includes("writer.commit()") &&
@@ -1118,6 +1115,10 @@ const catalogHook = readFileSync(join(root, "frontend/src/catalog/useCatalog.ts"
 const novelReader = readFileSync(join(root, "frontend/src/components/NovelReader.tsx"), "utf8");
 const frontendStyles = readFileSync(join(root, "frontend/src/styles.css"), "utf8");
 const settingsModule = readFileSync(join(root, "crates/server/src/settings.rs"), "utf8");
+const libraryLayout = readFileSync(join(root, "frontend/src/features/library/libraryLayout.ts"), "utf8");
+const motionModule = readFileSync(join(root, "frontend/src/ui/motion.ts"), "utf8");
+const motionProvider = readFileSync(join(root, "frontend/src/ui/MotionProvider.tsx"), "utf8");
+const mainEntry = readFileSync(join(root, "frontend/src/main.tsx"), "utf8");
 settingsModule.includes("app-settings.json") && scanner.includes("load_settings") && scanner.includes("comic_roots") && scanner.includes("audio_roots")
   ? pass("settings-backed media directories are wired into scanner")
   : fail("settings-backed media directories are not wired into scanner");
@@ -1184,24 +1185,67 @@ frontend.includes("playlistRequestRef") &&
 frontend.includes("comicMode") && frontend.includes('"horizontal"') && frontend.includes("scrollLeft") && frontend.includes('data-mode={comicMode}')
   ? pass("frontend comic reader supports paged/scroll/horizontal/zoom/keyboard controls")
   : fail("frontend comic reader controls are incomplete");
-frontend.includes("readerDerivativesEnabled") &&
-  frontend.includes("getComicReaderPrefetchRadius") &&
-  frontend.includes("COMIC_READER_PREFETCH_LIMIT") &&
+frontend.includes("comic_prefetch_pages") &&
+  frontend.includes("Math.max(5, Math.min(10,") &&
+  frontend.includes("if (stopped || !success) break") &&
   frontend.includes("clearGalleryPreloads(comicPagePreloadsRef.current)") &&
-  frontend.includes("rememberGalleryPreload(cache, url")
-  ? pass("frontend comic reader uses derivative-gated, adaptive bounded page prefetch")
-  : fail("frontend comic reader page prefetch is missing its derivative gate or bound");
+  frontend.includes("for (const url of desired)")
+  ? pass("frontend comic reader uses bounded sequential 5-10 page prefetch")
+  : fail("frontend comic reader page prefetch is missing its sequential bound or cleanup");
 novelReader.includes('theme: "paper" | "dark" | "sepia"') &&
 novelReader.includes("data-theme={settings.theme}") &&
 novelReader.includes('updateSettings({ theme: "dark" })')
   ? pass("frontend EPUB reader theme toggle is wired")
   : fail("frontend EPUB reader theme toggle is missing");
-frontend.includes("SettingsOverlay") && frontend.includes("AppSettings") && frontend.includes("media_dirs") && frontend.includes("onSaveSettings")
-  ? pass("frontend settings panel manages theme, directories, and rescan")
+frontend.includes("SettingsOverlay") &&
+frontend.includes("AppSettings") &&
+frontend.includes("media_dirs") &&
+frontend.includes("onSaveSettings") &&
+!frontend.includes("onThemeChange") &&
+!frontend.includes("onAppearanceChange") &&
+!frontend.includes("updateAppearance")
+  ? pass("frontend settings panel manages directories, reader preferences, and rescan")
   : fail("frontend settings panel is incomplete");
-frontendStyles.includes(':root[data-theme="dark"]') && frontend.includes("onThemeChange")
-  ? pass("frontend light/dark theme toggle is wired")
-  : fail("frontend theme toggle is missing");
+frontend.includes("资源访问目录") &&
+  frontend.includes("容器挂载") &&
+  !frontend.includes("addDir") &&
+  !frontend.includes("removeDir") &&
+  settingsModule.includes("with_container_directories")
+  ? pass("resource directories are read-only and bound to container configuration")
+  : fail("resource directory settings are still editable or not container-bound");
+frontendStyles.includes("--ui-canvas") &&
+frontendStyles.includes("--ui-sidebar") &&
+frontendStyles.includes("--ui-shadow-float") &&
+frontendStyles.includes("@media (prefers-reduced-motion: reduce)") &&
+frontend.includes("getLibraryLayout") &&
+libraryLayout.includes("rowHeight") &&
+libraryLayout.includes('contentKind === "audio" ? 1 : 4 / 3') &&
+frontend.includes('contentKind={kind === "audio" ? "audio" : "portrait"}') &&
+frontendStyles.includes("aspect-ratio: 1 / var(--library-cover-ratio") &&
+motionModule.includes("uiEaseOut") &&
+motionProvider.includes('reducedMotion="user"') &&
+mainEntry.includes("MotionProvider") &&
+!frontendStyles.includes("backdrop-filter") &&
+!frontendStyles.includes("data-material") &&
+!frontendStyles.includes("ambient-shelf") &&
+!frontend.includes("GlassSurface") &&
+!frontend.includes("GlassFilterProvider")
+  ? pass("frontend uses the single soft-light UI foundation with shared motion and layout primitives")
+  : fail("frontend soft-light UI foundation or shared motion/layout primitives are missing");
+const removedUiPaths = [
+  "frontend/src/components/material/GlassSurface.tsx",
+  "frontend/src/components/material/GlassFilterProvider.tsx",
+  "frontend/src/components/material/index.ts",
+  "frontend/public/assets/ambient-shelf.png"
+];
+removedUiPaths.every((file) => !existsSync(join(root, file))) &&
+!settingsModule.includes("ThemeMode") &&
+!settingsModule.includes("UiMaterial") &&
+!settingsModule.includes("GlassIntensity") &&
+!settingsModule.includes("AppearanceSettings") &&
+!settingsModule.includes("appearance:")
+  ? pass("legacy application material files, asset, and settings fields are removed")
+  : fail("legacy application material files, asset, or settings fields remain");
 frontend.includes("setLocalSearch") && frontend.includes("api.search(needle") && frontend.includes("searchRank")
   ? pass("frontend local Tantivy search is used for bookshelf filtering")
   : fail("frontend local Tantivy search is not wired into filtering");
@@ -1228,9 +1272,12 @@ api.includes("meta_json: string")
 api.includes("updateProgress") && routes.includes("update_work_progress")
   ? pass("progress API client and backend writer are wired")
   : fail("progress API wiring is incomplete");
-api.includes("setCsrfToken") && api.includes('"x-csrf-token"') && frontend.includes("AuthControls")
-  ? pass("frontend admin login and CSRF client are wired")
-  : fail("frontend admin login/CSRF wiring is missing");
+!api.includes("setCsrfToken") &&
+  !api.includes("/api/auth") &&
+  !frontend.includes("AuthControls") &&
+  !frontend.includes("loginPassword")
+  ? pass("frontend administrator password and CSRF client are removed")
+  : fail("frontend administrator authentication UI or client remains");
 !frontend.includes("AssetGenerator") && !frontend.includes("queueGeneratedAsset")
   ? pass("frontend gpt-image asset generation UI is removed")
   : fail("frontend gpt-image asset generation UI should be removed");

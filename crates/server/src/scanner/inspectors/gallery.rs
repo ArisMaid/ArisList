@@ -168,6 +168,7 @@ fn inspect_blocking(
             root_generation: request.root_generation,
             scan_token: request.scan_token,
             complete_snapshot: false,
+            preserve_scanner_tags: false,
         },
         fingerprint: format!("{GALLERY_INSPECTOR_VERSION}:{fingerprint}"),
         work: WorkMutationFields {

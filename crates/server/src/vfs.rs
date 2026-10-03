@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::io::{BufWriter, Cursor, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -32,13 +31,9 @@ const MAX_REMOTE_THUMBNAIL_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_STRM_FILE_BYTES: u64 = 64 * 1024;
 const MAX_IMAGE_DECODE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
 const VALIDATED_CLOUD_CACHE_LIMIT: usize = 2_048;
-const STRM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const STRM_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const STRM_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const CACHE_USAGE_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 const REMOTE_DERIVED_CACHE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const CLOUD_CACHE_REVALIDATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const STRM_CLIENT_CACHE_LIMIT: usize = 32;
 
 static CACHE_WRITE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -49,9 +44,6 @@ static CLOUD_CACHE_QUOTAS: LazyLock<Mutex<HashMap<PathBuf, CloudCacheQuotaState>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLOUD_CACHE_VALIDATORS: LazyLock<Mutex<HashMap<PathBuf, CloudCacheValidator>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static STRM_CLIENTS: LazyLock<Mutex<HashMap<String, (reqwest::Client, Instant)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 #[derive(Default)]
 struct QmsRuntimeCounters {
     stream_requests: AtomicU64,
@@ -164,18 +156,23 @@ struct CloudCacheQuotaState {
     last_scan: Option<Instant>,
 }
 
-struct CloudCacheReservation {
+pub(crate) struct CloudCacheReservation {
     cache_dir: PathBuf,
     reserved: u64,
     active: bool,
 }
 
 impl CloudCacheReservation {
-    fn limit(&self) -> u64 {
+    pub(crate) fn limit(&self) -> u64 {
         self.reserved
     }
 
-    fn commit(mut self, actual: u64, replaced: u64, observed_dir_modified: Option<SystemTime>) {
+    pub(crate) fn commit(
+        mut self,
+        actual: u64,
+        replaced: u64,
+        observed_dir_modified: Option<SystemTime>,
+    ) {
         let mut quotas = CLOUD_CACHE_QUOTAS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -367,15 +364,17 @@ fn unique_qmediasync_mount_name(used: &mut Vec<String>) -> String {
     }
 }
 
-pub async fn qms_strm_meta_json(
+pub async fn qms_strm_meta_json_with_volumes(
     mount_name: &str,
     source_root: &Path,
     strm_path: &Path,
     relative_path: &str,
     target_url: &str,
+    volume_paths: &[String],
+    missing_volumes: &[String],
 ) -> Value {
     let metadata = tokio::fs::metadata(strm_path).await.ok();
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "provider": "qmediasync",
         "mount_name": mount_name,
         "source_root": source_root.to_string_lossy(),
@@ -387,7 +386,28 @@ pub async fn qms_strm_meta_json(
             .and_then(system_time_key),
         "strm_size": metadata.map(|meta| meta.len()),
         "target_url_hash": short_hash(target_url),
-    })
+    });
+    if !volume_paths.is_empty() {
+        value["volume_paths"] = serde_json::json!(volume_paths);
+        let volume_url_hashes = volume_paths
+            .iter()
+            .filter_map(|volume_path| {
+                let (volume_mount, relative) = parse_qms_strm_uri(volume_path).ok()?;
+                if volume_mount != mount_name {
+                    return None;
+                }
+                let path = source_root.join(relative.trim_start_matches('/'));
+                read_qms_strm_url(&path)
+                    .ok()
+                    .map(|target| short_hash(&target))
+            })
+            .collect::<Vec<_>>();
+        value["volume_url_hashes"] = serde_json::json!(volume_url_hashes);
+    }
+    if !missing_volumes.is_empty() {
+        value["missing_volumes"] = serde_json::json!(missing_volumes);
+    }
+    value
 }
 
 pub fn cloud_cache_key(asset: &Asset) -> String {
@@ -513,7 +533,7 @@ pub async fn asset_route_info(state: &AppState, asset: &Asset) -> Result<AssetRo
     let target_url = qms_target_url_for_asset(state, asset).await?;
     let parsed = Url::parse(&target_url)
         .map_err(|err| AppError::BadRequest(format!("invalid STRM URL: {err}")))?;
-    resolve_public_target(&parsed).await?;
+    crate::strm::http::validate_target(parsed.as_str()).await?;
     let qms_host = url_host(&settings.qmediasync.base_url);
     let target_host = url_host(&target_url);
     let via_qmediasync = qms_host.is_some() && qms_host == target_host;
@@ -587,9 +607,7 @@ pub async fn stream_qms_asset(
         }
     }
     if !(status.is_success() || status == StatusCode::RANGE_NOT_SATISFIABLE) {
-        return Err(AppError::Other(format!(
-            "qmediasync stream request failed: {status}"
-        )));
+        return Err(strm_response_error("qmediasync stream request", &response));
     }
     let mut builder = Response::builder()
         .status(status)
@@ -648,10 +666,10 @@ pub async fn generate_qms_thumbnail(
         .await?;
     let response = send_strm_get(&raw_url).await?;
     if !response.status().is_success() {
-        return Err(AppError::Other(format!(
-            "qmediasync thumbnail download failed: {}",
-            response.status()
-        )));
+        return Err(strm_response_error(
+            "qmediasync thumbnail download",
+            &response,
+        ));
     }
     reject_oversized_response(&response, MAX_REMOTE_THUMBNAIL_SOURCE_BYTES, "thumbnail")?;
     let expected_length = response.content_length();
@@ -870,28 +888,37 @@ fn try_reserve_cloud_capacity(
 }
 
 fn cloud_cache_usage(cache_dir: &Path) -> std::io::Result<u64> {
-    let mut total = 0_u64;
-    for entry in std::fs::read_dir(cache_dir)? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        if !file_type.is_file() {
-            continue;
+    fn visit(dir: &Path, total: &mut u64) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            if file_type.is_dir() {
+                visit(&entry.path(), total)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            *total = total.saturating_add(metadata.len());
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        total = total.saturating_add(metadata.len());
+        Ok(())
     }
+
+    let mut total = 0_u64;
+    visit(cache_dir, &mut total)?;
     Ok(total)
 }
 
@@ -962,6 +989,10 @@ fn remember_cloud_cache_validator(
 
 pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<PathBuf> {
     let strm_path = qms_strm_path_for_asset(state, &asset.path).await?;
+    let volume_paths = qms_asset_volume_paths(asset);
+    if volume_paths.len() > 1 {
+        return ensure_qms_volume_group_cached(state, asset, &volume_paths).await;
+    }
     let cache_dir = state.config.data_dir.join("cloud-cache");
     tokio::fs::create_dir_all(&cache_dir).await?;
     for _attempt in 0..3 {
@@ -1019,10 +1050,7 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
             return Ok(cache_path);
         }
         if !response.status().is_success() {
-            return Err(AppError::Other(format!(
-                "qmediasync cache download failed: {}",
-                response.status()
-            )));
+            return Err(strm_response_error("qmediasync cache download", &response));
         }
         reject_oversized_response(&response, MAX_CLOUD_CACHE_FILE_BYTES, "cloud cache")?;
         let response_headers = response.headers().clone();
@@ -1125,14 +1153,245 @@ pub async fn ensure_qms_asset_cached(state: &AppState, asset: &Asset) -> Result<
     ))
 }
 
+fn qms_asset_volume_paths(asset: &Asset) -> Vec<String> {
+    serde_json::from_str::<Value>(&asset.meta_json)
+        .ok()
+        .and_then(|value| value.get("volume_paths").cloned())
+        .and_then(|value| value.as_array().cloned())
+        .map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .filter(|value| is_qms_strm_uri(value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn ensure_qms_volume_group_cached(
+    state: &AppState,
+    asset: &Asset,
+    volume_paths: &[String],
+) -> Result<PathBuf> {
+    let cache_root = state.config.data_dir.join("cloud-cache");
+    tokio::fs::create_dir_all(&cache_root).await?;
+    let group_key = short_hash(&format!("strm-volume-group\0{}", cloud_cache_key(asset)));
+    let group_dir = cache_root.join(format!("strm-volume-{group_key}"));
+    tokio::fs::create_dir_all(&group_dir).await?;
+
+    let mut primary = None;
+    for (index, volume_uri) in volume_paths.iter().enumerate() {
+        let strm_path = qms_strm_path_for_asset(state, volume_uri).await?;
+        let raw_url = read_qms_strm_url_async(strm_path.clone()).await?;
+        let file_name = qms_volume_cache_name(&strm_path, index, &raw_url);
+        let cache_path = group_dir.join(file_name);
+        ensure_qms_volume_file_cached(state, &cache_root, &strm_path, &raw_url, &cache_path)
+            .await?;
+        if volume_uri == &asset.path || primary.is_none() {
+            primary = Some(cache_path);
+        }
+    }
+    primary.ok_or_else(|| {
+        AppError::Other("STRM volume group did not contain a primary file".to_string())
+    })
+}
+
+fn qms_volume_cache_name(strm_path: &Path, index: usize, raw_url: &str) -> String {
+    let name = strm_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .and_then(|value| value.strip_suffix(".strm"))
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 240
+                && !value.contains(['/', '\\'])
+                && !value.contains("..")
+                && !value.chars().any(|character| character.is_control())
+        });
+    name.map(ToOwned::to_owned).unwrap_or_else(|| {
+        let extension = qms_cache_extension(strm_path, raw_url);
+        format!("volume-{index}.{extension}")
+    })
+}
+
+async fn ensure_qms_volume_file_cached(
+    state: &AppState,
+    cache_root: &Path,
+    strm_path: &Path,
+    raw_url: &str,
+    cache_path: &Path,
+) -> Result<()> {
+    let extension = cache_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin")
+        .to_ascii_lowercase();
+    if valid_cloud_cache(state, cache_path, &extension).await?
+        && !cloud_cache_needs_revalidation(cache_path)?
+    {
+        QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+        return Ok(());
+    }
+    let lock = cache_write_lock(cache_path)?;
+    let _guard = lock.lock().await;
+    if valid_cloud_cache(state, cache_path, &extension).await?
+        && !cloud_cache_needs_revalidation(cache_path)?
+    {
+        QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+        return Ok(());
+    }
+    let _remote_lease = state
+        .resources
+        .reserve(ResourceClass::RemoteSource, 0, 0)
+        .await?;
+    let fresh_url = read_qms_strm_url_async(strm_path.to_path_buf()).await?;
+    if fresh_url != raw_url {
+        return Err(AppError::Other(
+            "STRM volume target changed while preparing the volume group".to_string(),
+        ));
+    }
+    let existing_valid = valid_cloud_cache(state, cache_path, &extension).await?;
+    let replaced_bytes = tokio::fs::metadata(cache_path)
+        .await
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let validator = existing_valid
+        .then(|| cloud_cache_validator(cache_path))
+        .transpose()?
+        .flatten();
+    let response = send_strm_get_conditional(&fresh_url, validator.as_ref()).await?;
+    if response.status() == StatusCode::NOT_MODIFIED && existing_valid {
+        remember_cloud_cache_validator(cache_path, response.headers())?;
+        QMS_RUNTIME
+            .cache_not_modified
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        QMS_RUNTIME.cache_hits.fetch_add(1, AtomicOrdering::Relaxed);
+        return Ok(());
+    }
+    if !response.status().is_success() {
+        return Err(strm_response_error("qmediasync volume download", &response));
+    }
+    reject_oversized_response(&response, MAX_CLOUD_CACHE_FILE_BYTES, "cloud cache volume")?;
+    let response_headers = response.headers().clone();
+    let expected_length = response.content_length();
+    let reservation = reserve_cloud_cache_capacity(
+        cache_root,
+        state.config.cloud_cache_max_bytes,
+        expected_length,
+    )
+    .await?;
+    let download_limit = reservation.limit();
+    let temp_path = unique_temp_path(cache_path)?;
+    let mut temp_cleanup = TempFileCleanup::new(temp_path.clone());
+    let mut file = tokio::fs::File::create_new(&temp_path).await?;
+    let mut stream = response.bytes_stream();
+    let mut downloaded = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                remove_temp_file(&temp_path).await;
+                return Err(error.into());
+            }
+        };
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > download_limit {
+            drop(file);
+            remove_temp_file(&temp_path).await;
+            return Err(AppError::Other(format!(
+                "qmediasync volume download exceeds its reserved {download_limit} bytes"
+            )));
+        }
+        file.write_all(&chunk).await?;
+    }
+    if downloaded == 0 {
+        drop(file);
+        remove_temp_file(&temp_path).await;
+        return Err(AppError::Other(
+            "qmediasync volume download was empty".to_string(),
+        ));
+    }
+    if let Some(expected) = expected_length {
+        if downloaded != expected {
+            drop(file);
+            remove_temp_file(&temp_path).await;
+            return Err(AppError::Other(format!(
+                "qmediasync volume length mismatch: expected {expected}, received {downloaded}"
+            )));
+        }
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    drop(file);
+    drop(_remote_lease);
+    if tokio::fs::try_exists(cache_path).await? {
+        tokio::fs::remove_file(cache_path).await?;
+    }
+    if let Err(error) = tokio::fs::rename(&temp_path, cache_path).await {
+        remove_temp_file(&temp_path).await;
+        return Err(error.into());
+    }
+    temp_cleanup.disarm();
+    let observed_dir_modified = tokio::fs::metadata(cache_root)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    reservation.commit(downloaded, replaced_bytes, observed_dir_modified);
+    remember_validated_cloud_cache(cache_path).await?;
+    remember_cloud_cache_validator(cache_path, &response_headers)?;
+    QMS_RUNTIME
+        .cache_downloads
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    QMS_RUNTIME
+        .cache_download_bytes
+        .fetch_add(downloaded, AtomicOrdering::Relaxed);
+    Ok(())
+}
+
+pub(crate) async fn reserve_strm_entry_cache_capacity(
+    state: &AppState,
+    expected_length: u64,
+) -> Result<CloudCacheReservation> {
+    let cache_dir = state.config.data_dir.join("cloud-cache");
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    reserve_cloud_cache_capacity(
+        &cache_dir,
+        state.config.cloud_cache_max_bytes,
+        Some(expected_length),
+    )
+    .await
+}
+
 async fn read_qms_strm_url_async(path: PathBuf) -> Result<String> {
     tokio::task::spawn_blocking(move || read_qms_strm_url(&path))
         .await
         .map_err(|err| AppError::Other(err.to_string()))?
 }
 
+fn strm_response_error(context: &str, response: &reqwest::Response) -> AppError {
+    let retry_after = crate::strm::http::retry_after_seconds(response);
+    match response.status() {
+        StatusCode::TOO_MANY_REQUESTS => AppError::Overloaded {
+            message: format!("{context} failed: remote source returned 429"),
+            retry_after_seconds: retry_after.unwrap_or(60),
+        },
+        StatusCode::FORBIDDEN => AppError::Overloaded {
+            message: format!("{context} failed: remote source returned 403"),
+            retry_after_seconds: retry_after.unwrap_or(5 * 60),
+        },
+        StatusCode::SERVICE_UNAVAILABLE => AppError::Overloaded {
+            message: format!("{context} failed: remote source returned 503"),
+            retry_after_seconds: retry_after.unwrap_or(30).max(30),
+        },
+        status => AppError::Other(format!("{context} failed: {status}")),
+    }
+}
+
 async fn send_strm_get(raw_url: &str) -> Result<reqwest::Response> {
-    send_strm_request(raw_url, None, None, None).await
+    crate::strm::http::send_get(raw_url, None, None, None, None).await
 }
 
 async fn send_strm_get_with_range(
@@ -1140,176 +1399,22 @@ async fn send_strm_get_with_range(
     range: Option<&str>,
     if_range: Option<&str>,
 ) -> Result<reqwest::Response> {
-    send_strm_request(raw_url, range, if_range, None).await
+    crate::strm::http::send_get(raw_url, range, if_range, None, None).await
 }
 
 async fn send_strm_get_conditional(
     raw_url: &str,
     validator: Option<&CloudCacheValidator>,
 ) -> Result<reqwest::Response> {
-    send_strm_request(raw_url, None, None, validator).await
-}
-
-async fn send_strm_request(
-    raw_url: &str,
-    range: Option<&str>,
-    if_range: Option<&str>,
-    validator: Option<&CloudCacheValidator>,
-) -> Result<reqwest::Response> {
-    let url = Url::parse(raw_url)
-        .map_err(|err| AppError::BadRequest(format!("invalid STRM URL: {err}")))?;
-    let addresses = resolve_public_target(&url).await?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("STRM URL has no host".to_string()))?;
-    let client = strm_client(&url, host, &addresses)?;
-    let mut request = client
-        .get(url)
-        .header(reqwest::header::ACCEPT_ENCODING, "identity");
-    if let Some(range) = range {
-        request = request.header(reqwest::header::RANGE, range);
-    }
-    if let Some(if_range) = if_range {
-        request = request.header(reqwest::header::IF_RANGE, if_range);
-    }
-    if let Some(validator) = validator {
-        if let Some(etag) = validator.etag.as_deref() {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        if let Some(last_modified) = validator.last_modified.as_deref() {
-            request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
-        }
-    }
-    let response = request.send().await?;
-    if response.status().is_redirection() {
-        return Err(AppError::BadRequest(
-            "STRM target redirects are disabled".to_string(),
-        ));
-    }
-    Ok(response)
-}
-
-fn strm_client(url: &Url, host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client> {
-    let mut address_keys = addresses
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    address_keys.sort();
-    let key = format!(
-        "{}://{}:{}|{}",
-        url.scheme(),
-        host,
-        url.port_or_known_default().unwrap_or_default(),
-        address_keys.join(",")
-    );
-    let mut clients = STRM_CLIENTS
-        .lock()
-        .map_err(|_| AppError::Other("STRM client cache poisoned".to_string()))?;
-    if let Some((client, used_at)) = clients.get_mut(&key) {
-        *used_at = Instant::now();
-        return Ok(client.clone());
-    }
-    let client = reqwest::Client::builder()
-        .user_agent("LocalMediaShelf/0.1 (+private local deployment)")
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .connect_timeout(STRM_CONNECT_TIMEOUT)
-        .timeout(STRM_REQUEST_TIMEOUT)
-        .resolve_to_addrs(host, addresses)
-        .build()?;
-    if clients.len() >= STRM_CLIENT_CACHE_LIMIT {
-        if let Some(oldest) = clients
-            .iter()
-            .min_by_key(|(_, (_, used_at))| *used_at)
-            .map(|(key, _)| key.clone())
-        {
-            clients.remove(&oldest);
-        }
-    }
-    clients.insert(key, (client.clone(), Instant::now()));
-    Ok(client)
-}
-
-async fn resolve_public_target(url: &Url) -> Result<Vec<SocketAddr>> {
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(AppError::BadRequest(
-            "STRM URL must use http or https".to_string(),
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(AppError::BadRequest(
-            "STRM URL credentials are not allowed".to_string(),
-        ));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| AppError::BadRequest("STRM URL has no host".to_string()))?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| AppError::BadRequest("STRM URL has no valid port".to_string()))?;
-    let addresses = tokio::time::timeout(STRM_DNS_TIMEOUT, tokio::net::lookup_host((host, port)))
-        .await
-        .map_err(|_| AppError::BadRequest("STRM host resolution timed out".to_string()))?
-        .map_err(|err| AppError::BadRequest(format!("STRM host resolution failed: {err}")))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(AppError::BadRequest(
-            "STRM host resolved to no addresses".to_string(),
-        ));
-    }
-    if let Some(address) = addresses.iter().find(|address| !is_public_ip(address.ip())) {
-        return Err(AppError::BadRequest(format!(
-            "STRM target address {} is not public",
-            address.ip()
-        )));
-    }
-    Ok(addresses)
-}
-
-fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => is_public_ipv4(ip),
-        IpAddr::V6(ip) => is_public_ipv6(ip),
-    }
-}
-
-fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    !(ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || ip.is_broadcast()
-        || a == 0
-        || a == 100 && (64..=127).contains(&b)
-        || a == 192 && b == 0 && c == 0
-        || a == 192 && b == 0 && c == 2
-        || a == 198 && b == 18
-        || a == 198 && b == 19
-        || a == 198 && b == 51 && c == 100
-        || a == 203 && b == 0 && c == 113
-        || a >= 240)
-}
-
-fn is_public_ipv6(ip: Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    if let Some(ipv4) = ip.to_ipv4() {
-        return is_public_ipv4(ipv4);
-    }
-    if (segments[0] & 0xe000) != 0x2000 {
-        return false;
-    }
-    if segments[0] == 0x2001 && (segments[1] <= 0x01ff || segments[1] == 0x0db8) {
-        return false;
-    }
-    if segments[0] == 0x2002 {
-        return false;
-    }
-    if segments[0] == 0x3fff && segments[1] < 0x1000 {
-        return false;
-    }
-    true
+    let (etag, last_modified) = validator
+        .map(|validator| {
+            (
+                validator.etag.as_deref(),
+                validator.last_modified.as_deref(),
+            )
+        })
+        .unwrap_or((None, None));
+    crate::strm::http::send_get(raw_url, None, None, etag, last_modified).await
 }
 
 fn cache_write_lock(path: &Path) -> Result<Arc<AsyncMutex<()>>> {
@@ -1628,10 +1733,16 @@ mod tests {
             "2002:c0a8:1::1",
             "3fff::1",
         ] {
-            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+            assert!(
+                !crate::strm::http::is_public_ip(address.parse().unwrap()),
+                "{address}"
+            );
         }
         for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
-            assert!(is_public_ip(address.parse().unwrap()), "{address}");
+            assert!(
+                crate::strm::http::is_public_ip(address.parse().unwrap()),
+                "{address}"
+            );
         }
     }
 

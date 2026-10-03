@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_stream::stream;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue};
+use axum::http::{header, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -14,12 +14,11 @@ use base64::Engine;
 use chrono::Utc;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
 use crate::assets;
-use crate::auth;
 use crate::catalog;
 use crate::catalog_reconciliation;
 use crate::catalog_writer::CATALOG_KINDS;
@@ -94,10 +93,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/catalog/counts", get(catalog::counts))
         .route("/catalog/history", get(catalog::history))
         .route("/inventory/status", get(inventory::status))
-        .route("/auth/session", get(auth::session))
-        .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout))
-        .route("/auth/password", patch(auth::change_password))
         .route("/library", get(library))
         .route("/jobs", get(jobs))
         .route("/history", get(history))
@@ -154,6 +149,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(assets::stream_asset).head(assets::head_asset),
         )
         .route("/assets/{id}/route", get(assets::asset_route))
+        .route("/assets/{id}/prepare", post(crate::strm::jobs::prepare))
+        .route("/assets/{id}/diagnose", post(crate::strm::jobs::diagnose))
+        .route("/strm/tasks/{id}", get(crate::strm::jobs::get))
+        .route(
+            "/strm/tasks/{id}/password",
+            post(crate::strm::jobs::set_password),
+        )
+        .route("/strm/tasks/{id}/cancel", post(crate::strm::jobs::cancel))
         .route(
             "/assets/{id}/thumb",
             get(assets::thumb_asset).head(assets::reject_expensive_head),
@@ -405,10 +408,8 @@ struct CatalogOwnershipRequest {
 async fn change_catalog_ownership(
     State(state): State<Arc<AppState>>,
     Path(kind): Path<String>,
-    headers: HeaderMap,
     Json(input): Json<CatalogOwnershipRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.ownership").await?;
     let kind = kind.trim().to_ascii_lowercase();
     if !CATALOG_KINDS.contains(&kind.as_str()) {
         return Err(AppError::BadRequest(format!(
@@ -502,9 +503,7 @@ async fn catalog_reconciliation_status(
 
 async fn reconcile_catalog_novel(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
     let (job_id, created) = state
         .db
         .create_job_if_absent(
@@ -530,9 +529,7 @@ async fn reconcile_catalog_novel(
 
 async fn reconcile_catalog_comic(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
     let (job_id, created) = state
         .db
         .create_job_if_absent(
@@ -558,9 +555,7 @@ async fn reconcile_catalog_comic(
 
 async fn reconcile_catalog_coser_picture(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
     let (job_id, created) = state
         .db
         .create_job_if_absent(
@@ -586,9 +581,7 @@ async fn reconcile_catalog_coser_picture(
 
 async fn reconcile_catalog_audio(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
     let (job_id, created) = state
         .db
         .create_job_if_absent(
@@ -614,9 +607,7 @@ async fn reconcile_catalog_audio(
 
 async fn reconcile_catalog_gallery(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
-    let _claims = auth::require_csrf(&state, &headers, "catalog.reconciliation").await?;
     let (job_id, created) = state
         .db
         .create_job_if_absent(
@@ -883,11 +874,8 @@ struct QmsStrmRootTestRequest {
 }
 
 async fn test_qms_strm_root(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(input): Json<QmsStrmRootTestRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::require_csrf(&state, &headers, "cloud.qmediasync.test-strm-root").await?;
     let root = std::path::PathBuf::from(input.root.trim());
     if input.root.trim().is_empty() {
         return Err(AppError::BadRequest("STRM root is required".to_string()));
@@ -942,15 +930,104 @@ async fn test_qms_strm_root(
     .await??;
     Ok(Json(json!({
         "status": "ok",
+        "scope": "local-directory",
+        "remote_checked": false,
         "root": root.to_string_lossy(),
         "works": work_count,
         "strm_files": strm_files,
         "samples": samples,
+        "message": "仅检查本地 STRM 文件与目录，不发起远程请求",
     })))
 }
 
 async fn cloud_status(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>> {
     let settings = settings::load_settings(&state.config).await?;
+    let mut source_specs = Vec::new();
+    for kind in ["comic", "novel", "audio", "gallery", "coser-picture"] {
+        for source in crate::vfs::qmediasync_scan_sources(&settings, kind) {
+            let origin = if settings.media_sources.iter().any(|configured| {
+                configured.enabled
+                    && configured.kind == source.kind
+                    && configured.provider == source.provider
+                    && configured.mount_name == source.mount_name
+                    && configured.root == source.root
+            }) {
+                "explicit"
+            } else if state
+                .config
+                .qmediasync_strm_dir
+                .as_ref()
+                .is_some_and(|root| root == std::path::Path::new(&source.root))
+            {
+                "env"
+            } else {
+                "legacy"
+            };
+            source_specs.push((
+                source.kind,
+                source.provider,
+                source.mount_name,
+                source.root,
+                source.scan_depth,
+                origin.to_string(),
+            ));
+        }
+    }
+    let source_details = run_filesystem_inspection(move || {
+        source_specs
+            .into_iter()
+            .map(|(kind, provider, mount_name, root, scan_depth, origin)| {
+                let path = std::path::PathBuf::from(&root);
+                let readable = path.is_dir() && std::fs::read_dir(&path).is_ok();
+                let mut discovered = 0_u64;
+                if readable {
+                    discovered = WalkDir::new(&path)
+                        .min_depth(1)
+                        .max_depth(scan_depth.clamp(1, 64))
+                        .into_iter()
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| entry.file_type().is_file())
+                        .filter(|entry| {
+                            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                            match kind.as_str() {
+                                "comic" => name.ends_with(".strm") || name.ends_with(".cbz"),
+                                "novel" => name.ends_with(".strm") || name.ends_with(".epub"),
+                                "audio" => [
+                                    ".strm", ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac",
+                                    ".opus", ".zip", ".rar", ".7z",
+                                ]
+                                .iter()
+                                .any(|suffix| name.ends_with(suffix)),
+                                "gallery" => [
+                                    ".strm", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif",
+                                    ".bmp",
+                                ]
+                                .iter()
+                                .any(|suffix| name.ends_with(suffix)),
+                                "coser-picture" => {
+                                    name.ends_with(".strm") || name.ends_with(".zip")
+                                }
+                                _ => false,
+                            }
+                        })
+                        .count() as u64;
+                }
+                json!({
+                    "kind": kind,
+                    "provider": provider,
+                    "mount_name": mount_name,
+                    "root": root,
+                    "source": origin,
+                    "scan_depth": scan_depth,
+                    "readable": readable,
+                    "status": if readable { "ready" } else { "failed" },
+                    "discovered": discovered,
+                    "message": if readable { Value::Null } else { json!("源目录不可读或不存在") },
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
     let cache_dir = state.config.data_dir.join("cloud-cache");
     let (cache_bytes, cache_files) = run_filesystem_inspection(move || {
         let mut cache_bytes = 0_u64;
@@ -980,6 +1057,7 @@ async fn cloud_status(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
                     || settings.media_sources.iter().any(|source| source.provider == "qmediasync" && source.enabled)),
             "sources": settings.media_sources.iter().filter(|source| source.provider == "qmediasync" && source.enabled).count(),
             "strm_roots": settings.qmediasync.strm_roots.len(),
+            "source_details": source_details,
         },
         "cache": {
             "bytes": cache_bytes,
@@ -991,10 +1069,8 @@ async fn cloud_status(State(state): State<Arc<AppState>>) -> Result<Json<serde_j
 
 async fn scan(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(input): Json<ScanRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::require_csrf(&state, &headers, "scan").await?;
     let configured = settings::load_settings(&state.config).await?;
     let enqueue_enrichment = input
         .enqueue_enrichment

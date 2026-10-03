@@ -2383,14 +2383,15 @@ async fn query_collections_with_candidates(
                 ) AS cover_asset_id
             FROM grouped
         )
-        SELECT * FROM summaries
+        SELECT summaries.*, single_work.title AS single_title, single_work.subtitle AS single_subtitle
+        FROM summaries JOIN works AS single_work ON single_work.id = summaries.first_work_id
         WHERE 1 = 1
         "#,
     );
     if cursor.is_some() {
-        sql.push_str(" AND (updated_at < ? OR (updated_at = ? AND collection_key > ?))");
+        sql.push_str(" AND (summaries.updated_at < ? OR (summaries.updated_at = ? AND summaries.collection_key > ?))");
     }
-    sql.push_str(" ORDER BY updated_at DESC, collection_key ASC LIMIT ?");
+    sql.push_str(" ORDER BY summaries.updated_at DESC, summaries.collection_key ASC LIMIT ?");
 
     let mut statement = sqlx::query(&sql);
     if !filter.tags.is_empty() {
@@ -2450,8 +2451,16 @@ async fn query_collections_with_candidates(
                 } else {
                     base_kind.clone()
                 },
-                title: title.unwrap_or_else(|| "未命名合集".to_string()),
-                subtitle: collection_subtitle(&base_kind, work_count),
+                title: if work_count == 1 {
+                    row.get("single_title")
+                } else {
+                    title.unwrap_or_else(|| "未命名合集".to_string())
+                },
+                subtitle: if work_count == 1 {
+                    row.get("single_subtitle")
+                } else {
+                    collection_subtitle(&base_kind, work_count)
+                },
                 cover_asset_id: row.get("cover_asset_id"),
                 cover_version: updated_at.to_rfc3339(),
                 progress: row.get("progress"),
@@ -5162,7 +5171,7 @@ mod tests {
         let alice_collection = collections
             .items
             .iter()
-            .find(|item| item.title == "Alice")
+            .find(|item| item.title == "Alice volume")
             .unwrap()
             .collection_key
             .clone();

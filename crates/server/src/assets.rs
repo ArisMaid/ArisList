@@ -27,13 +27,13 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::auth;
 use crate::derivative::{DerivativeFile, DerivativeKey};
 use crate::error::{AppError, Result};
 use crate::models::Asset;
 use crate::resource::{ResourceBufferLease, ResourceClass, ResourceGovernor};
 use crate::scanner::{image_name, naturalish_key};
 use crate::security::path_mime;
+use crate::strm::{archive as strm_archive, cache as strm_cache, source as strm_source};
 use crate::vfs;
 use crate::AppState;
 
@@ -448,22 +448,17 @@ struct ComicArchivePool {
     next: AtomicUsize,
 }
 
-pub async fn stream_asset(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-    Query(query): Query<VersionQuery>,
-    headers: HeaderMap,
+async fn stream_local_file(
+    state: &AppState,
+    path: &FsPath,
+    mime: &str,
+    headers: &HeaderMap,
+    cache_control: &str,
 ) -> Result<Response> {
-    let asset = state.db.asset(id).await?;
-    if vfs::is_qms_strm_uri(&asset.path) {
-        return vfs::stream_qms_asset(state, asset, headers).await;
-    }
-    let path = vfs::local_asset_path(&state, &asset.path).await?;
-    let mut file = tokio::fs::File::open(&path).await?;
+    let mut file = tokio::fs::File::open(path).await?;
     let size = file.metadata().await?.len();
-    let cache_control = media_cache_control(query.v.as_deref());
 
-    match parse_byte_range(&headers, size) {
+    match parse_byte_range(headers, size) {
         ByteRange::Range { start, end } => {
             let length = end - start + 1;
             file.seek(SeekFrom::Start(start)).await?;
@@ -478,7 +473,7 @@ pub async fn stream_asset(
             let body = Body::from_stream(leased_local_file_stream(file.take(length), lease));
             return Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, asset.mime)
+                .header(header::CONTENT_TYPE, mime)
                 .header(header::CACHE_CONTROL, cache_control)
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_LENGTH, length.to_string())
@@ -509,12 +504,177 @@ pub async fn stream_asset(
     let body = Body::from_stream(leased_local_file_stream(file, lease));
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, asset.mime)
+        .header(header::CONTENT_TYPE, mime)
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, size.to_string())
         .body(body)
         .map_err(|e| AppError::Other(e.to_string()))
+}
+
+pub async fn stream_asset(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(query): Query<VersionQuery>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    let asset = state.db.asset(id).await?;
+    if is_strm_entry_asset(&asset) {
+        return stream_strm_entry_asset(&state, &asset, &headers, &query).await;
+    }
+    if vfs::is_qms_strm_uri(&asset.path) {
+        return vfs::stream_qms_asset(state, asset, headers).await;
+    }
+    let path = vfs::local_asset_path(&state, &asset.path).await?;
+    let cache_control = media_cache_control(query.v.as_deref());
+    stream_local_file(&state, &path, &asset.mime, &headers, cache_control).await
+}
+
+fn is_strm_entry_asset(asset: &Asset) -> bool {
+    serde_json::from_str::<serde_json::Value>(&asset.meta_json)
+        .ok()
+        .and_then(|meta| meta.get("strm_entry").and_then(|value| value.as_bool()))
+        .unwrap_or(false)
+}
+
+async fn stream_strm_entry_asset(
+    state: &AppState,
+    asset: &Asset,
+    headers: &HeaderMap,
+    query: &VersionQuery,
+) -> Result<Response> {
+    let meta: serde_json::Value = serde_json::from_str(&asset.meta_json)
+        .map_err(|error| AppError::Other(format!("invalid STRM entry metadata: {error}")))?;
+    let parent_id = meta
+        .get("archive_asset_id")
+        .and_then(|value| value.as_i64())
+        .ok_or_else(|| AppError::Other("STRM entry has no parent archive".to_string()))?;
+    let entry_name = meta
+        .get("entry_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::Other("STRM entry has no archive path".to_string()))?;
+    let parent = state.db.asset(parent_id).await?;
+    let relation = state
+        .db
+        .archive_asset_entry(parent.id, entry_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound("STRM entry relation not found".to_string()))?;
+    let destination = FsPath::new(&relation.entry_path).to_path_buf();
+    let prepared = if let Some((target_url, manifest)) =
+        remote_archive_manifest(state, &parent).await?
+    {
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.name == entry_name)
+            .ok_or_else(|| {
+                AppError::NotFound(format!("remote archive entry {entry_name} not found"))
+            })?;
+        if entry.encrypted {
+            let archive_path = vfs::ensure_qms_asset_cached(state, &parent).await?;
+            let entries = strm_archive::list_seven_zip_entries(&archive_path).await?;
+            let entry = entries
+                .into_iter()
+                .find(|entry| entry.name == entry_name)
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("archive entry {entry_name} not found"))
+                })?;
+            let password = crate::strm::jobs::password_for_asset(parent.id);
+            strm_archive::prepare_seven_zip_entry(
+                &archive_path,
+                &entry,
+                &destination,
+                password.as_deref(),
+                None,
+            )
+            .await?
+        } else {
+            prepare_remote_strm_entry(state, &target_url, &manifest, entry, &destination).await?
+        }
+    } else {
+        let archive_path = vfs::ensure_qms_asset_cached(state, &parent).await?;
+        let target_url = vfs::qms_target_url_for_asset(state, &parent).await?;
+        let extension = strm_source::extension_from_target(&target_url).unwrap_or("zip");
+        match strm_archive::support_for_extension(extension) {
+            strm_archive::ArchiveSupport::Zip => {
+                match strm_archive::prepare_local_zip_entry(&archive_path, entry_name, &destination)
+                    .await
+                {
+                    Ok(path) => path,
+                    Err(_zip_error) if strm_archive::seven_zip_available().await => {
+                        let entry = strm_archive::list_seven_zip_entries(&archive_path)
+                            .await?
+                            .into_iter()
+                            .find(|entry| entry.name == entry_name)
+                            .ok_or_else(|| {
+                                AppError::NotFound(format!("archive entry {entry_name} not found"))
+                            })?;
+                        let password = crate::strm::jobs::password_for_asset(parent.id);
+                        strm_archive::prepare_seven_zip_entry(
+                            &archive_path,
+                            &entry,
+                            &destination,
+                            password.as_deref(),
+                            None,
+                        )
+                        .await?
+                    }
+                    Err(zip_error) => return Err(zip_error),
+                }
+            }
+            strm_archive::ArchiveSupport::SevenZip | strm_archive::ArchiveSupport::Rar => {
+                let entries = strm_archive::list_seven_zip_entries(&archive_path).await?;
+                let entry = entries
+                    .into_iter()
+                    .find(|entry| entry.name == entry_name)
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!("archive entry {entry_name} not found"))
+                    })?;
+                let password = crate::strm::jobs::password_for_asset(parent.id);
+                strm_archive::prepare_seven_zip_entry(
+                    &archive_path,
+                    &entry,
+                    &destination,
+                    password.as_deref(),
+                    None,
+                )
+                .await?
+            }
+            strm_archive::ArchiveSupport::Unsupported => {
+                return Err(strm_archive::unsupported_archive_error(extension));
+            }
+        }
+    };
+    stream_local_file(
+        state,
+        &prepared,
+        &asset.mime,
+        headers,
+        media_cache_control(query.v.as_deref()),
+    )
+    .await
+}
+
+async fn prepare_remote_strm_entry(
+    state: &AppState,
+    target_url: &str,
+    manifest: &strm_archive::RemoteArchiveManifest,
+    entry: &strm_archive::RemoteArchiveEntry,
+    destination: &FsPath,
+) -> Result<PathBuf> {
+    if tokio::fs::try_exists(destination).await? {
+        return strm_archive::prepare_entry(target_url, manifest, entry, destination).await;
+    }
+    let reservation =
+        vfs::reserve_strm_entry_cache_capacity(state, entry.uncompressed_size).await?;
+    let prepared = strm_archive::prepare_entry(target_url, manifest, entry, destination).await?;
+    let actual = tokio::fs::metadata(&prepared).await?.len();
+    let observed_dir_modified = destination
+        .parent()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok());
+    reservation.commit(actual, 0, observed_dir_modified);
+    Ok(prepared)
 }
 
 pub async fn head_asset(
@@ -523,6 +683,9 @@ pub async fn head_asset(
     Query(query): Query<VersionQuery>,
 ) -> Result<Response> {
     let asset = state.db.asset(id).await?;
+    if is_strm_entry_asset(&asset) {
+        return reject_expensive_head().await;
+    }
     if vfs::is_qms_strm_uri(&asset.path) {
         return reject_expensive_head().await;
     }
@@ -910,6 +1073,14 @@ async fn cached_archive_cover(
     size: u32,
     cache_control: &'static str,
 ) -> Result<Response> {
+    if vfs::is_qms_strm_uri(&archive.path) {
+        if let Some(response) =
+            cached_remote_archive_cover(&state, work_id, &archive, &cache_dir, size, cache_control)
+                .await?
+        {
+            return Ok(response);
+        }
+    }
     let path = vfs::asset_local_processing_path(&state, &archive).await?;
     let metadata = tokio::fs::metadata(&path).await?;
     let modified = metadata
@@ -1011,6 +1182,79 @@ async fn cached_archive_cover(
             tracing::warn!(asset_id = archive.id, error = %err, "archive cover thumbnail generation failed; serving a retryable placeholder");
             thumbnail_placeholder_response(size)
         }
+    }
+}
+
+async fn cached_remote_archive_cover(
+    state: &AppState,
+    work_id: i64,
+    archive: &Asset,
+    cache_dir: &FsPath,
+    size: u32,
+    cache_control: &'static str,
+) -> Result<Option<Response>> {
+    let Some((target_url, manifest)) = remote_archive_manifest(state, archive).await? else {
+        return Ok(None);
+    };
+    let mut entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.directory && strm_source::classify(FsPath::new(&entry.name), None).is_image()
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_cached_key(|entry| naturalish_key(&entry.name));
+    let Some(entry) = entries.first() else {
+        return Err(AppError::NotFound(
+            "remote archive cover page not found".to_string(),
+        ));
+    };
+    let entry_path = strm_cache::entry_cache_path(
+        &state.config.data_dir,
+        &archive.id.to_string(),
+        &manifest.source_version,
+        &entry.name,
+    );
+    let entry_path =
+        prepare_remote_strm_entry(state, &target_url, &manifest, entry, &entry_path).await?;
+    let cache_path = cache_dir.join(format!(
+        "work-{work_id}-archive-{}-{size}-{}.jpg",
+        archive.id,
+        short_hash(&format!("{}:{}", manifest.source_version, entry.name))
+    ));
+    if valid_thumbnail_cache(&cache_path).await? {
+        return Ok(Some(stream_thumb_cache(cache_path, cache_control).await?));
+    }
+    let write_lock = thumbnail_write_lock(&cache_path)?;
+    let write_guard = write_lock.lock_owned().await;
+    if valid_thumbnail_cache(&cache_path).await? {
+        return Ok(Some(stream_thumb_cache(cache_path, cache_control).await?));
+    }
+    let generated = match reserve_thumbnail_cache_capacity(
+        &cache_path,
+        state.config.thumbnail_cache_max_bytes_per_dir,
+    )
+    .await
+    {
+        Ok(reservation) => {
+            let jpeg_downscale_enabled = state.config.jpeg_thumbnail_downscale_enabled;
+            run_blocking_thumbnail_generation(
+                state.resources.clone(),
+                write_guard,
+                reservation,
+                cache_path.clone(),
+                move |cache_path| {
+                    generate_thumbnail_atomic(&entry_path, cache_path, size, jpeg_downscale_enabled)
+                },
+            )
+            .await
+            .map_err(|error| AppError::Other(error.to_string()))
+        }
+        Err(error) => Err(error),
+    };
+    match generated {
+        Ok(()) => Ok(Some(stream_thumb_cache(cache_path, cache_control).await?)),
+        Err(error) => Err(error),
     }
 }
 
@@ -1722,6 +1966,74 @@ pub struct ComicPageInfo {
     pub height: Option<u32>,
 }
 
+async fn remote_archive_manifest(
+    state: &AppState,
+    archive: &Asset,
+) -> Result<Option<(String, strm_archive::RemoteArchiveManifest)>> {
+    if !vfs::is_qms_strm_uri(&archive.path) {
+        return Ok(None);
+    }
+    let target_url = vfs::qms_target_url_for_asset(state, archive).await?;
+    let manifest = match strm_archive::cached_manifest(&target_url) {
+        Some(manifest) => manifest,
+        None => {
+            if let Some(manifest) =
+                strm_archive::load_persisted_manifest(&state.db, &target_url).await?
+            {
+                strm_archive::remember_manifest(&target_url, manifest.clone());
+                manifest
+            } else {
+                match strm_archive::probe_manifest(&target_url).await? {
+                    strm_archive::ManifestProbe::Ready(manifest) => {
+                        strm_archive::remember_manifest(&target_url, manifest.clone());
+                        let cache_limit =
+                            state.resources.snapshot().archive_manifest_cache_bytes / 2;
+                        if let Err(error) = strm_archive::persist_manifest(
+                            &state.db,
+                            &target_url,
+                            &manifest,
+                            cache_limit,
+                        )
+                        .await
+                        {
+                            tracing::debug!(
+                                error = %error,
+                                "failed to persist remote STRM archive manifest"
+                            );
+                        }
+                        manifest
+                    }
+                    strm_archive::ManifestProbe::RequiresFullCache { .. } => return Ok(None),
+                }
+            }
+        }
+    };
+    if !manifest.range_supported {
+        return Ok(None);
+    }
+    Ok(Some((target_url, manifest)))
+}
+
+fn remote_comic_pages(manifest: &strm_archive::RemoteArchiveManifest) -> Vec<ComicPageInfo> {
+    let mut names = manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.directory && strm_source::classify(FsPath::new(&entry.name), None).is_image()
+        })
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    names.sort_by_cached_key(|name| naturalish_key(name));
+    names
+        .into_iter()
+        .map(|name| ComicPageInfo {
+            name,
+            width: None,
+            height: None,
+        })
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ComicPagesQuery {
     pub cursor: Option<usize>,
@@ -1739,8 +2051,12 @@ pub async fn comic_pages(
         kind,
         meta_json,
     } = state.db.work_archive_and_meta(work_id).await?;
-    let path = vfs::asset_local_processing_path(&state, &archive).await?;
-    let pages = cached_cbz_page_manifest(&state, &path).await?;
+    let pages = if let Some((_, manifest)) = remote_archive_manifest(&state, &archive).await? {
+        Arc::new(remote_comic_pages(&manifest))
+    } else {
+        let path = vfs::asset_local_processing_path(&state, &archive).await?;
+        cached_cbz_page_manifest(&state, &path).await?
+    };
     if let Err(err) =
         maybe_update_comic_page_count(&state, work_id, &kind, &meta_json, pages.len()).await
     {
@@ -2407,6 +2723,11 @@ pub async fn stream_comic_page(
         .work_asset_by_role(work_id, "archive", None)
         .await?;
     let remote_archive = vfs::is_qms_strm_uri(&archive.path);
+    if remote_archive {
+        if let Some(response) = stream_remote_comic_page(&state, &archive, page).await? {
+            return Ok(response);
+        }
+    }
     let path = vfs::asset_local_processing_path(&state, &archive).await?;
     let cached = cached_cbz_pages(&state, &path).await?;
     let name = cached
@@ -2511,6 +2832,66 @@ pub async fn stream_comic_page(
             }
         }))
         .map_err(|err| AppError::Other(err.to_string()))
+}
+
+async fn stream_remote_comic_page(
+    state: &AppState,
+    archive: &Asset,
+    page: usize,
+) -> Result<Option<Response>> {
+    let Some((target_url, manifest)) = remote_archive_manifest(state, archive).await? else {
+        return Ok(None);
+    };
+    let mut entries = manifest
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.directory && strm_source::classify(FsPath::new(&entry.name), None).is_image()
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_cached_key(|entry| naturalish_key(&entry.name));
+    let Some(entry) = entries.get(page) else {
+        return Err(AppError::NotFound(format!("page {page} not found")));
+    };
+    let cache_path = strm_cache::entry_cache_path(
+        &state.config.data_dir,
+        &archive.id.to_string(),
+        &manifest.source_version,
+        &entry.name,
+    );
+    let page_directory = state
+        .config
+        .data_dir
+        .join("cloud-cache")
+        .join("reader-pages");
+    let cache_path = page_directory.join(
+        cache_path
+            .file_name()
+            .ok_or_else(|| AppError::Other("invalid comic page cache path".to_string()))?,
+    );
+    let mime = path_mime(FsPath::new(&entry.name));
+    // Warm pages must not wait behind an unrelated prefetch download.
+    if strm_cache::touch_page(&cache_path).await.is_ok() {
+        if let Ok(response) =
+            stream_local_file(state, &cache_path, &mime, &HeaderMap::new(), MEDIA_NO_CACHE).await
+        {
+            return Ok(Some(response));
+        }
+    }
+    let _page_gate = strm_cache::PAGE_CACHE_GATE.lock().await;
+    let exists = tokio::fs::try_exists(&cache_path).await?;
+    strm_cache::reserve_page_space(
+        &page_directory,
+        if exists { 0 } else { entry.uncompressed_size },
+        &cache_path,
+    )
+    .await?;
+    let prepared = strm_archive::prepare_entry(&target_url, &manifest, entry, &cache_path).await?;
+    strm_cache::touch_page(&prepared).await?;
+    let mime = path_mime(FsPath::new(&entry.name));
+    let response =
+        stream_local_file(state, &prepared, &mime, &HeaderMap::new(), MEDIA_NO_CACHE).await?;
+    Ok(Some(response))
 }
 
 #[derive(Debug, Serialize)]
@@ -3498,10 +3879,8 @@ pub struct GenerateAssetRequest {
 
 pub async fn generate_asset_job(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(input): Json<GenerateAssetRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    auth::require_csrf(&state, &headers, "assets.generate").await?;
     if input.prompt.trim().is_empty() {
         return Err(AppError::BadRequest("prompt is required".to_string()));
     }
@@ -3573,9 +3952,6 @@ mod tests {
             gallery_dir: temp.path().join("gallery"),
             coser_picture_dir: temp.path().join("coser-picture"),
             generated_dir: temp.path().join("generated"),
-            app_admin_password: "admin".to_string(),
-            admin_password_persisted: false,
-            admin_password_ephemeral: false,
             lightnovel_api_bases: Vec::new(),
             lightnovel_access_token: None,
             enrichment_concurrency: 1,
@@ -3583,6 +3959,7 @@ mod tests {
             openai_api_key: None,
             openai_image_model: "gpt-image-2".to_string(),
             qmediasync_base_url: String::new(),
+            qmediasync_strm_dir: None,
             cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
             thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
             catalog_v2_enabled: true,
@@ -3598,7 +3975,6 @@ mod tests {
             derivative_cache_dir: temp.path().join("derivatives"),
             derivative_cache_max_bytes: 1024 * 1024,
             derivative_cache_low_watermark_bytes: 512 * 1024,
-            session_secret: "test-secret".to_string(),
             enable_file_watcher: false,
             watch_debounce_seconds: 20,
         }
@@ -3663,8 +4039,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let response = thumb_asset(
@@ -3765,9 +4139,6 @@ mod tests {
                 gallery_dir: temp.path().join("图库"),
                 coser_picture_dir: temp.path().join("COS图"),
                 generated_dir,
-                app_admin_password: "admin".to_string(),
-                admin_password_persisted: false,
-                admin_password_ephemeral: false,
                 lightnovel_api_bases: Vec::new(),
                 lightnovel_access_token: None,
                 enrichment_concurrency: 1,
@@ -3775,6 +4146,7 @@ mod tests {
                 openai_api_key: None,
                 openai_image_model: "gpt-image-2".to_string(),
                 qmediasync_base_url: String::new(),
+                qmediasync_strm_dir: None,
                 cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
                 thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
                 catalog_v2_enabled: true,
@@ -3790,7 +4162,6 @@ mod tests {
                 derivative_cache_dir: temp.path().join("derivatives"),
                 derivative_cache_max_bytes: 1024,
                 derivative_cache_low_watermark_bytes: 512,
-                session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
@@ -3804,8 +4175,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let response = work_cover(
@@ -3929,8 +4298,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         (state, work_id)
     }

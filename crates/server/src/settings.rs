@@ -3,14 +3,12 @@ use std::sync::{LazyLock, RwLock};
 use std::time::SystemTime;
 
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
-use crate::auth;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 use crate::scanner::audio_grouping::AudioGroupingMode;
@@ -27,14 +25,6 @@ struct CachedSettings {
 static SETTINGS_CACHE: LazyLock<RwLock<Option<CachedSettings>>> =
     LazyLock::new(|| RwLock::new(None));
 const MAX_SETTINGS_FILE_BYTES: u64 = 2 * 1024 * 1024;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ThemeMode {
-    #[default]
-    Light,
-    Dark,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MediaDirectorySettings {
@@ -152,43 +142,25 @@ pub struct OpenAiSettings {
     pub image_configured: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum UiMaterial {
-    Classic,
-    #[default]
-    Liquid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum GlassIntensity {
-    Clear,
-    #[default]
-    Standard,
-    Readable,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AppearanceSettings {
-    #[serde(default)]
-    pub material: UiMaterial,
-    #[serde(default)]
-    pub glass_intensity: GlassIntensity,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReaderSettings {
     #[serde(default = "default_comic_auto_read_interval_ms")]
     pub comic_auto_read_interval_ms: u64,
+    #[serde(default = "default_comic_prefetch_pages")]
+    pub comic_prefetch_pages: u8,
 }
 
 impl Default for ReaderSettings {
     fn default() -> Self {
         Self {
             comic_auto_read_interval_ms: default_comic_auto_read_interval_ms(),
+            comic_prefetch_pages: default_comic_prefetch_pages(),
         }
     }
+}
+
+fn default_comic_prefetch_pages() -> u8 {
+    5
 }
 
 fn default_comic_auto_read_interval_ms() -> u64 {
@@ -205,11 +177,8 @@ pub enum DetailPaneMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
-    pub theme: ThemeMode,
     #[serde(default)]
     pub detail_mode: DetailPaneMode,
-    #[serde(default)]
-    pub appearance: AppearanceSettings,
     #[serde(default)]
     pub reader: ReaderSettings,
     pub media_dirs: MediaDirectorySettings,
@@ -228,9 +197,7 @@ pub struct AppSettings {
 impl AppSettings {
     pub fn defaults(config: &Config) -> Self {
         Self {
-            theme: ThemeMode::Light,
             detail_mode: DetailPaneMode::Modal,
-            appearance: AppearanceSettings::default(),
             reader: ReaderSettings::default(),
             media_dirs: MediaDirectorySettings {
                 comics: vec![path_string(&config.comics_dir)],
@@ -258,6 +225,7 @@ impl AppSettings {
                 image_configured: config.openai_api_key.is_some(),
             },
         }
+        .with_container_directories(config)
     }
 
     pub fn comic_roots(&self) -> Vec<PathBuf> {
@@ -314,6 +282,7 @@ impl AppSettings {
         self.cover_cache_dirs = self.cover_cache_dirs.normalized(config);
         self.media_sources = normalize_sources(self.media_sources);
         self.qmediasync.strm_roots = normalize_dirs(self.qmediasync.strm_roots);
+        self.reader.comic_prefetch_pages = self.reader.comic_prefetch_pages.clamp(5, 10);
         self.reader.comic_auto_read_interval_ms =
             self.reader.comic_auto_read_interval_ms.clamp(500, 120_000);
         if self.qmediasync.base_url.trim().is_empty() {
@@ -331,6 +300,35 @@ impl AppSettings {
         self.openai.image_configured = config.openai_api_key.is_some();
         self
     }
+
+    /// Resource locations belong to the process/container configuration, not
+    /// to the mutable application settings document. Keep the non-path
+    /// options from that document, while always resolving the displayed and
+    /// scanned paths from the current container environment.
+    fn with_container_directories(mut self, config: &Config) -> Self {
+        let comic_scan_depth = self.media_dirs.comic_scan_depth;
+        self.media_dirs = MediaDirectorySettings {
+            comics: vec![path_string(&config.comics_dir)],
+            novels: vec![path_string(&config.novels_dir)],
+            audio: vec![path_string(&config.audio_dir)],
+            gallery: vec![path_string(&config.gallery_dir)],
+            coser_picture: vec![path_string(&config.coser_picture_dir)],
+            comic_scan_depth,
+        };
+        self.cover_cache_dirs = CoverCacheDirectorySettings::defaults(config);
+        // Explicit persisted sources win, even if unavailable. Do not silently switch libraries.
+        if self.qmediasync.strm_roots.is_empty()
+            && !self.media_sources.iter().any(|source| {
+                source.enabled && source.provider == "qmediasync" && source.kind == "comic"
+            })
+        {
+            if let Some(root) = config.qmediasync_strm_dir.as_ref() {
+                self.qmediasync.strm_roots.push(path_string(root));
+                self.qmediasync.enabled = true;
+            }
+        }
+        self
+    }
 }
 
 pub async fn get_settings(State(state): State<Arc<AppState>>) -> Result<Json<AppSettings>> {
@@ -339,11 +337,17 @@ pub async fn get_settings(State(state): State<Arc<AppState>>) -> Result<Json<App
 
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
     Json(input): Json<AppSettings>,
 ) -> Result<Json<AppSettings>> {
-    auth::require_csrf(&state, &headers, "settings.update").await?;
-    let settings = input.normalized(&state.config);
+    let current = load_settings(&state.config).await?;
+    let mut settings = input
+        .normalized(&state.config)
+        .with_container_directories(&state.config);
+    // STRM roots and provider source roots are resource locations as well.
+    // Keep them outside the mutable settings patch; changing the mounted
+    // resource location belongs to the container configuration.
+    settings.media_sources = current.media_sources;
+    settings.qmediasync.strm_roots = current.qmediasync.strm_roots;
     save_settings(&state.config, &settings).await?;
     update_settings_cache(&state.config, &settings).await;
     state
@@ -362,9 +366,6 @@ pub async fn update_settings(
                 "audio_grouping": settings.audio_grouping.as_str(),
                 "qmediasync_enabled": settings.qmediasync.enabled,
                 "qmediasync_roots": settings.qmediasync.strm_roots.len(),
-                "theme": &settings.theme,
-                "appearance_material": &settings.appearance.material,
-                "glass_intensity": &settings.appearance.glass_intensity,
                 "comic_auto_read_interval_ms": settings.reader.comic_auto_read_interval_ms,
             }),
         )
@@ -410,7 +411,9 @@ pub async fn load_settings(config: &Config) -> Result<AppSettings> {
     if missing_coser_picture {
         settings.media_dirs.coser_picture = vec![path_string(&config.coser_picture_dir)];
     }
-    let settings = settings.normalized(config);
+    let settings = settings
+        .normalized(config)
+        .with_container_directories(config);
     replace_settings_cache(path, modified, len, settings.clone());
     Ok(settings)
 }
@@ -666,5 +669,42 @@ mod tests {
             read_settings_file_bounded(&path, 1).await,
             Err(AppError::Other(message)) if message.contains("UTF-8")
         ));
+    }
+
+    #[test]
+    fn legacy_application_appearance_is_ignored_and_not_written_back() {
+        let settings = serde_json::from_value::<AppSettings>(serde_json::json!({
+            "theme": "dark",
+            "appearance": {
+                "material": "liquid",
+                "glass_intensity": "clear"
+            },
+            "detail_mode": "docked",
+            "reader": {
+                "comic_auto_read_interval_ms": 12000
+            },
+            "media_dirs": {
+                "comics": [],
+                "novels": [],
+                "audio": []
+            },
+            "scan": {
+                "enqueue_enrichment": false,
+                "file_watcher": false,
+                "enrichment_concurrency": 1
+            },
+            "openai": {
+                "image_model": "ignored-by-normalization",
+                "image_configured": false
+            }
+        }))
+        .unwrap();
+
+        assert!(matches!(settings.detail_mode, DetailPaneMode::Docked));
+        assert_eq!(settings.reader.comic_auto_read_interval_ms, 12000);
+
+        let written = serde_json::to_value(settings).unwrap();
+        assert!(written.get("theme").is_none());
+        assert!(written.get("appearance").is_none());
     }
 }

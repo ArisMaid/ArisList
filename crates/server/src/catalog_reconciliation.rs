@@ -46,8 +46,8 @@ const COSER_PICTURE_JOB_TYPE: &str = "reconcile-catalog-coser-picture";
 const AUDIO_JOB_TYPE: &str = "reconcile-catalog-audio";
 const GALLERY_JOB_TYPE: &str = "reconcile-catalog-gallery";
 const NOVEL_FINGERPRINT_PREFIX: &str = "novel-v1:";
-const COMIC_FINGERPRINT_PREFIX: &str = "comic-v1:";
-const COSER_PICTURE_FINGERPRINT_PREFIX: &str = "coser-picture-v1:";
+use crate::scanner::comic_info::COMIC_FINGERPRINT_PREFIX;
+const COSER_PICTURE_FINGERPRINT_PREFIX: &str = "coser-picture-v2:";
 const AUDIO_FINGERPRINT_PREFIX: &str = "audio-v1:";
 const GALLERY_FINGERPRINT_PREFIX: &str = "gallery-v1:";
 const MAX_RECORDED_DIFFS: usize = 256;
@@ -2495,6 +2495,7 @@ mod tests {
                 root_generation: 1,
                 scan_token: "streamed-reconciliation".to_string(),
                 complete_snapshot,
+                preserve_scanner_tags: false,
             },
             fingerprint: "audio-v1:fixture".to_string(),
             work: WorkMutationFields {
@@ -3103,7 +3104,7 @@ mod tests {
         std::fs::write(author.join("cover.jpg"), [1_u8, 2, 3, 4]).unwrap();
         std::fs::write(
             author.join("ComicInfo.xml"),
-            r#"<ComicInfo><Series>Fixture Comic</Series><AlternateSeries>Alternate title</AlternateSeries><Writer>Fixture Circle</Writer><Penciller>Fixture Artist</Penciller><Genre>f:Romance, m:Action</Genre><PageCount>9</PageCount><LanguageIso>ja</LanguageIso><CommunityRating>4.5</CommunityRating></ComicInfo>"#,
+            r#"<ComicInfo><Series>Fixture Comic</Series><AlternateSeries>Alternate title</AlternateSeries><Summary>Fixture summary</Summary><Writer>Fixture Circle</Writer><Penciller>Fixture Artist</Penciller><Genre>f:Romance, m:Action</Genre><PageCount>9</PageCount><LanguageIso>ja</LanguageIso><CommunityRating>4.5</CommunityRating></ComicInfo>"#,
         )
         .unwrap();
 
@@ -3150,9 +3151,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(mutation.work.title, "Alternate title");
         assert_eq!(
             mutation.work.description.as_deref(),
-            Some("Alternate title")
+            Some("Fixture summary")
         );
         assert!(db
             .try_acquire_scanner_lock("library", "legacy-comic-scan", 60)
@@ -4091,7 +4093,7 @@ mod tests {
             .await
             .unwrap(),
             (
-                "Fixture Comic".to_string(),
+                "Alternate title".to_string(),
                 0.75,
                 Some("page-7".to_string())
             )

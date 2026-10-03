@@ -154,6 +154,7 @@ pub(crate) async fn inspect(
             root_generation: request.root_generation,
             scan_token: request.scan_token,
             complete_snapshot: true,
+            preserve_scanner_tags: false,
         },
         fingerprint: fingerprint_value,
         work: WorkMutationFields {

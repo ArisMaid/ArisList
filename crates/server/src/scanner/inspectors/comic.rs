@@ -14,8 +14,8 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::json;
 
 use super::super::{
-    clean_title, count_cbz_pages_blocking, fingerprint_archive, local_comic_archive_type,
-    normalize_key, parse_comic_genre_tags, path_string, read_comic_info_blocking,
+    count_cbz_pages_blocking, fingerprint_archive, local_comic_archive_type, path_string,
+    read_comic_info_blocking,
 };
 use crate::catalog_writer::{
     AssetMutation, MutationFence, MutationOwner, MutationSource, TagMutation, WorkMutation,
@@ -25,7 +25,7 @@ use crate::error::{AppError, Result};
 use crate::resource::ResourceGovernor;
 use crate::vfs;
 
-const COMIC_INSPECTOR_VERSION: &str = "comic-v1";
+use super::super::comic_info::COMIC_FINGERPRINT_PREFIX;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ComicInspectionRequest {
@@ -69,8 +69,9 @@ pub(crate) async fn inspect(
             ))
         })?
         .to_string();
-    let comic_info = read_comic_info_blocking(resources, dir.clone()).await?;
-    let comic_info = comic_info.unwrap_or_default();
+    let comic_info_read = read_comic_info_blocking(resources, dir.clone()).await?;
+    let preserve_scanner_tags = comic_info_read.is_missing();
+    let comic_info = comic_info_read.into_info();
     let page_count = if is_qmediasync {
         request.qmediasync_mount_name.as_deref().ok_or_else(|| {
             AppError::BadRequest("qmediasync comic inspection requires a mount name".to_string())
@@ -83,19 +84,7 @@ pub(crate) async fn inspect(
         let archive_page_count = count_cbz_pages_blocking(resources, archive_path.clone()).await?;
         comic_info.page_count.unwrap_or(archive_page_count)
     };
-    let title = comic_info
-        .series
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(clean_title)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            dir.file_name()
-                .and_then(|value| value.to_str())
-                .map(clean_title)
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or_else(|| "Untitled comic".to_string());
+    let title = comic_info.display_title(&archive_state.fallback_title);
     let (archive_mime, archive_variant) = if is_qmediasync {
         ("application/vnd.comicbook+zip", "cbz-strm")
     } else {
@@ -108,12 +97,16 @@ pub(crate) async fn inspect(
             .expect("validated qmediasync mount name");
         let target_url =
             super::super::read_qms_strm_url_blocking(resources, archive_path.clone()).await?;
-        let meta = vfs::qms_strm_meta_json(
+        let volume_paths = super::super::qms_volume_paths(&request.root, mount_name, &archive_path);
+        let missing_volumes = super::super::qms_volume_missing_names(&archive_path);
+        let meta = vfs::qms_strm_meta_json_with_volumes(
             mount_name,
             &request.root,
             &archive_path,
             &request.work_key,
             &target_url,
+            &volume_paths,
+            &missing_volumes,
         )
         .await;
         Some((vfs::qms_strm_uri(mount_name, &request.work_key), meta))
@@ -168,34 +161,14 @@ pub(crate) async fn inspect(
 
     let mut tags = Vec::new();
     let mut identities = BTreeSet::new();
-    if let Some(genre) = comic_info.genre.as_deref() {
-        for tag in parse_comic_genre_tags(genre) {
-            push_tag(
-                &mut tags,
-                &mut identities,
-                &tag.namespace,
-                &tag.key,
-                &tag.label,
-            );
-        }
-    }
-    for (namespace, value) in [
-        ("artist", comic_info.penciller.as_deref()),
-        ("group", comic_info.writer.as_deref()),
-    ] {
-        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-            let key = normalize_key(value);
-            push_tag(&mut tags, &mut identities, namespace, &key, value);
-        }
-    }
-    if let Some(language) = comic_info.language_iso.as_deref() {
-        let label = match language {
-            "zh" | "cn" => "chinese",
-            "ja" => "japanese",
-            "en" => "english",
-            other => other,
-        };
-        push_tag(&mut tags, &mut identities, "language", label, label);
+    for tag in comic_info.tags() {
+        push_tag(
+            &mut tags,
+            &mut identities,
+            &tag.namespace,
+            &tag.key,
+            &tag.label,
+        );
     }
 
     Ok(WorkMutation {
@@ -210,24 +183,27 @@ pub(crate) async fn inspect(
             root_generation: request.root_generation,
             scan_token: request.scan_token,
             complete_snapshot: true,
+            preserve_scanner_tags,
         },
         fingerprint: format!(
-            "{COMIC_INSPECTOR_VERSION}:{}",
+            "{COMIC_FINGERPRINT_PREFIX}{}",
             archive_state.fingerprint.value
         ),
         work: WorkMutationFields {
             title,
-            subtitle: None,
+            subtitle: comic_info.subtitle(),
             category: Some("Doujinshi".to_string()),
-            description: comic_info.alternate_series,
+            description: comic_info.description(),
             rating: comic_info.community_rating,
             source_path: archive_reference,
-            meta: json!({
-                "page_count": page_count,
-                "writer": comic_info.writer,
-                "penciller": comic_info.penciller,
-                "language_iso": comic_info.language_iso,
-            }),
+            meta: comic_info.meta_with_sidecar_status(
+                page_count,
+                if preserve_scanner_tags {
+                    "missing"
+                } else {
+                    "present"
+                },
+            ),
         },
         assets,
         tags,
@@ -375,9 +351,9 @@ mod tests {
         let zip = inspect(&resources, request(&root, "Author/book.zip"))
             .await
             .unwrap();
-        assert_eq!(cbz.work.title, "Fixture Series");
-        assert_eq!(cbz.work.subtitle, None);
-        assert_eq!(cbz.work.description.as_deref(), Some("Alt"));
+        assert_eq!(cbz.work.title, "Alt");
+        assert_eq!(cbz.work.subtitle.as_deref(), Some("Fixture Series"));
+        assert_eq!(cbz.work.description, None);
         assert_eq!(cbz.work.rating, Some(4.5));
         assert_eq!(cbz.work.meta["page_count"], 9);
         assert_eq!(cbz.assets.len(), 2);
@@ -398,7 +374,13 @@ mod tests {
                 .map(|asset| &asset.role)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(cbz.fingerprint.len(), "comic-v1:".len() + 64);
+        assert_eq!(
+            cbz.fingerprint.len(),
+            COMIC_FINGERPRINT_PREFIX.len()
+                + super::super::super::comic_info::METADATA_VERSION.len()
+                + 1
+                + 64
+        );
     }
 
     #[tokio::test]

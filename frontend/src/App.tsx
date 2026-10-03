@@ -12,8 +12,6 @@ import {
   ChevronRight,
   Cloud,
   ExternalLink,
-  FolderMinus,
-  FolderPlus,
   Folders,
   Gauge,
   GalleryHorizontal,
@@ -22,15 +20,13 @@ import {
   History as HistoryIcon,
   Image,
   Info,
-  KeyRound,
   Library,
   ListMusic,
   LayoutGrid,
   LayoutList,
   ListFilter,
   Loader2,
-  LogOut,
-  Moon,
+  Menu,
   Pause,
   Play,
   RefreshCw,
@@ -42,18 +38,17 @@ import {
   SkipBack,
   SkipForward,
   Sparkles,
-  Sun,
   Tags,
   Volume2,
   X,
   ZoomIn,
   ZoomOut
 } from "lucide-react";
-import { api, assetUrl, assetVersion, catalogAssetToAsset, comicPageUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type AuthSession, type ComicPageInfo, type GlassIntensity, type HistoryRecord, type Job, type LibraryResponse, type Tag, type ThemeMode, type UiMaterial, type WorkDetail, type WorkSummary } from "./api";
-import { GlassFilterProvider, GlassSurface } from "./components/material";
+import { api, assetUrl, assetVersion, catalogAssetToAsset, comicPageUrl, coverUrl, parseMeta, thumbUrl, type AppSettings, type Asset, type AssetRouteInfo, type CloudStatus, type ComicPageInfo, type HistoryRecord, type Job, type LibraryResponse, type StrmTask, type Tag, type WorkDetail, type WorkSummary } from "./api";
 import { loadRandomCatalogWork, type CatalogShelfQuery } from "./catalog/api";
 import { useCatalogContext, useCatalogJobs, useCatalogShelf } from "./catalog/useCatalog";
 import { useProgressQueue } from "./hooks/useProgressQueue";
+import { getLibraryLayout, type LibraryContentKind, type LibraryViewMode } from "./features/library/libraryLayout";
 import {
   AUDIO_QUEUE_WINDOW,
   AUDIO_TRACK_MAX_CACHED,
@@ -61,19 +56,16 @@ import {
   mergeAudioTrackPage,
   type AudioPlaylistState
 } from "./audioQueue";
+import { uiDuration, uiEaseOut } from "./ui/motion";
 const NovelReader = lazy(() => import("./components/NovelReader").then((module) => ({ default: module.NovelReader })));
 
 type KindFilter = "history" | "comic" | "novel" | "audio" | "gallery" | "coser-picture";
-type ViewMode = "grid" | "compact" | "list" | "cover";
+type ViewMode = LibraryViewMode;
 type TagFilterMode = "include";
 type TagLanguage = "translated" | "raw";
 type ComicReaderMode = "paged" | "scroll" | "horizontal";
 type ShelfDisplayMode = "collections" | "single";
 type DetailMode = "modal" | "docked";
-type AppearanceState = {
-  material: UiMaterial;
-  glass_intensity: GlassIntensity;
-};
 type LocalSearchState = {
   query: string;
   ids: number[];
@@ -98,7 +90,6 @@ type AudioRepeatMode = "none" | "all" | "one";
 const COMIC_DEFAULT_ASPECT = 0.72;
 const COMIC_HORIZONTAL_OVERSCAN = 4;
 const COMIC_VERTICAL_OVERSCAN = 4;
-const COMIC_READER_PREFETCH_LIMIT = 4;
 const COMIC_MAX_PAGE_COUNT = 100_000;
 // The legacy fallback is kept bounded so a disabled Catalog v2 cannot pull
 // the entire library into the browser during startup.  Further pages remain
@@ -138,12 +129,8 @@ function isArchiveWorkKind(kind: string) {
   return kind === "comic" || kind === "coser-picture";
 }
 
-const defaultAppearance: AppearanceState = {
-  material: "liquid",
-  glass_intensity: "standard"
-};
-
 const defaultReaderSettings = {
+  comic_prefetch_pages: 5,
   comic_auto_read_interval_ms: 4000
 };
 
@@ -175,11 +162,6 @@ export function App() {
   const [viewMode, setViewMode] = useState<ViewMode>("cover");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [auth, setAuth] = useState<AuthSession>({ authenticated: false });
-  const [loginPassword, setLoginPassword] = useState("");
-  const [newAdminPassword, setNewAdminPassword] = useState("");
-  const [passwordMessage, setPasswordMessage] = useState<string | null>(null);
-  const [authBusy, setAuthBusy] = useState(false);
   const [readerOpen, setReaderOpen] = useState(false);
   const [readerDerivativesEnabled, setReaderDerivativesEnabled] = useState(false);
   const [pendingReaderId, setPendingReaderId] = useState<number | null>(null);
@@ -187,13 +169,10 @@ export function App() {
   const [readerPositionOverride, setReaderPositionOverride] = useState<string | null | undefined>(undefined);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileRailOpen, setMobileRailOpen] = useState(false);
   const [detailMode, setDetailMode] = useState<DetailMode>("modal");
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [collectionStack, setCollectionStack] = useState<WorkSummary[] | null>(null);
-  const [theme, setTheme] = useState<ThemeMode>(() => {
-    if (typeof window === "undefined") return "light";
-    return (window.localStorage.getItem("media_shelf_theme") as ThemeMode | null) ?? "light";
-  });
   const [comicDisplayMode, setComicDisplayMode] = useState<ShelfDisplayMode>("collections");
   const [novelDisplayMode, setNovelDisplayMode] = useState<ShelfDisplayMode>("collections");
   const [coserPictureDisplayMode, setCoserPictureDisplayMode] = useState<ShelfDisplayMode>("collections");
@@ -363,29 +342,13 @@ export function App() {
     }
   }, [appendLegacyPage, legacyLoading, library.next_cursor]);
 
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    window.localStorage.setItem("media_shelf_theme", theme);
-  }, [theme]);
-
-  const appearance = settings?.appearance ?? defaultAppearance;
-  const material = appearance.material ?? "liquid";
-  const glassIntensity = appearance.glass_intensity ?? "standard";
-  const isLiquid = material === "liquid";
   const comicAutoReadIntervalMs = clampComicAutoReadIntervalMs(settings?.reader?.comic_auto_read_interval_ms);
 
   useEffect(() => {
-    document.documentElement.dataset.material = material;
-    document.documentElement.dataset.glassIntensity = glassIntensity;
-  }, [material, glassIntensity]);
-
-  useEffect(() => {
-    api.authSession().then(setAuth).catch(() => setAuth({ authenticated: false }));
     api
       .settings()
       .then((value) => {
         setSettings(value);
-        setTheme(value.theme ?? "light");
         setDetailMode(value.detail_mode ?? "modal");
       })
       .catch((err) => setError(err.message));
@@ -701,10 +664,6 @@ export function App() {
   };
 
   const runScan = async () => {
-    if (!auth.authenticated) {
-      setError("请先使用管理员密码登录");
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
@@ -719,10 +678,6 @@ export function App() {
   };
 
   const runTagImport = async () => {
-    if (!auth.authenticated) {
-      setError("请先使用管理员密码登录");
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
@@ -736,86 +691,18 @@ export function App() {
     }
   };
 
-  const login = async () => {
-    if (!loginPassword.trim()) return;
-    setAuthBusy(true);
-    setError(null);
-    setPasswordMessage(null);
-    try {
-      const session = await api.login(loginPassword);
-      setAuth(session);
-      setLoginPassword("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
-  const changeAdminPassword = async () => {
-    if (!newAdminPassword.trim()) return;
-    setAuthBusy(true);
-    setPasswordMessage(null);
-    setError(null);
-    try {
-      await api.changePassword(newAdminPassword);
-      setNewAdminPassword("");
-      setPasswordMessage("管理员密码已更新");
-    } catch (err) {
-      setPasswordMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
-  const logout = async () => {
-    setAuthBusy(true);
-    setError(null);
-    try {
-      await api.logout();
-      setAuth({ authenticated: false });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAuthBusy(false);
-    }
-  };
-
   const saveSettings = async (next: AppSettings) => {
-    if (!auth.authenticated) {
-      setError("请先使用管理员密码登录");
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
       const saved = await api.updateSettings(next);
       setSettings(saved);
-      setTheme(saved.theme);
       setDetailMode(saved.detail_mode ?? "modal");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
-  };
-
-  const changeTheme = (next: ThemeMode) => {
-    setTheme(next);
-    setSettings((prev) => (prev ? { ...prev, theme: next } : prev));
-  };
-
-  const changeAppearance = (next: Partial<AppearanceState>) => {
-    setSettings((prev) => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        appearance: {
-          ...(prev.appearance ?? defaultAppearance),
-          ...next
-        }
-      };
-    });
   };
 
   const closeCollection = useCallback(() => {
@@ -992,14 +879,14 @@ export function App() {
   };
 
   return (
-    <GlassFilterProvider>
-    <div
-      className={detailMode === "docked" ? "app-shell has-detail-pane" : "app-shell modal-detail"}
-      data-glass-intensity={glassIntensity}
-      data-material={material}
-    >
-      {isLiquid ? (
-      <GlassSurface as="aside" className="rail" variant="panel">
+    <div className={detailMode === "docked" ? "app-shell has-detail-pane" : "app-shell modal-detail"}>
+      <button
+        className={mobileRailOpen ? "rail-mobile-backdrop open" : "rail-mobile-backdrop"}
+        type="button"
+        onClick={() => setMobileRailOpen(false)}
+        aria-label="关闭导航"
+      />
+      <aside className={mobileRailOpen ? "rail mobile-open" : "rail"}>
         <RailContent
           counts={counts}
           includeTags={includeTags}
@@ -1007,67 +894,24 @@ export function App() {
           selectedTag={selectedTag}
           tagFilters={tagFilters}
           tagLanguage={tagLanguage}
-           tagQuery={tagQuery}
-           visibleTags={visibleTags}
-           hasMoreTags={catalogEnabled === true && Boolean(catalogContext.tagNextCursor)}
-           tagLoadingMore={catalogContext.tagLoadingMore}
-           tagLimitReached={catalogContext.tagLimitReached}
-           onKindChange={setKind}
-           onSelectedTagChange={setSelectedTag}
-           onTagFiltersChange={setTagFilters}
-           onTagLanguageChange={setTagLanguage}
-           onTagQueryChange={setTagQuery}
-           onLoadMoreTags={catalogContext.loadMoreTags}
-         />
-      </GlassSurface>
-      ) : (
-      <aside className="rail">
-        <RailContent
-          counts={counts}
-          includeTags={includeTags}
-          kind={kind}
-          selectedTag={selectedTag}
-          tagFilters={tagFilters}
-          tagLanguage={tagLanguage}
-           tagQuery={tagQuery}
-           visibleTags={visibleTags}
-           hasMoreTags={catalogEnabled === true && Boolean(catalogContext.tagNextCursor)}
-           tagLoadingMore={catalogContext.tagLoadingMore}
-           tagLimitReached={catalogContext.tagLimitReached}
-           onKindChange={setKind}
-           onSelectedTagChange={setSelectedTag}
-           onTagFiltersChange={setTagFilters}
-           onTagLanguageChange={setTagLanguage}
-           onTagQueryChange={setTagQuery}
-           onLoadMoreTags={catalogContext.loadMoreTags}
-         />
+          tagQuery={tagQuery}
+          visibleTags={visibleTags}
+          hasMoreTags={catalogEnabled === true && Boolean(catalogContext.tagNextCursor)}
+          tagLoadingMore={catalogContext.tagLoadingMore}
+          tagLimitReached={catalogContext.tagLimitReached}
+          onKindChange={(next) => {
+            setKind(next);
+            setMobileRailOpen(false);
+          }}
+          onSelectedTagChange={setSelectedTag}
+          onTagFiltersChange={setTagFilters}
+          onTagLanguageChange={setTagLanguage}
+          onTagQueryChange={setTagQuery}
+          onLoadMoreTags={catalogContext.loadMoreTags}
+        />
       </aside>
-      )}
 
       <main className="workspace">
-        {isLiquid ? (
-        <GlassSurface as="header" className="toolbar" variant="panel">
-          <ToolbarContent
-            collectionStack={collectionNavigationStack}
-            comicDisplayMode={comicDisplayMode}
-            comicCount={catalogEnabled === true ? counts.comic ?? 0 : (collectionNavigationStack ?? filteredWorks).filter((work) => work.kind === "comic").length}
-            coserPictureDisplayMode={coserPictureDisplayMode}
-            kind={kind}
-            localSearch={localSearch}
-            novelDisplayMode={novelDisplayMode}
-            query={query}
-            viewMode={viewMode}
-            onCollectionBack={closeCollection}
-            onComicDisplayModeChange={setComicDisplayMode}
-            onCoserPictureDisplayModeChange={setCoserPictureDisplayMode}
-            onOpenRandomComic={openRandomComic}
-            onNovelDisplayModeChange={setNovelDisplayMode}
-            onQueryChange={setQuery}
-            onSettingsOpen={() => setSettingsOpen(true)}
-            onViewModeChange={setViewMode}
-          />
-        </GlassSurface>
-        ) : (
         <header className="toolbar">
           <ToolbarContent
             collectionStack={collectionNavigationStack}
@@ -1079,6 +923,7 @@ export function App() {
             novelDisplayMode={novelDisplayMode}
             query={query}
             viewMode={viewMode}
+            onMenuOpen={() => setMobileRailOpen(true)}
             onCollectionBack={closeCollection}
             onComicDisplayModeChange={setComicDisplayMode}
             onCoserPictureDisplayModeChange={setCoserPictureDisplayMode}
@@ -1089,7 +934,6 @@ export function App() {
             onViewModeChange={setViewMode}
           />
         </header>
-        )}
 
         {error && (
           <motion.div className="error-strip" initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}>
@@ -1119,10 +963,10 @@ export function App() {
         <VirtualShelf
           items={displayedWorks}
           itemKey={(work) => work.id}
+          contentKind={kind === "audio" ? "audio" : "portrait"}
           viewMode={viewMode}
-          renderItem={(work, index) => (
+          renderItem={(work) => (
             <WorkCard
-              index={index}
               key={work.id}
               selected={work.id === selectedId}
               viewMode={viewMode}
@@ -1175,17 +1019,14 @@ export function App() {
           onOpenReader={openReader}
           onPlayTrack={playTrackInDock}
           onTagPick={(key) => setTagFilters((prev) => cycleTagFilter(prev, key))}
-          liquid={isLiquid}
         />
       )}
       <AudioDock
-        key={activeAudio ? `${activeAudio.work.id}:${activeAudio.asset.id}:${activeAudio.sessionId}` : "idle"}
         active={activeAudio}
         canPersistProgress={true}
         onClose={() => setActiveAudio(null)}
         onProgressSaved={syncProgress}
         resumePosition={activeAudio?.resumePosition ?? null}
-        liquid={isLiquid}
       />
 
       <AnimatePresence>
@@ -1200,32 +1041,18 @@ export function App() {
               onOpenReader={openReader}
               onPlayTrack={playTrackInDock}
               onTagPick={(key) => setTagFilters((prev) => cycleTagFilter(prev, key))}
-              liquid={isLiquid}
             />
           </motion.div>
         )}
         {settingsOpen && (
           <SettingsOverlay
-            auth={auth}
-            authBusy={authBusy}
             busy={busy}
-            loginPassword={loginPassword}
-            newAdminPassword={newAdminPassword}
-            passwordMessage={passwordMessage}
+            jobs={library.jobs}
             settings={settings}
-            theme={theme}
-            onAppearanceChange={changeAppearance}
-            onChangeAdminPassword={changeAdminPassword}
             onClose={() => setSettingsOpen(false)}
-            onLogin={login}
-            onLogout={logout}
-            onPasswordChange={setLoginPassword}
             onRescan={runScan}
             onSaveSettings={saveSettings}
             onTagImport={runTagImport}
-            onThemeChange={changeTheme}
-            onNewAdminPasswordChange={setNewAdminPassword}
-            liquid={isLiquid}
           />
         )}
         {readerOpen && detail && (
@@ -1241,13 +1068,12 @@ export function App() {
             onProgressSaved={syncProgress}
             readerDerivativesEnabled={readerDerivativesEnabled}
             resumePosition={readerResume ? readerPositionOverride ?? historyByWorkId.get(detail.work.id)?.position ?? null : "start"}
-            liquid={isLiquid}
+            comicPrefetchPages={settings?.reader?.comic_prefetch_pages ?? 5}
             comicAutoReadIntervalMs={comicAutoReadIntervalMs}
           />
         )}
       </AnimatePresence>
     </div>
-    </GlassFilterProvider>
   );
 }
 
@@ -1381,6 +1207,7 @@ function ToolbarContent({
   onOpenRandomComic,
   onNovelDisplayModeChange,
   onQueryChange,
+  onMenuOpen,
   onSettingsOpen,
   onViewModeChange
 }: {
@@ -1399,12 +1226,16 @@ function ToolbarContent({
   onOpenRandomComic: () => void;
   onNovelDisplayModeChange: (mode: ShelfDisplayMode) => void;
   onQueryChange: (value: string) => void;
+  onMenuOpen: () => void;
   onSettingsOpen: () => void;
   onViewModeChange: (value: ViewMode) => void;
 }) {
   return (
     <>
       <div className="toolbar-left">
+        <button className="icon-btn mobile-menu-btn" type="button" onClick={onMenuOpen} aria-label="打开导航">
+          <Menu size={18} />
+        </button>
         {collectionStack && (
           <button className="primary-action subtle-action collection-back-action" onClick={onCollectionBack}>
             <ChevronLeft size={16} />
@@ -1472,91 +1303,6 @@ function ToolbarContent({
   );
 }
 
-function AuthControls({
-  auth,
-  busy,
-  message,
-  newPassword,
-  password,
-  onChangePassword,
-  onLogin,
-  onLogout,
-  onNewPasswordChange,
-  onPasswordChange
-}: {
-  auth: AuthSession;
-  busy: boolean;
-  message: string | null;
-  newPassword: string;
-  password: string;
-  onChangePassword: () => void;
-  onLogin: () => void;
-  onLogout: () => void;
-  onNewPasswordChange: (value: string) => void;
-  onPasswordChange: (value: string) => void;
-}) {
-  if (auth.authenticated) {
-    return (
-      <div className="auth-panel">
-        <div className="auth-pill">
-          <KeyRound size={15} />
-          <span>{auth.user ?? "admin"}</span>
-          <button className="icon-btn compact" disabled={busy} onClick={onLogout} aria-label="退出登录">
-            <LogOut size={15} />
-          </button>
-        </div>
-        <form
-          className="auth-form auth-form-wide"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onChangePassword();
-          }}
-        >
-          <KeyRound size={15} />
-          <input
-            autoComplete="new-password"
-            placeholder="新的管理员密码"
-            type="password"
-            value={newPassword}
-            onChange={(event) => onNewPasswordChange(event.target.value)}
-          />
-          <button className="auth-submit" disabled={busy || newPassword.trim().length < 8} type="submit">
-            {busy ? <Loader2 className="spin" size={15} /> : <KeyRound size={15} />}
-            <span>修改密码</span>
-          </button>
-        </form>
-        {message && <span className="settings-message">{message}</span>}
-      </div>
-    );
-  }
-
-  return (
-    <div className="auth-panel">
-      <form
-        className="auth-form auth-form-wide"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onLogin();
-        }}
-      >
-        <KeyRound size={15} />
-        <input
-          autoComplete="current-password"
-          placeholder="管理员密码"
-          type="password"
-          value={password}
-          onChange={(event) => onPasswordChange(event.target.value)}
-        />
-        <button className="icon-btn compact" disabled={busy || !password.trim()} aria-label="登录">
-          {busy ? <Loader2 className="spin" size={15} /> : <KeyRound size={15} />}
-        </button>
-      </form>
-      <div className="auth-help-row"><span>忘记密码时请在服务器端更新配置或持久化密码文件。</span></div>
-      {message && <span className="settings-message">{message}</span>}
-    </div>
-  );
-}
-
 function ViewModePicker({ value, onChange }: { value: ViewMode; onChange: (value: ViewMode) => void }) {
   const modes: Array<[ViewMode, ReactNode, string]> = [
     ["cover", <GalleryHorizontal size={16} />, "封面"],
@@ -1576,110 +1322,60 @@ function ViewModePicker({ value, onChange }: { value: ViewMode; onChange: (value
 }
 
 function SettingsOverlay({
-  auth,
-  authBusy,
   busy,
-  loginPassword,
-  liquid = false,
-  newAdminPassword,
-  passwordMessage,
+  jobs,
   settings,
-  theme,
-  onChangeAdminPassword,
   onClose,
-  onLogin,
-  onLogout,
-  onNewAdminPasswordChange,
-  onPasswordChange,
   onRescan,
   onSaveSettings,
-  onTagImport,
-  onThemeChange,
-  onAppearanceChange
+  onTagImport
 }: {
-  auth: AuthSession;
-  authBusy: boolean;
   busy: boolean;
-  loginPassword: string;
-  liquid?: boolean;
-  newAdminPassword: string;
-  passwordMessage: string | null;
+  jobs: Job[];
   settings: AppSettings | null;
-  theme: ThemeMode;
-  onChangeAdminPassword: () => void;
   onClose: () => void;
-  onLogin: () => void;
-  onLogout: () => void;
-  onNewAdminPasswordChange: (value: string) => void;
-  onPasswordChange: (value: string) => void;
   onRescan: () => void;
   onSaveSettings: (settings: AppSettings) => void;
   onTagImport: () => void;
-  onThemeChange: (value: ThemeMode) => void;
-  onAppearanceChange: (next: Partial<AppearanceState>) => void;
 }) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
-  const [dirInputs, setDirInputs] = useState({ comics: "", novels: "", audio: "", gallery: "", coser_picture: "" });
-  const [cloudInput, setCloudInput] = useState({
-    kind: "comic" as AppSettings["media_sources"][number]["kind"],
-    mount_name: "qms",
-    root: "",
-    scan_depth: "12"
-  });
-  const [cloudMessage, setCloudMessage] = useState<string | null>(null);
-  const [cloudBusy, setCloudBusy] = useState(false);
-  const [cloudStatus, setCloudStatus] = useState<{ bytes: number; files: number } | null>(null);
+  const [cloudStatus, setCloudStatus] = useState<CloudStatus | null>(null);
+  const latestScanResult = [...jobs]
+    .filter((job) => job.job_type === "scan-library")
+    .sort((left, right) => right.id - left.id)
+    .map((job) => parseMeta<{
+      scan_result?: {
+        status: string;
+        source_results: Array<{
+          kind: string;
+          root: string;
+          status: string;
+          discovered: number;
+          imported: number;
+          skipped: number;
+          failed: number;
+          message?: string | null;
+        }>;
+      };
+    }>(job.payload_json).scan_result)
+    .find(Boolean);
 
   useEffect(() => {
     setDraft(settings ? normalizeSettingsDraft(settings) : null);
   }, [settings]);
 
   useEffect(() => {
-    if (!auth.authenticated) return;
     api
       .cloudStatus()
-      .then((status) => setCloudStatus(status.cache))
+      .then((status) => setCloudStatus(status))
       .catch(() => setCloudStatus(null));
-  }, [auth.authenticated, settings]);
+  }, [settings]);
 
   const updateDraft = (updater: (value: AppSettings) => AppSettings) => {
     setDraft((prev) => (prev ? updater(prev) : prev));
   };
 
-  const updateAppearance = (patch: Partial<AppearanceState>) => {
-    updateDraft((prev) => ({
-      ...prev,
-      appearance: {
-        ...(prev.appearance ?? defaultAppearance),
-        ...patch
-      }
-    }));
-    onAppearanceChange(patch);
-  };
-
   type MediaDirectoryKey = "comics" | "novels" | "audio" | "gallery" | "coser_picture";
-  const addDir = (kind: MediaDirectoryKey) => {
-    const value = dirInputs[kind].trim();
-    if (!value) return;
-    updateDraft((prev) => ({
-      ...prev,
-      media_dirs: {
-        ...prev.media_dirs,
-        [kind]: prev.media_dirs[kind].includes(value) ? prev.media_dirs[kind] : [...prev.media_dirs[kind], value]
-      }
-    }));
-    setDirInputs((prev) => ({ ...prev, [kind]: "" }));
-  };
-
-  const removeDir = (kind: MediaDirectoryKey, value: string) => {
-    updateDraft((prev) => ({
-      ...prev,
-      media_dirs: {
-        ...prev.media_dirs,
-        [kind]: prev.media_dirs[kind].filter((item) => item !== value)
-      }
-    }));
-  };
 
   const mediaLabels: Record<MediaDirectoryKey, string> = {
     comics: "漫画目录",
@@ -1712,68 +1408,9 @@ function SettingsOverlay({
     }));
   };
 
-  const addCloudSource = () => {
-    const mount = cloudInput.mount_name.trim();
-    const root = normalizeStrmRoot(cloudInput.root);
-    const scanDepth = Math.min(Math.max(Number.parseInt(cloudInput.scan_depth, 10) || 12, 1), 64);
-    if (!mount || !root) return;
-    updateDraft((prev) => {
-      const source = {
-        kind: cloudInput.kind,
-        provider: "qmediasync" as const,
-        root,
-        mount_name: mount,
-        enabled: true,
-        scan_depth: scanDepth,
-        audio_grouping: "auto" as const
-      };
-      const exists = prev.media_sources.some((item) =>
-        item.kind === source.kind &&
-        item.provider === source.provider &&
-        item.root === source.root &&
-        item.mount_name === source.mount_name
-      );
-      return {
-        ...prev,
-        media_sources: exists ? prev.media_sources : [...prev.media_sources, source],
-        qmediasync: {
-          ...prev.qmediasync,
-          enabled: true,
-          strm_roots: prev.qmediasync.strm_roots.includes(root)
-            ? prev.qmediasync.strm_roots
-            : [...prev.qmediasync.strm_roots, root]
-        }
-      };
-    });
-  };
-
-  const removeCloudSource = (index: number) => {
-    updateDraft((prev) => ({
-      ...prev,
-      media_sources: prev.media_sources.filter((_, itemIndex) => itemIndex !== index)
-    }));
-  };
-
-  const testQMediaSyncRoot = async () => {
-    setCloudBusy(true);
-    setCloudMessage(null);
-    try {
-      const res = await api.testQMediaSyncStrmRoot({
-        root: normalizeStrmRoot(cloudInput.root),
-        kind: cloudInput.kind,
-        scan_depth: Number.parseInt(cloudInput.scan_depth, 10) || 12
-      });
-      setCloudMessage(`STRM 可读：${res.root}，${res.works} 个作品，${res.strm_files} 个 STRM`);
-    } catch (err) {
-      setCloudMessage(err instanceof Error ? err.message : String(err));
-    } finally {
-      setCloudBusy(false);
-    }
-  };
-
   return (
-    <motion.div className="settings-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-      <motion.article className="settings-panel" initial={{ opacity: 0, y: 18, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 18, scale: 0.98 }}>
+      <motion.div className="settings-backdrop" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: uiDuration.fade, ease: uiEaseOut }}>
+      <motion.article className="settings-panel" initial={{ opacity: 0, y: 18, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 18, scale: 0.98 }} transition={{ duration: uiDuration.modal, ease: uiEaseOut }}>
         <header className="settings-header">
           <div>
             <span>Settings</span>
@@ -1786,64 +1423,13 @@ function SettingsOverlay({
 
         <div className="settings-body">
           <section className="settings-section">
-            <h3>本地后台</h3>
-            <AuthControls
-              auth={auth}
-              busy={authBusy}
-              message={passwordMessage}
-              newPassword={newAdminPassword}
-              password={loginPassword}
-              onChangePassword={onChangeAdminPassword}
-              onLogin={onLogin}
-              onLogout={onLogout}
-              onNewPasswordChange={onNewAdminPasswordChange}
-              onPasswordChange={onPasswordChange}
-            />
+            <h3>本地服务</h3>
+            <p className="settings-hint settings-access-note">
+              当前服务由本机或容器访问控制保护，不再使用管理员密码。资源目录由容器挂载决定，设置页仅展示当前访问路径。
+            </p>
           </section>
 
-          {auth.authenticated && (
-            <>
-              <section className="settings-section">
-                <h3>外观</h3>
-                <div className="segmented">
-                  <button className={theme === "light" ? "active" : ""} onClick={() => { onThemeChange("light"); updateDraft((prev) => ({ ...prev, theme: "light" })); }}>
-                    <Sun size={16} />
-                    <span>浅色</span>
-                  </button>
-                  <button className={theme === "dark" ? "active" : ""} onClick={() => { onThemeChange("dark"); updateDraft((prev) => ({ ...prev, theme: "dark" })); }}>
-                    <Moon size={16} />
-                    <span>深色</span>
-                  </button>
-                </div>
-                {draft && (
-                  <>
-                    <div className="settings-subtitle">界面材质</div>
-                    <div className="segmented">
-                      <button className={(draft.appearance?.material ?? "liquid") === "liquid" ? "active" : ""} onClick={() => updateAppearance({ material: "liquid" })}>
-                        <Sparkles size={16} />
-                        <span>液态玻璃</span>
-                      </button>
-                      <button className={(draft.appearance?.material ?? "liquid") === "classic" ? "active" : ""} onClick={() => updateAppearance({ material: "classic" })}>
-                        <LayoutList size={16} />
-                        <span>经典</span>
-                      </button>
-                    </div>
-                    <div className="settings-subtitle">玻璃强度</div>
-                    <div className="segmented">
-                      {(["clear", "standard", "readable"] as GlassIntensity[]).map((value) => (
-                        <button
-                          className={(draft.appearance?.glass_intensity ?? "standard") === value ? "active" : ""}
-                          key={value}
-                          onClick={() => updateAppearance({ glass_intensity: value })}
-                        >
-                          <span>{value === "clear" ? "通透" : value === "readable" ? "清晰" : "标准"}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                )}
-              </section>
-
+          <>
               {draft && (
                 <section className="settings-section">
                   <h3>预览栏</h3>
@@ -1884,36 +1470,34 @@ function SettingsOverlay({
                       }}
                     />
                   </label>
+                  <label className="setting-field">
+                    <span>漫画向前预加载页数</span>
+                    <select value={draft.reader?.comic_prefetch_pages ?? 5}
+                      onChange={(event) => updateDraft((prev) => ({ ...prev, reader: {
+                        ...(prev.reader ?? defaultReaderSettings), comic_prefetch_pages: Number(event.target.value)
+                      } }))}>
+                      {[5, 6, 7, 8, 9, 10].map(count => <option key={count} value={count}>{count} 页</option>)}
+                    </select>
+                  </label>
+                  <p className="settings-hint">当前页完成后逐页预加载；慢速或省流网络暂停预加载，读取失败即停止。</p>
                   <p className="settings-hint">用于漫画和 CoserPicture 阅读器的自动翻页按钮，支持 0.5 到 120 秒。</p>
                 </section>
               )}
 
               {draft && (
                 <section className="settings-section">
-                  <h3>媒体目录</h3>
+                  <h3>资源访问目录</h3>
+                  <p className="settings-hint">
+                    目录为只读信息。需要调整资源位置时，请修改容器的 volumes 映射和对应的 *_DIR 环境变量，然后重启服务。
+                  </p>
                   {(["comics", "novels", "audio", "gallery", "coser_picture"] as MediaDirectoryKey[]).map((dirKind) => (
-                    <div className="directory-editor" key={dirKind}>
+                    <div className="directory-editor readonly-directory" key={dirKind}>
                       <b>{mediaLabels[dirKind]}</b>
-                      <div className="directory-add">
-                        <input
-                          value={dirInputs[dirKind]}
-                          onChange={(event) => {
-                            const value = event.currentTarget.value;
-                            setDirInputs((prev) => ({ ...prev, [dirKind]: value }));
-                          }}
-                          placeholder="D:\\Media\\..."
-                        />
-                        <button className="icon-btn compact" onClick={() => addDir(dirKind)} aria-label="添加目录">
-                          <FolderPlus size={15} />
-                        </button>
-                      </div>
                       <div className="directory-list">
                         {draft.media_dirs[dirKind].map((path) => (
                           <span key={path}>
                             <em>{path}</em>
-                            <button className="icon-btn compact" onClick={() => removeDir(dirKind, path)} aria-label="移除目录配置">
-                              <FolderMinus size={15} />
-                            </button>
+                            <small>容器挂载</small>
                           </span>
                         ))}
                       </div>
@@ -1961,24 +1545,15 @@ function SettingsOverlay({
               {draft && (
                 <section className="settings-section">
                   <h3>封面缓存目录</h3>
+                  <p className="settings-hint">缓存目录同样由容器配置，应用内不提供修改入口。</p>
                   {(["comic", "novel", "audio", "gallery", "coser_picture"] as Array<keyof AppSettings["cover_cache_dirs"]>).map((cacheKind) => (
-                    <label className="setting-field" key={cacheKind}>
-                      <span>{coverCacheLabels[cacheKind]}</span>
-                      <input
-                        value={draft.cover_cache_dirs[cacheKind]}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          updateDraft((prev) => ({
-                            ...prev,
-                            cover_cache_dirs: {
-                              ...prev.cover_cache_dirs,
-                              [cacheKind]: value
-                            }
-                          }));
-                        }}
-                        placeholder="D:\\ArisList\\cover-cache\\..."
-                      />
-                    </label>
+                    <div className="directory-list readonly-directory" key={cacheKind}>
+                      <span>
+                        <b>{coverCacheLabels[cacheKind]}</b>
+                        <em>{draft.cover_cache_dirs[cacheKind]}</em>
+                        <small>容器目录</small>
+                      </span>
+                    </div>
                   ))}
                 </section>
               )}
@@ -2006,67 +1581,57 @@ function SettingsOverlay({
                         {"115 -> qmediasync -> STRM -> 本项目缓存/浏览器"}
                       </span>
                     </div>
-                    {cloudMessage && <p className="settings-hint">{cloudMessage}</p>}
                     {cloudStatus && (
                       <p className="settings-hint">
-                        云缓存 {formatBytes(cloudStatus.bytes)} / {cloudStatus.files} 文件
+                        云缓存 {formatBytes(cloudStatus.cache.bytes)} / {cloudStatus.cache.files} 文件
                       </p>
                     )}
-                    <div className="cloud-source-add">
-                      <select
-                        value={cloudInput.kind}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value as typeof cloudInput.kind;
-                          setCloudInput((prev) => ({ ...prev, kind: value }));
-                        }}
-                      >
-                        {(Object.keys(cloudKindLabels) as Array<typeof cloudInput.kind>).map((kind) => (
-                          <option key={kind} value={kind}>{cloudKindLabels[kind]}</option>
+                    <p className="settings-hint">STRM 根目录和挂载名为只读信息；修改请调整容器的 qmediasync 访问目录及 volumes 映射。</p>
+                    {draft.qmediasync.strm_roots.length > 0 && (
+                      <div className="directory-list readonly-directory cloud-source-list">
+                        {draft.qmediasync.strm_roots.map((root) => (
+                          <span key={root}>
+                            <em>STRM 根目录 · {root}</em>
+                            <small>容器挂载</small>
+                          </span>
                         ))}
-                      </select>
-                      <input
-                        value={cloudInput.mount_name}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setCloudInput((prev) => ({ ...prev, mount_name: value }));
-                        }}
-                        placeholder="挂载名"
-                      />
-                      <input
-                        value={cloudInput.root}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setCloudInput((prev) => ({ ...prev, root: value }));
-                        }}
-                        placeholder="STRM 根目录，例如 D:\\qms\\comics 或 /qms-strm/comics"
-                      />
-                      <input
-                        value={cloudInput.scan_depth}
-                        onChange={(event) => {
-                          const value = event.currentTarget.value;
-                          setCloudInput((prev) => ({ ...prev, scan_depth: value }));
-                        }}
-                        min={1}
-                        max={64}
-                        type="number"
-                      />
-                      <button className="icon-btn compact" disabled={cloudBusy || !cloudInput.root.trim()} onClick={testQMediaSyncRoot} aria-label="测试 STRM 目录">
-                        {cloudBusy ? <Loader2 className="spin" size={15} /> : <Cloud size={15} />}
-                      </button>
-                      <button className="icon-btn compact" onClick={addCloudSource} aria-label="添加云盘源">
-                        <FolderPlus size={15} />
-                      </button>
-                    </div>
-                    <div className="directory-list cloud-source-list">
-                      {draft.media_sources.map((source, index) => (
+                      </div>
+                    )}
+                    <div className="directory-list readonly-directory cloud-source-list">
+                      {draft.media_sources.map((source) => (
                         <span key={`${source.provider}-${source.kind}-${source.mount_name}-${source.root}`}>
                           <em>{cloudKindLabels[source.kind]} · {source.mount_name}:{source.root} · 深度 {source.scan_depth}</em>
-                          <button className="icon-btn compact" onClick={() => removeCloudSource(index)} aria-label="移除云盘源">
-                            <FolderMinus size={15} />
-                          </button>
+                          <small>容器源</small>
                         </span>
                       ))}
                     </div>
+                    {cloudStatus?.qmediasync.source_details.length ? (
+                      <div className="source-health-list">
+                        {cloudStatus.qmediasync.source_details.map((source) => (
+                          <div className="source-health-row" key={`${source.kind}-${source.mount_name}-${source.root}`}>
+                            <span className={`source-health-dot ${source.readable ? "ready" : "failed"}`} aria-hidden="true" />
+                            <div>
+                              <b>{cloudKindLabels[source.kind as keyof typeof cloudKindLabels] ?? source.kind} · {source.mount_name ?? "qmediasync"}</b>
+                              <small>{source.root} · {source.source} · 深度 {source.scan_depth} · {source.readable ? `发现 ${source.discovered} 个候选` : "不可读"}</small>
+                            </div>
+                            <em>{source.readable ? "可读" : "失败"}</em>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                    {latestScanResult ? (
+                      <div className="scan-source-results">
+                        <p className="settings-hint">最近一次扫描：{latestScanResult.status}</p>
+                        {latestScanResult.source_results.map((source) => (
+                          <div className="scan-source-result" key={`${source.kind}-${source.root}`}>
+                            <b>{cloudKindLabels[source.kind as keyof typeof cloudKindLabels] ?? source.kind}</b>
+                            <span>{source.root}</span>
+                            <em>{source.status} · 发现 {source.discovered} · 导入 {source.imported} · 跳过 {source.skipped} · 失败 {source.failed}</em>
+                            {source.message ? <small>{source.message}</small> : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 </section>
               )}
@@ -2089,8 +1654,7 @@ function SettingsOverlay({
                   </div>
                 </section>
               )}
-            </>
-          )}
+          </>
         </div>
       </motion.article>
     </motion.div>
@@ -2139,19 +1703,16 @@ type VirtualShelfProps<T> = {
   items: T[];
   itemKey: (item: T) => string | number;
   renderItem: (item: T, index: number) => ReactNode;
+  contentKind?: LibraryContentKind;
   viewMode: ViewMode;
 };
 
-function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfProps<T>) {
+function VirtualShelf<T>({ items, itemKey, renderItem, contentKind = "portrait", viewMode }: VirtualShelfProps<T>) {
   const ref = useRef<HTMLElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
-  const gap = viewMode === "list" ? 9 : 12;
-  const targetWidth = viewMode === "compact" ? 138 : viewMode === "cover" ? 240 : 182;
-  const columns = viewMode === "list" ? 1 : Math.max(1, Math.floor((viewport.width + gap) / (targetWidth + gap)));
-  const columnWidth = columns > 0 ? Math.max(viewMode === "compact" ? 120 : 160, (viewport.width - gap * (columns - 1)) / columns) : targetWidth;
-  const copyReserve = viewMode === "cover" ? 88 : Math.max(104, Math.min(168, columnWidth * 0.42 + 20));
-  const rowHeight = viewMode === "list" ? 128 + gap : Math.ceil(columnWidth * (4 / 3) + copyReserve + gap);
+  const layout = getLibraryLayout(viewMode, viewport.width, contentKind);
+  const { columns, gap, rowHeight } = layout;
   const rowCount = Math.ceil(items.length / columns);
   const overscanRows = 4;
   const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - overscanRows);
@@ -2161,6 +1722,31 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
   const visibleItems = items.slice(startIndex, endIndex);
   const totalHeight = Math.max(0, rowCount * rowHeight - gap);
   const offsetY = startRow * rowHeight;
+  const previousLayoutRef = useRef<typeof layout | null>(null);
+
+  useLayoutEffect(() => {
+    const node = ref.current;
+    const previous = previousLayoutRef.current;
+    previousLayoutRef.current = layout;
+    if (!node || !previous || items.length === 0) return;
+    if (previous.columns === layout.columns && previous.rowHeight === layout.rowHeight) return;
+    const anchorIndex = Math.min(
+      Math.max(0, items.length - 1),
+      Math.floor(node.scrollTop / previous.rowHeight) * previous.columns
+    );
+    const rowOffset = node.scrollTop % previous.rowHeight;
+    const nextScrollTop = Math.max(
+      0,
+      Math.min(
+        Math.max(0, totalHeight - viewport.height),
+        Math.floor(anchorIndex / layout.columns) * layout.rowHeight + Math.min(rowOffset, layout.rowHeight - 1)
+      )
+    );
+    if (Math.abs(node.scrollTop - nextScrollTop) > 1) {
+      node.scrollTop = nextScrollTop;
+      setScrollTop(nextScrollTop);
+    }
+  }, [items.length, layout, totalHeight, viewport.height]);
 
   useEffect(() => {
     const node = ref.current;
@@ -2188,9 +1774,12 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
   }, [items.length, totalHeight, viewMode]);
 
   const shelfStyle = {
-    "--virtual-columns": columns,
-    "--virtual-gap": `${gap}px`,
-    "--virtual-item-height": `${Math.max(80, rowHeight - gap)}px`,
+    "--library-columns": columns,
+    "--library-gap": `${gap}px`,
+    "--library-item-height": `${Math.max(80, layout.cardHeight)}px`,
+    "--library-column-width": `${layout.columnWidth}px`,
+    "--library-cover-ratio": layout.coverRatio,
+    "--library-text-reserve": `${layout.textReserve}px`,
     height: items.length > 0 && totalHeight > 0 && viewport.height > 0 ? `${Math.min(totalHeight, viewport.height)}px` : undefined,
   } as CSSProperties;
 
@@ -2209,13 +1798,11 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
       ) : (
         <div className="virtual-shelf-spacer" style={{ height: totalHeight }}>
           <div className="virtual-shelf-window" style={{ transform: `translateY(${offsetY}px)` }}>
-            <AnimatePresence mode="popLayout">
-              {visibleItems.map((item, localIndex) => (
-                <div className="virtual-shelf-cell" key={itemKey(item)}>
-                  {renderItem(item, startIndex + localIndex)}
-                </div>
-              ))}
-            </AnimatePresence>
+            {visibleItems.map((item, localIndex) => (
+              <div className="virtual-shelf-cell" key={itemKey(item)}>
+                {renderItem(item, startIndex + localIndex)}
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -2225,16 +1812,66 @@ function VirtualShelf<T>({ items, itemKey, renderItem, viewMode }: VirtualShelfP
 
 function CoverImage({ kind, loading = "lazy", src }: { kind: string; loading?: "eager" | "lazy"; src: string }) {
   const [failed, setFailed] = useState(false);
+  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const imageRef = useRef<HTMLImageElement | null>(null);
 
   useEffect(() => {
     setFailed(false);
+    setLoadedSrc(null);
+    setAttempt(0);
   }, [src]);
 
-  if (!src || failed) return <FallbackCover kind={kind} />;
-  return <img src={src} alt="" loading={loading} onError={() => setFailed(true)} />;
+  if (!src) return <FallbackCover kind={kind} />;
+  if (failed) {
+    return (
+      <div
+        className="cover-load-error"
+        data-state="error"
+        role="button"
+        tabIndex={0}
+        aria-label="封面加载失败，点击重试"
+        onClick={(event) => {
+          event.stopPropagation();
+          setFailed(false);
+          setLoadedSrc(null);
+          setAttempt((value) => value + 1);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            event.stopPropagation();
+            setFailed(false);
+            setLoadedSrc(null);
+            setAttempt((value) => value + 1);
+          }
+        }}
+      >
+        <span>封面暂时无法加载</span>
+        <small>点击重试</small>
+      </div>
+    );
+  }
+  const requestSrc = attempt > 0
+    ? `${src}${src.includes("?") ? "&" : "?"}retry=${attempt}`
+    : src;
+  return (
+    <img
+      ref={(node) => {
+        imageRef.current = node;
+        if (node?.complete && node.naturalWidth > 0) setLoadedSrc(src);
+      }}
+      src={requestSrc}
+      alt=""
+      loading={loading}
+      data-loaded={loadedSrc === src}
+      onLoad={() => setLoadedSrc(src)}
+      onError={() => setFailed(true)}
+    />
+  );
 }
 
-function WorkCard({ work, index, selected, viewMode, onClick }: { work: WorkSummary; index: number; selected: boolean; viewMode: ViewMode; onClick: () => void }) {
+function WorkCard({ work, selected, viewMode, onClick }: { work: WorkSummary; selected: boolean; viewMode: ViewMode; onClick: () => void }) {
   const meta = parseMeta<{ series?: string; page_count?: number; volume_count?: number; first_work_id?: number; image_count?: number }>(work.meta_json);
   const cover = workCoverUrl(work);
   const badge = isArchiveWorkKind(work.kind) && meta.page_count
@@ -2247,15 +1884,11 @@ function WorkCard({ work, index, selected, viewMode, onClick }: { work: WorkSumm
           ? `${meta.volume_count ?? work.asset_count}套`
           : work.kind === "gallery" && meta.image_count ? `${meta.image_count}图` : null;
   return (
-    <motion.button
-      layout
+    <button
+      type="button"
       className={selected ? "work-card selected" : "work-card"}
       data-view={viewMode}
       onClick={onClick}
-      initial={{ opacity: 0, y: 18 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, scale: 0.98 }}
-      transition={{ delay: Math.min(index * 0.018, 0.18), duration: 0.22 }}
     >
       <div className="cover">
         {cover ? <CoverImage kind={work.kind} src={cover} /> : <FallbackCover kind={work.kind} />}
@@ -2272,7 +1905,7 @@ function WorkCard({ work, index, selected, viewMode, onClick }: { work: WorkSumm
           <span style={{ width: `${Math.min(100, Math.max(0, work.progress * 100))}%` }} />
         </div>
       </div>
-    </motion.button>
+    </button>
   );
 }
 
@@ -2284,8 +1917,7 @@ function DetailPane({
   onClose,
   onTagPick,
   onPlayTrack,
-  onOpenReader,
-  liquid = false
+  onOpenReader
 }: {
   detail: WorkDetail | null;
   jobs: Job[];
@@ -2295,7 +1927,6 @@ function DetailPane({
   onTagPick: (key: string) => void;
   onPlayTrack: (work: WorkDetail["work"], asset: Asset, playlist?: Asset[], playlistTotal?: number) => void;
   onOpenReader: (resume?: boolean) => void;
-  liquid?: boolean;
 }) {
   const [jobOpen, setJobOpen] = useState(false);
   const tracks = detail?.assets.filter((asset) => asset.role === "track" || asset.mime.startsWith("audio/")) ?? [];
@@ -2329,7 +1960,7 @@ function DetailPane({
 
   const detailClassName = variant === "modal" ? "detail-pane detail-pane-modal" : "detail-pane";
   const detailContent = (
-      <AnimatePresence mode="wait">
+      <AnimatePresence>
         {detail ? (
           <motion.div key={detail.work.id} initial={{ opacity: 0, x: 24 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: 12 }} className="detail-content">
             {variant === "modal" && (
@@ -2385,18 +2016,18 @@ function DetailPane({
               </div>
             </div>
             <div className="tag-cloud tag-group-list">
-              {groupedTags.map((group) => (
-                <div className="tag-group" key={group.namespace}>
-                  <span className="tag-group-name">{group.namespace}</span>
-                  <div className="tag-group-items">
-                    {group.tags.map((tag) => (
-                      <button key={tagKey(tag)} onClick={() => onTagPick(tagKey(tag))}>
-                        {tagLabel(tag, tagLanguage)}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
+              <div className="tag-group-names">
+                {groupedTags.map((group) => (
+                  <span className="tag-group-name" key={group.namespace}>{group.namespace}</span>
+                ))}
+              </div>
+              <div className="tag-group-values">
+                {groupedTags.flatMap((group) => group.tags).map((tag) => (
+                  <button key={tagKey(tag)} onClick={() => onTagPick(tagKey(tag))}>
+                    {tagLabel(tag, tagLanguage)}
+                  </button>
+                ))}
+              </div>
             </div>
             {detail.work.description && <p className="description">{detail.work.description}</p>}
             {displayTracks.length > 0 && (
@@ -2463,11 +2094,7 @@ function DetailPane({
       </AnimatePresence>
   );
 
-  return liquid ? (
-    <GlassSurface as="aside" className={detailClassName} variant={variant === "modal" ? "floating" : "panel"} onClick={(event) => event.stopPropagation()}>
-      {detailContent}
-    </GlassSurface>
-  ) : (
+  return (
     <aside className={detailClassName} onClick={(event) => event.stopPropagation()}>
       {detailContent}
     </aside>
@@ -2491,15 +2118,13 @@ function AudioDock({
   canPersistProgress,
   onClose,
   onProgressSaved,
-  resumePosition,
-  liquid = false
+  resumePosition
 }: {
   active: ActiveAudioState | null;
   canPersistProgress: boolean;
   onClose: () => void;
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
   resumePosition?: string | null;
-  liquid?: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const lastProgressWrite = useRef(0);
@@ -2915,14 +2540,14 @@ function AudioDock({
     </>
   );
 
-  return liquid ? (
-    <motion.div className="audio-dock-motion" initial={{ y: 80 }} animate={{ y: 0 }} exit={{ y: 80 }}>
-      <GlassSurface className="audio-dock" variant="dock">
-        {audioContent}
-      </GlassSurface>
-    </motion.div>
-  ) : (
-    <motion.div className="audio-dock" initial={{ y: 80 }} animate={{ y: 0 }} exit={{ y: 80 }}>
+  return (
+    <motion.div
+      className="audio-dock"
+      initial={{ opacity: 0, transform: "translateY(24px)" }}
+      animate={{ opacity: 1, transform: "translateY(0)" }}
+      exit={{ opacity: 0, transform: "translateY(12px)" }}
+      transition={{ duration: uiDuration.fade, ease: uiEaseOut }}
+    >
       {audioContent}
     </motion.div>
   );
@@ -2930,16 +2555,17 @@ function AudioDock({
 
 function ReaderOverlay({
   canPersistProgress,
+  comicPrefetchPages = 5,
   comicAutoReadIntervalMs = defaultReaderSettings.comic_auto_read_interval_ms,
   detail,
   onClose,
   onPlayTrack,
   onProgressSaved,
   readerDerivativesEnabled,
-  resumePosition,
-  liquid = false
+  resumePosition
 }: {
   canPersistProgress: boolean;
+  comicPrefetchPages?: number;
   comicAutoReadIntervalMs?: number;
   detail: WorkDetail;
   onClose: () => void;
@@ -2947,7 +2573,6 @@ function ReaderOverlay({
   onProgressSaved: (id: number, progress: number, position?: string | null) => void;
   readerDerivativesEnabled: boolean;
   resumePosition?: string | null;
-  liquid?: boolean;
 }) {
   const [pages, setPages] = useState<ComicPageInfo[]>([]);
   const [comicPageCount, setComicPageCount] = useState(0);
@@ -2971,6 +2596,11 @@ function ReaderOverlay({
   const comicPendingScrollRef = useRef<{ left: number; top: number; page: number } | null>(null);
   const comicLayoutKeyRef = useRef<string | null>(null);
   const comicPagePreloadsRef = useRef(new Map<string, HTMLImageElement>());
+  const [readerAssets, setReaderAssets] = useState<Asset[]>(detail.assets);
+  const [strmTask, setStrmTask] = useState<StrmTask | null>(null);
+  const [strmPrepareError, setStrmPrepareError] = useState<string | null>(null);
+  const [strmPreparing, setStrmPreparing] = useState(false);
+  const strmArchive = detail.assets.find((asset) => asset.role === "archive" && asset.path.startsWith("qms-strm://"));
   const mediaImages = detail.assets.filter((asset) => ["generated", "image"].includes(asset.role) && asset.mime.startsWith("image/"));
   const comicArchiveVersion = assetVersion(detail.assets.find((asset) => asset.role === "archive"), detail.work.updated_at);
   const resumeTarget = useMemo(() => parseReadingPosition(resumePosition), [resumePosition]);
@@ -2980,6 +2610,50 @@ function ReaderOverlay({
     canPersistProgress,
     onProgressSaved
   );
+
+  useEffect(() => {
+    setReaderAssets(detail.assets);
+    setStrmTask(null);
+    setStrmPrepareError(null);
+  }, [detail.work.id, detail.assets]);
+
+  useEffect(() => {
+    if (!strmTask || ["done", "failed", "cancelled"].includes(strmTask.status)) return;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        const next = await api.strmTask(strmTask.id, controller.signal);
+        if (controller.signal.aborted) return;
+        setStrmTask(next);
+        if (next.status === "done") {
+          const refreshed = await api.work(detail.work.id, controller.signal, "legacy");
+          if (!controller.signal.aborted) setReaderAssets(refreshed.assets);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) setStrmPrepareError(error instanceof Error ? error.message : String(error));
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 2000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [detail.work.id, strmTask?.id, strmTask?.status]);
+
+  const prepareStrmArchive = async () => {
+    if (!strmArchive || strmPreparing) return;
+    setStrmPreparing(true);
+    setStrmPrepareError(null);
+    try {
+      const task = await api.prepareStrmAsset(strmArchive.id);
+      setStrmTask(task);
+    } catch (error) {
+      setStrmPrepareError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStrmPreparing(false);
+    }
+  };
 
   useLayoutEffect(() => {
     return () => {
@@ -3081,47 +2755,54 @@ function ReaderOverlay({
   // a derivative generation attempt fails.  Zooming beyond 1.25x requests
   // the original so the optional downsample never becomes a quality trap.
   const comicReaderSize = comicZoom > 1.25 ? undefined : comicMeasuredWidth >= 1440 ? 1920 : 1280;
-  const comicReaderPrefetchRadius = useMemo(() => getComicReaderPrefetchRadius(), []);
+  const [loadedComicUrl, setLoadedComicUrl] = useState("");
+  const currentComicUrl = comicPageUrl(detail.work.id, page, comicArchiveVersion, comicReaderSize);
+  const prefetchCount = Math.max(5, Math.min(10, Math.trunc(comicPrefetchPages) || 5));
 
   useEffect(() => {
     const cache = comicPagePreloadsRef.current;
-    if (
-      !readerDerivativesEnabled ||
-      !isArchiveReader ||
-      !comicReaderSize ||
-      comicPageCount <= 1 ||
-      comicReaderPrefetchRadius <= 0
-    ) {
-      clearGalleryPreloads(cache);
-      return;
-    }
-
-    const desired = new Set<string>();
-    const safePage = Math.min(Math.max(page, 0), comicPageCount - 1);
-    for (let distance = 1; distance <= comicReaderPrefetchRadius; distance += 1) {
-      for (const candidate of [safePage + distance, safePage - distance]) {
-        if (candidate < 0 || candidate >= comicPageCount) continue;
-        desired.add(comicPageUrl(detail.work.id, candidate, comicArchiveVersion, comicReaderSize));
-      }
-    }
-    for (const url of desired) {
-      rememberGalleryPreload(cache, url, false, COMIC_READER_PREFETCH_LIMIT);
-    }
+    const visibleLoaded = comicStageRef.current?.querySelectorAll("img");
+    const currentReady = loadedComicUrl === currentComicUrl || Array.from(visibleLoaded ?? []).some(
+      image => image.getAttribute("src") === currentComicUrl && image.complete && image.naturalWidth > 0);
+    if (!isArchiveReader || !currentReady || !allowsOriginalPreload()) return;
+    let stopped = false;
+    let active: HTMLImageElement | undefined;
+    const desired = new Set(Array.from({ length: Math.min(prefetchCount, Math.max(0, comicPageCount - page - 1)) },
+      (_, offset) => comicPageUrl(detail.work.id, page + offset + 1, comicArchiveVersion, comicReaderSize)));
+    // Only retain the current page and the forward window in JS memory.
     for (const [url, image] of cache) {
-      if (desired.has(url)) continue;
+      if (url === currentComicUrl || desired.has(url)) continue;
       image.removeAttribute("src");
       cache.delete(url);
     }
-  }, [
-    comicArchiveVersion,
-    comicPageCount,
-    comicReaderPrefetchRadius,
-    comicReaderSize,
-    detail.work.id,
-    isArchiveReader,
-    page,
-    readerDerivativesEnabled
-  ]);
+    void (async () => {
+      for (const url of desired) {
+        if (stopped) break;
+        const existing = cache.get(url);
+        if (existing?.complete && existing.naturalWidth > 0) continue;
+        const image = new window.Image();
+        active = image;
+        image.fetchPriority = "low";
+        const success = await new Promise<boolean>((resolve) => {
+          image.onload = () => resolve(true);
+          image.onerror = () => resolve(false);
+          image.src = url;
+        });
+        image.onload = null;
+        image.onerror = null;
+        if (stopped || !success) break; // Do not hammer a failing/cloud-cooled source.
+        cache.set(url, image);
+      }
+    })();
+    return () => {
+      stopped = true;
+      if (active && !active.complete) {
+        active.onerror?.(new Event("error"));
+        active.removeAttribute("src");
+      }
+    };
+  }, [comicArchiveVersion, comicPageCount, comicReaderSize, currentComicUrl,
+    detail.work.id, isArchiveReader, loadedComicUrl, page, prefetchCount]);
 
   useEffect(() => () => clearGalleryPreloads(comicPagePreloadsRef.current), []);
   const comicSlotWidth = comicHorizontalSlotWidthFromSize(comicMeasuredWidth, comicMeasuredHeight, comicAspect, comicZoom);
@@ -3452,7 +3133,7 @@ function ReaderOverlay({
     immersiveReader ? "reader-immersive" : "",
     immersiveReader ? (readerChromeVisible ? "chrome-visible" : "chrome-hidden") : ""
   ].filter(Boolean).join(" ");
-  const liquidReaderBarClassName = [
+  const readerBarClassName = [
     "reader-bar",
     isArchiveReader || isGallery ? "reader-bar-floating" : "reader-bar-docked",
     isGallery ? "reader-bar-gallery" : ""
@@ -3467,25 +3148,7 @@ function ReaderOverlay({
         exit={{ scale: 0.98, y: 18 }}
         onWheel={onHorizontalComicWheel}
       >
-        {!isNovel && (liquid ? (
-          <div className={liquidReaderBarClassName}>
-            <GlassSurface className="reader-back-surface" variant="dock">
-              <button className="icon-btn reader-back-button" onClick={closeReader} aria-label="关闭">
-                <ChevronLeft size={18} />
-              </button>
-            </GlassSurface>
-            {!isGallery && (
-              <GlassSurface className="reader-title-surface" variant="dock">
-                <span className="reader-title-pill">{detail.work.title}</span>
-              </GlassSurface>
-            )}
-            <GlassSurface className="reader-actions-surface" variant="dock">
-              <div className="reader-actions">{readerActionsContent}</div>
-            </GlassSurface>
-          </div>
-        ) : (
-          <div className="reader-bar">{readerBarContent}</div>
-        ))}
+        {!isNovel && <div className={readerBarClassName}>{readerBarContent}</div>}
         {isArchiveReader ? (
           <div
             className="comic-stage"
@@ -3504,14 +3167,15 @@ function ReaderOverlay({
             }}
             ref={comicStageRef}
           >
-            {comicError && <div className="reader-error archive-reader-error">{comicError}</div>}
+            {comicError && <div className="reader-error archive-reader-error">{strmArchive ? strmReadErrorMessage(comicError) : comicError}</div>}
             {comicPageCount > 0 && comicMode === "paged" ? (
               <motion.img
                 key={page}
+                onLoad={(event) => setLoadedComicUrl(event.currentTarget.getAttribute("src") ?? "")}
                 src={comicPageUrl(detail.work.id, page, comicArchiveVersion, comicReaderSize)}
                 alt=""
-                initial={{ opacity: 0, x: 16 }}
-                animate={{ opacity: 1, x: 0 }}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
                 style={{ position: "absolute", inset: 0, width: "100%", height: "100%", maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
               />
             ) : comicPageCount > 0 ? (
@@ -3535,6 +3199,7 @@ function ReaderOverlay({
                           <img
                             alt=""
                             loading="lazy"
+                            onLoad={(event) => { if (index === page) setLoadedComicUrl(event.currentTarget.getAttribute("src") ?? ""); }}
                             src={comicPageUrl(detail.work.id, index, comicArchiveVersion, comicReaderSize)}
                           />
                         </div>
@@ -3565,6 +3230,7 @@ function ReaderOverlay({
                           <img
                             alt=""
                             loading="lazy"
+                            onLoad={(event) => { if (index === page) setLoadedComicUrl(event.currentTarget.getAttribute("src") ?? ""); }}
                             src={comicPageUrl(detail.work.id, index, comicArchiveVersion, comicReaderSize)}
                             style={{
                               height: `${slotHeight}px`,
@@ -3609,9 +3275,9 @@ function ReaderOverlay({
                   rel="noreferrer"
                   key={asset.id}
                   data-image-index={index}
-                  initial={{ opacity: 0, y: 12 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: Math.min(index * 0.025, 0.2), duration: 0.2 }}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.18 }}
                   onClick={() => persistProgress((index + 1) / Math.max(1, mediaImages.length), `image:${index}`)}
                 >
                   <img src={thumbUrl(asset.id, 360, assetVersion(asset, detail.work.updated_at))} alt="" loading="lazy" />
@@ -3626,7 +3292,7 @@ function ReaderOverlay({
             <h2>{detail.work.title}</h2>
             {(() => {
               const tracks = preferredTrackVariants(
-                detail.assets.filter((asset) => asset.role === "track" || asset.mime.startsWith("audio/"))
+                readerAssets.filter((asset) => asset.role === "track" || asset.mime.startsWith("audio/"))
               );
               return tracks.length > 0 ? (
                 <>
@@ -3645,7 +3311,18 @@ function ReaderOverlay({
                   ))}
                 </>
               ) : (
-                <p className="audio-reader-hint">未找到可播放轨道</p>
+                <>
+                  <p className="audio-reader-hint">
+                    {strmArchive ? "这是一个远程归档音声，需要先读取目录并建立可播放轨道。" : "未找到可播放轨道"}
+                  </p>
+                  {strmArchive && (
+                    <button className="primary-action" type="button" disabled={strmPreparing || ["downloading", "parsing-directory", "extracting"].includes(strmTask?.phase ?? "")} onClick={() => void prepareStrmArchive()}>
+                      {strmPreparing ? "提交准备任务…" : strmTask?.status === "waiting-password" ? "等待输入密码" : strmTask?.message ?? "准备音声归档"}
+                    </button>
+                  )}
+                  {strmPrepareError && <p className="reader-error">{strmReadErrorMessage(strmPrepareError)}</p>}
+                  {strmTask && strmTask.status !== "done" && strmTask.message && <p className="audio-reader-hint">{strmTask.phase} · {strmReadErrorMessage(strmTask.message)}</p>}
+                </>
               );
             })()}
           </div>
@@ -4230,7 +3907,7 @@ function GalleryStage({
 
 function FallbackCover({ kind }: { kind: string }) {
   return (
-    <div className="fallback-cover" data-kind={kind}>
+    <div className="fallback-cover" data-kind={kind} data-state="missing" aria-label="暂无封面" title="暂无封面">
       {kindIcon[kind] ?? <Sparkles size={24} />}
     </div>
   );
@@ -4699,7 +4376,6 @@ function cycleTagFilter(filters: Record<string, TagFilterMode>, key: string) {
 function normalizeSettingsDraft(settings: AppSettings): AppSettings {
   return {
     ...settings,
-    appearance: settings.appearance ?? defaultAppearance,
     reader: {
       ...defaultReaderSettings,
       ...(settings.reader ?? {}),
@@ -4731,12 +4407,6 @@ function normalizeSettingsDraft(settings: AppSettings): AppSettings {
       strm_roots: []
     }
   };
-}
-
-function normalizeStrmRoot(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return "";
-  return trimmed.replace(/[\\/]+$/g, "");
 }
 
 function formatBytes(value: number) {
@@ -4865,17 +4535,6 @@ function allowsOriginalPreload() {
   return !connection?.effectiveType || !["slow-2g", "2g", "3g"].includes(connection.effectiveType);
 }
 
-function getComicReaderPrefetchRadius() {
-  if (typeof navigator === "undefined") return 1;
-  const connection = (navigator as Navigator & {
-    connection?: { saveData?: boolean; effectiveType?: string };
-  }).connection;
-  if (connection?.saveData || connection?.effectiveType === "slow-2g") return 0;
-  if (connection?.effectiveType === "2g" || connection?.effectiveType === "3g") return 1;
-  const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
-  if (typeof deviceMemory === "number" && deviceMemory > 0 && deviceMemory <= 2) return 1;
-  return 2;
-}
 
 function preferredTrackVariants(tracks: Asset[]) {
   const byKey = new Map<string, Asset>();
@@ -4903,3 +4562,17 @@ function isPreferredTrack(candidate: Asset, current: Asset) {
 }
 
 
+
+// Keep source/network failures distinct from missing local metadata.
+function strmReadErrorMessage(message: string): string {
+  if (message.includes("STRM target resolves to a non-public address")) {
+    return "漫画正文尚未读取：STRM 域名解析到了非公网地址，后端已阻止请求。请检查后端所在设备的 DNS 和代理设置（可能为 Fake-IP）。本地封面和标题加载成功不代表云盘可访问；重扫不会修复此问题。若确实使用内网媒体服务，请由管理员配置该来源的精确信任规则。";
+  }
+  if (message.includes("STRM DNS lookup")) {
+    return "无法解析 STRM 域名，请检查后端所在设备的 DNS 和网络连接。";
+  }
+  if (message.includes("STRM source is cooling down") || message.includes("STRM source recently failed")) {
+    return "云盘请求失败后正在等待冷却，请稍后重试，避免连续请求。";
+  }
+  return message;
+}

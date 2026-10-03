@@ -1,7 +1,6 @@
 mod archive;
 mod assets;
 mod atomic_file;
-mod auth;
 mod catalog;
 mod catalog_reconciliation;
 mod catalog_writer;
@@ -20,6 +19,7 @@ mod scanner;
 mod search;
 mod security;
 mod settings;
+mod strm;
 mod vfs;
 mod watcher;
 
@@ -41,7 +41,6 @@ pub mod sqlite {
 }
 
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,8 +64,6 @@ pub struct AppState {
     pub catalog_runtime: catalog::CatalogRuntime,
     pub search_runtime: search::SearchRuntime,
     pub comic_page_cache: Arc<assets::ComicPageCache>,
-    pub auth_epoch: Arc<tokio::sync::RwLock<String>>,
-    pub admin_password_persisted: Arc<AtomicBool>,
 }
 
 fn response_has_no_byte_ranges(
@@ -111,12 +108,6 @@ async fn main() -> anyhow::Result<()> {
     );
     let resources = ResourceGovernor::new(resource_limits);
     let _resource_memory_monitor = resources.spawn_memory_monitor();
-    if config.admin_password_ephemeral {
-        tracing::warn!(
-            password = %config.app_admin_password,
-            "generated an ephemeral admin password for loopback-only access; set APP_ADMIN_PASSWORD or change it in the application to persist a password"
-        );
-    }
     tokio::fs::create_dir_all(&config.data_dir).await?;
     tokio::fs::create_dir_all(&config.generated_dir).await?;
 
@@ -183,8 +174,6 @@ async fn main() -> anyhow::Result<()> {
         catalog_runtime: catalog::CatalogRuntime::default(),
         search_runtime: search::SearchRuntime::default(),
         comic_page_cache: Arc::new(Default::default()),
-        auth_epoch: Arc::new(tokio::sync::RwLock::new(uuid::Uuid::new_v4().to_string())),
-        admin_password_persisted: Arc::new(AtomicBool::new(config.admin_password_persisted)),
     });
     if !state.config.search_incremental_reader_enabled {
         let prewarm_started = std::time::Instant::now();

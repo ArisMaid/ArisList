@@ -181,12 +181,6 @@ export type SearchResponse = {
   hits: Array<{ work_id: number; score: number; title: string; kind: string }>;
 };
 
-export type AuthSession = {
-  authenticated: boolean;
-  csrf?: string | null;
-  user?: string | null;
-};
-
 export type HealthResponse = {
   status: string;
   features?: {
@@ -195,10 +189,6 @@ export type HealthResponse = {
     file_watcher?: boolean;
   };
 };
-
-export type ThemeMode = "light" | "dark";
-export type UiMaterial = "classic" | "liquid";
-export type GlassIntensity = "clear" | "standard" | "readable";
 
 export type AssetRouteInfo = {
   asset_id: number;
@@ -214,15 +204,36 @@ export type AssetRouteInfo = {
   note?: string | null;
 };
 
+export type StrmTask = {
+  id: string;
+  asset_id: number;
+  status: string;
+  phase: string;
+  progress: number;
+  total?: number | null;
+  message?: string | null;
+  cooling_until?: string | null;
+  requires_password: boolean;
+  missing_volumes: string[];
+};
+
+export type StrmDiagnostic = {
+  asset_id: number;
+  scope: string;
+  remote_checked: boolean;
+  target_host?: string | null;
+  status?: number;
+  range_supported: boolean;
+  content_range?: string | null;
+  content_length?: number | null;
+  message: string;
+};
+
 export type AppSettings = {
-  theme: ThemeMode;
   detail_mode: "modal" | "docked";
-  appearance: {
-    material: UiMaterial;
-    glass_intensity: GlassIntensity;
-  };
   reader: {
     comic_auto_read_interval_ms: number;
+    comic_prefetch_pages: number;
   };
   media_dirs: {
     comics: string[];
@@ -265,24 +276,36 @@ export type AppSettings = {
   };
 };
 
-let csrfToken = typeof window !== "undefined" ? window.localStorage.getItem("media_shelf_csrf") : null;
+export type CloudSourceStatus = {
+  kind: string;
+  provider: string;
+  mount_name?: string | null;
+  root: string;
+  source: "explicit" | "env" | "legacy" | string;
+  scan_depth: number;
+  readable: boolean;
+  status: "ready" | "failed" | string;
+  discovered: number;
+  message?: string | null;
+};
 
-export function setCsrfToken(token?: string | null) {
-  csrfToken = token ?? null;
-  if (typeof window === "undefined") return;
-  if (csrfToken) window.localStorage.setItem("media_shelf_csrf", csrfToken);
-  else window.localStorage.removeItem("media_shelf_csrf");
-}
+export type CloudStatus = {
+  qmediasync: {
+    enabled: boolean;
+    base_url: string;
+    configured: boolean;
+    sources: number;
+    strm_roots: number;
+    source_details: CloudSourceStatus[];
+  };
+  cache: { bytes: number; files: number; quota_bytes?: number };
+};
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const method = (init?.method ?? "GET").toUpperCase();
   const headers = {
     "content-type": "application/json",
     ...(init?.headers ?? {})
   } as Record<string, string>;
-  if (!["GET", "HEAD", "OPTIONS"].includes(method) && csrfToken) {
-    headers["x-csrf-token"] = csrfToken;
-  }
   const res = await fetch(url, {
     ...init,
     credentials: "same-origin",
@@ -306,32 +329,6 @@ async function requestText(url: string, init?: RequestInit): Promise<string> {
 
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
-  authSession: async () => {
-    const session = await request<AuthSession>("/api/auth/session");
-    setCsrfToken(session.csrf);
-    return session;
-  },
-  login: async (password: string) => {
-    const session = await request<AuthSession>("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ password })
-    });
-    setCsrfToken(session.csrf);
-    return session;
-  },
-  changePassword: (password: string) =>
-    request<{ status: string }>("/api/auth/password", {
-      method: "PATCH",
-      body: JSON.stringify({ password })
-    }),
-  logout: async () => {
-    await fetch("/api/auth/logout", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: csrfToken ? { "x-csrf-token": csrfToken } : undefined
-    });
-    setCsrfToken(null);
-  },
   library: ({ cursor, limit = 100, includeContext, signal }: LibraryRequestOptions = {}) => {
     const params = new URLSearchParams();
     if (cursor) params.set("cursor", cursor);
@@ -368,12 +365,25 @@ export const api = {
       signal: options.signal
     }),
   history: (signal?: AbortSignal) => request<HistoryRecord[]>("/api/history", { signal }),
-  cloudStatus: () => request<{ qmediasync: { enabled: boolean; base_url: string; configured: boolean; sources: number; strm_roots: number }; cache: { bytes: number; files: number } }>("/api/cloud/status"),
+  cloudStatus: () => request<CloudStatus>("/api/cloud/status"),
   testQMediaSyncStrmRoot: (input: { root: string; kind?: string; scan_depth?: number }) =>
-    request<{ status: string; root: string; works: number; strm_files: number; samples: string[] }>("/api/cloud/qmediasync/test-strm-root", {
+    request<{ status: string; scope: string; remote_checked: boolean; root: string; works: number; strm_files: number; samples: string[]; message?: string }>("/api/cloud/qmediasync/test-strm-root", {
       method: "POST",
       body: JSON.stringify(input)
     }),
+  prepareStrmAsset: (assetId: number) =>
+    request<StrmTask>(`/api/assets/${assetId}/prepare`, { method: "POST" }),
+  strmTask: (taskId: string, signal?: AbortSignal) =>
+    request<StrmTask>(`/api/strm/tasks/${encodeURIComponent(taskId)}`, { signal }),
+  setStrmPassword: (taskId: string, password: string) =>
+    request<StrmTask>(`/api/strm/tasks/${encodeURIComponent(taskId)}/password`, {
+      method: "POST",
+      body: JSON.stringify({ password })
+    }),
+  cancelStrmTask: (taskId: string) =>
+    request<StrmTask>(`/api/strm/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }),
+  diagnoseStrmAsset: (assetId: number) =>
+    request<StrmDiagnostic>(`/api/assets/${assetId}/diagnose`, { method: "POST" }),
   galleryPage: (id: number, cursor: string | number | null = null, limit = 120, signal?: AbortSignal, version?: string | null) => {
     const params = new URLSearchParams();
     if (cursor !== null && cursor !== undefined) params.set("cursor", String(cursor));

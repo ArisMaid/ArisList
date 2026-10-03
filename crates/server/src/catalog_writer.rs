@@ -47,6 +47,10 @@ pub struct MutationFence {
     /// work may set it true, which authorizes removal of scanner-owned facts
     /// whose seen token was not refreshed by any preceding chunk.
     pub complete_snapshot: bool,
+    /// A missing sidecar is not a complete metadata observation. Keep the
+    /// previous scanner-owned tag links while still allowing current assets
+    /// and work fields to be refreshed.
+    pub preserve_scanner_tags: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1374,13 +1378,49 @@ async fn update_existing_work(
     meta_json: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<bool> {
+    let mapped = mutation.work.meta.get("comic_info").is_some();
+    let mut title = mutation.work.title.clone();
+    let mut subtitle = mutation.work.subtitle.clone();
+    let mut description = mutation.work.description.clone();
+    if mapped {
+        let previous =
+            sqlx::query("SELECT title, subtitle, description, meta_json FROM works WHERE id = ?1")
+                .bind(work_id)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let previous_meta = previous
+            .as_ref()
+            .and_then(|row| serde_json::from_str::<Value>(&row.get::<String, _>("meta_json")).ok())
+            .unwrap_or_default();
+        let fields = previous.as_ref().map(|row| {
+            (
+                row.get::<String, _>("title"),
+                row.get::<Option<String>, _>("subtitle"),
+                row.get::<Option<String>, _>("description"),
+            )
+        });
+        (title, subtitle, description) = crate::scanner::comic_info::merge_existing_fields(
+            &title,
+            subtitle.as_deref(),
+            description.as_deref(),
+            &mutation.work.meta,
+            fields.as_ref().map(|(title, subtitle, description)| {
+                (
+                    title.as_str(),
+                    subtitle.as_deref(),
+                    description.as_deref(),
+                    &previous_meta,
+                )
+            }),
+        );
+    }
     let result = sqlx::query(
         r#"
         UPDATE works
         SET title = ?1,
-            subtitle = COALESCE(?2, subtitle),
+            subtitle = CASE WHEN ?11 THEN ?2 ELSE COALESCE(?2, subtitle) END,
             category = ?3,
-            description = COALESCE(?4, description),
+            description = CASE WHEN ?11 THEN ?4 ELSE COALESCE(?4, description) END,
             rating = COALESCE(?5, rating),
             source_path = ?6,
             meta_json = json_patch(
@@ -1394,9 +1434,9 @@ async fn update_existing_work(
           AND kind = ?10
           AND (
                 title IS NOT ?1
-             OR subtitle IS NOT COALESCE(?2, subtitle)
+             OR subtitle IS NOT CASE WHEN ?11 THEN ?2 ELSE COALESCE(?2, subtitle) END
              OR category IS NOT ?3
-             OR description IS NOT COALESCE(?4, description)
+             OR description IS NOT CASE WHEN ?11 THEN ?4 ELSE COALESCE(?4, description) END
              OR rating IS NOT COALESCE(?5, rating)
              OR source_path IS NOT ?6
              OR deleted_at IS NOT NULL
@@ -1408,16 +1448,17 @@ async fn update_existing_work(
           )
         "#,
     )
-    .bind(&mutation.work.title)
-    .bind(&mutation.work.subtitle)
+    .bind(&title)
+    .bind(&subtitle)
     .bind(&mutation.work.category)
-    .bind(&mutation.work.description)
+    .bind(&description)
     .bind(mutation.work.rating)
     .bind(&mutation.work.source_path)
     .bind(meta_json)
     .bind(now)
     .bind(work_id)
     .bind(&mutation.source.kind)
+    .bind(mapped)
     .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {
@@ -1747,7 +1788,7 @@ async fn merge_tags(
     .await?;
 
     let mut links_deleted = 0;
-    if mutation.fence.complete_snapshot {
+    if mutation.fence.complete_snapshot && !mutation.fence.preserve_scanner_tags {
         sqlx::query(
             r#"
             DELETE FROM work_tag_sources
@@ -2195,6 +2236,7 @@ mod tests {
                 root_generation: generation,
                 scan_token: token.to_string(),
                 complete_snapshot,
+                preserve_scanner_tags: false,
             },
             fingerprint: fingerprint.to_string(),
             work: WorkMutationFields {

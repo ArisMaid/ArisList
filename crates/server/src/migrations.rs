@@ -1358,6 +1358,48 @@ const MIGRATIONS: &[Migration] = &[
             "#,
         ],
     },
+    Migration {
+        version: 25,
+        name: "strm-archive-entry-assets",
+        statements: &[
+            r#"
+            CREATE TABLE archive_asset_entries (
+                parent_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                entry_key TEXT NOT NULL,
+                derived_asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+                entry_path TEXT NOT NULL,
+                source_version TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                PRIMARY KEY(parent_asset_id, entry_key),
+                UNIQUE(derived_asset_id)
+            )
+            "#,
+            r#"
+            CREATE INDEX idx_archive_asset_entries_derived
+            ON archive_asset_entries(derived_asset_id)
+            "#,
+        ],
+    },
+    Migration {
+        version: 26,
+        name: "strm-archive-entry-parent-cleanup",
+        statements: &[r#"
+            CREATE TRIGGER archive_asset_entries_parent_cleanup
+            BEFORE DELETE ON assets
+            WHEN EXISTS (
+                SELECT 1 FROM archive_asset_entries
+                WHERE parent_asset_id = OLD.id
+            )
+            BEGIN
+                DELETE FROM assets
+                WHERE id IN (
+                    SELECT derived_asset_id
+                    FROM archive_asset_entries
+                    WHERE parent_asset_id = OLD.id
+                );
+            END
+            "#],
+    },
 ];
 
 pub async fn ensure_table(pool: &Pool<Sqlite>) -> Result<()> {
@@ -1523,6 +1565,8 @@ mod tests {
         assert_eq!(MIGRATIONS[21].version, 22);
         assert_eq!(MIGRATIONS[22].version, 23);
         assert_eq!(MIGRATIONS[23].version, 24);
+        assert_eq!(MIGRATIONS[24].version, 25);
+        assert_eq!(MIGRATIONS[25].version, 26);
         for migration in MIGRATIONS {
             assert_eq!(checksum(migration), checksum(migration));
             assert_eq!(checksum(migration).len(), 64);

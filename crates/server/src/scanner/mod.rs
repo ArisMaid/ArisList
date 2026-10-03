@@ -3,12 +3,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use lofty::prelude::*;
 use lofty::probe::Probe;
 use regex::Regex;
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -17,13 +16,20 @@ use zip::ZipArchive;
 use crate::db::{ScannerAssetInput, ScannerExternalIdInput, ScannerTagInput, ScannerWorkSnapshot};
 use crate::error::{AppError, Result};
 use crate::inventory;
-use crate::models::ScanResponse;
+use crate::models::{ScanResponse, ScanSourceResult};
 use crate::resource::{ResourceClass, ResourceGovernor};
 use crate::settings;
+use crate::strm::source;
 use crate::vfs;
 use crate::AppState;
 
 pub(crate) mod audio_grouping;
+pub(crate) mod comic_info;
+use comic_info::ComicInfoRead;
+
+const AUDIO_METADATA_VERSION: &str = "audio-v2";
+static SCAN_SOURCE_RESULTS: LazyLock<Mutex<Vec<ScanSourceResult>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 pub(crate) mod inspectors;
 
 static NATURAL_NUMBER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+").unwrap());
@@ -145,6 +151,33 @@ impl ScanContext<'_> {
             .db
             .finish_scanner_work(work_id, scope, &self.token, fingerprint)
             .await
+    }
+
+    async fn finish_work_preserving_tags(
+        &self,
+        work_id: i64,
+        scope: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        self.state
+            .db
+            .finish_scanner_work_preserving_tags(work_id, scope, &self.token, fingerprint)
+            .await
+    }
+
+    fn record_source_result(&self, result: ScanSourceResult) {
+        let Ok(mut results) = SCAN_SOURCE_RESULTS.lock() else {
+            tracing::warn!("scanner source result lock is poisoned");
+            return;
+        };
+        if let Some(existing) = results
+            .iter_mut()
+            .find(|existing| source_results_match(existing, &result))
+        {
+            *existing = result;
+        } else {
+            results.push(result);
+        }
     }
 }
 
@@ -334,6 +367,7 @@ fn sampled_content_key(path: &Path, size: u64) -> Option<String> {
 }
 
 struct ArchiveScanState {
+    fallback_title: String,
     fingerprint: ScanFingerprint,
     cover: Option<PathBuf>,
 }
@@ -360,6 +394,7 @@ struct ScanWalk {
     files: Vec<PathBuf>,
     usable: bool,
     complete: bool,
+    discovered: usize,
 }
 
 struct BatchedWalkState {
@@ -367,6 +402,7 @@ struct BatchedWalkState {
     usable: bool,
     complete: bool,
     done: bool,
+    discovered: usize,
 }
 
 /// Incremental variant of `walk_matching_files`.
@@ -405,6 +441,7 @@ impl BatchedFileWalker {
                 return Ok(None);
             }
             let mut files = Vec::with_capacity(SCANNER_DISCOVERY_BATCH_SIZE);
+            let mut discovered = 0_usize;
             let mut traversal_failed = false;
             let iterator = state.iterator.as_mut().ok_or_else(|| {
                 AppError::Other("scanner traversal iterator was unexpectedly missing".to_string())
@@ -430,11 +467,13 @@ impl BatchedFileWalker {
                     }
                     Some(Ok(entry)) => {
                         if entry.file_type().is_file() && predicate(entry.path()) {
+                            discovered += 1;
                             files.push(entry.into_path());
                         }
                     }
                 }
             }
+            state.discovered += discovered;
             if traversal_failed {
                 state.complete = false;
             }
@@ -457,6 +496,7 @@ impl BatchedFileWalker {
                 files: Vec::new(),
                 usable: state.usable,
                 complete: state.complete && state.done,
+                discovered: state.discovered,
             })
         })
         .await
@@ -485,6 +525,7 @@ where
                 usable: false,
                 complete: false,
                 done: true,
+                discovered: 0,
             });
         }
         let mut walker = WalkDir::new(&state_root).min_depth(min_depth);
@@ -496,6 +537,7 @@ where
             usable: true,
             complete: true,
             done: false,
+            discovered: 0,
         })
     })
     .await?;
@@ -553,6 +595,11 @@ async fn fingerprint_archive(
         let dir = archive_path.parent().unwrap_or_else(|| Path::new(""));
         let comic_info_path = dir.join("ComicInfo.xml");
         let cover = include_cover.then(|| find_cover_file(dir)).flatten();
+        let fallback_title = if include_comic_info {
+            comic_info::fallback_title(&archive_path)
+        } else {
+            String::new()
+        };
         let mut paths = vec![archive_path];
         if include_comic_info && comic_info_path.is_file() {
             paths.push(comic_info_path);
@@ -561,7 +608,49 @@ async fn fingerprint_archive(
             paths.push(path.clone());
         }
         Ok(ArchiveScanState {
-            fingerprint: ScanFingerprint::from_paths(paths),
+            fallback_title,
+            fingerprint: {
+                let mut fingerprint = ScanFingerprint::from_paths(paths);
+                if include_comic_info {
+                    fingerprint.value =
+                        format!("{}:{}", comic_info::METADATA_VERSION, fingerprint.value);
+                }
+                fingerprint
+            },
+            cover,
+        })
+    })
+    .await
+}
+
+async fn fingerprint_archive_with_sidecar_version(
+    resources: &ResourceGovernor,
+    archive_path: PathBuf,
+    include_cover: bool,
+    version: &'static str,
+) -> Result<ArchiveScanState> {
+    scanner_blocking(resources, move || {
+        let dir = archive_path.parent().unwrap_or_else(|| Path::new(""));
+        let comic_info_path = dir.join("ComicInfo.xml");
+        let cover = include_cover.then(|| find_cover_file(dir)).flatten();
+        let fallback_title = archive_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(clean_title)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Untitled CoserPicture".to_string());
+        let mut paths = vec![archive_path];
+        if comic_info_path.is_file() {
+            paths.push(comic_info_path);
+        }
+        if let Some(path) = cover.as_ref() {
+            paths.push(path.clone());
+        }
+        let mut fingerprint = ScanFingerprint::from_paths(paths);
+        fingerprint.value = format!("{version}:{}", fingerprint.value);
+        Ok(ArchiveScanState {
+            fallback_title,
+            fingerprint,
             cover,
         })
     })
@@ -578,13 +667,19 @@ async fn fingerprint_audio_group(
         let root = common_rj_root(&audio_dir, &rj, &files);
         let cover = audio_cover_candidate(&files, &root);
         let mut fingerprint_files = files;
+        let sidecar = root.join("ComicInfo.xml");
+        if sidecar.is_file() {
+            fingerprint_files.push(sidecar);
+        }
         if let Some(path) = cover.as_ref() {
             if !fingerprint_files.contains(path) {
                 fingerprint_files.push(path.clone());
             }
         }
+        let mut fingerprint = ScanFingerprint::from_paths(fingerprint_files);
+        fingerprint.value = format!("{AUDIO_METADATA_VERSION}:{}", fingerprint.value);
         Ok(AudioFingerprintState {
-            fingerprint: ScanFingerprint::from_paths(fingerprint_files),
+            fingerprint,
             root,
             cover,
         })
@@ -628,7 +723,7 @@ async fn read_audio_group_metadata(
 async fn read_comic_info_blocking(
     resources: &ResourceGovernor,
     dir: PathBuf,
-) -> Result<Option<ComicInfo>> {
+) -> Result<ComicInfoRead> {
     scanner_blocking(resources, move || read_comic_info(&dir)).await
 }
 
@@ -681,6 +776,7 @@ where
                 files: Vec::new(),
                 usable: false,
                 complete: false,
+                discovered: 0,
             });
         }
         let mut walker = WalkDir::new(&root).min_depth(min_depth);
@@ -707,10 +803,12 @@ where
                 files.push(entry.into_path());
             }
         }
+        let discovered = files.len();
         Ok(ScanWalk {
             files,
             usable: true,
             complete,
+            discovered,
         })
     })
     .await
@@ -741,6 +839,7 @@ where
                 files: Vec::new(),
                 usable: false,
                 complete: false,
+                discovered: 0,
             });
         }
         let mut walker = WalkDir::new(&root).min_depth(min_depth);
@@ -778,10 +877,12 @@ where
                 }
             }
         }
+        let discovered = parents.len();
         Ok(ScanWalk {
             files: parents.into_iter().collect(),
             usable: true,
             complete,
+            discovered,
         })
     })
     .await
@@ -957,6 +1058,9 @@ async fn scan_all_locked(
     enqueue_enrichment: bool,
     scope: Option<&str>,
 ) -> Result<ScanResponse> {
+    if let Ok(mut results) = SCAN_SOURCE_RESULTS.lock() {
+        results.clear();
+    }
     let revision_before = state.db.revision_fence_snapshot().await?;
     let catalog_revision_before = revision_before.catalog_revision;
     let search_revision_before = revision_before.search_revision;
@@ -1078,6 +1182,34 @@ async fn scan_all_locked(
         stats.jobs_created += usize::from(created);
     }
 
+    record_unreported_source_results(&context, scope);
+    let source_results = SCAN_SOURCE_RESULTS
+        .lock()
+        .map(|results| results.clone())
+        .unwrap_or_default();
+    let status = if source_results.is_empty() {
+        "skipped".to_string()
+    } else if source_results
+        .iter()
+        .any(|result| result.status == "failed")
+    {
+        if source_results
+            .iter()
+            .any(|result| result.status == "success" || result.status == "partial")
+        {
+            "partial".to_string()
+        } else {
+            "failed".to_string()
+        }
+    } else if source_results
+        .iter()
+        .any(|result| result.status == "partial")
+    {
+        "partial".to_string()
+    } else {
+        "success".to_string()
+    };
+
     Ok(ScanResponse {
         comics: stats.comics,
         novels: stats.novels,
@@ -1085,20 +1217,134 @@ async fn scan_all_locked(
         gallery: stats.gallery,
         coser_picture: stats.coser_picture,
         jobs_created: stats.jobs_created,
+        status,
+        source_results,
     })
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(rename_all = "PascalCase")]
-struct ComicInfo {
-    series: Option<String>,
-    alternate_series: Option<String>,
-    writer: Option<String>,
-    penciller: Option<String>,
-    genre: Option<String>,
-    page_count: Option<i64>,
-    language_iso: Option<String>,
-    community_rating: Option<f64>,
+fn record_unreported_source_results(context: &ScanContext<'_>, scope: Option<&str>) {
+    let local_sources = [
+        ("comic", &context.settings.media_dirs.comics),
+        ("novel", &context.settings.media_dirs.novels),
+        ("audio", &context.settings.media_dirs.audio),
+        ("gallery", &context.settings.media_dirs.gallery),
+        ("coser-picture", &context.settings.media_dirs.coser_picture),
+    ];
+    for (kind, roots) in local_sources {
+        if scope.is_some_and(|selected| selected != kind) {
+            continue;
+        }
+        for root in roots {
+            record_default_source_result(context, kind, "local", None, Path::new(root));
+        }
+    }
+    for kind in ["comic", "novel", "audio", "gallery", "coser-picture"] {
+        if scope.is_some_and(|selected| selected != kind) {
+            continue;
+        }
+        for source in vfs::qmediasync_scan_sources(&context.settings, kind) {
+            record_default_source_result(
+                context,
+                kind,
+                &source.provider,
+                Some(source.mount_name),
+                Path::new(&source.root),
+            );
+        }
+    }
+}
+
+fn record_default_source_result(
+    context: &ScanContext<'_>,
+    kind: &str,
+    provider: &str,
+    mount_name: Option<String>,
+    root: &Path,
+) {
+    let root_string = path_string(root);
+    let readable = root.is_dir() && std::fs::read_dir(root).is_ok();
+    let (status, message) = if readable {
+        ("success".to_string(), None)
+    } else {
+        (
+            "failed".to_string(),
+            Some(format!("源目录不可读或不存在: {root_string}")),
+        )
+    };
+    let result = ScanSourceResult {
+        kind: kind.to_string(),
+        provider: provider.to_string(),
+        mount_name,
+        root: root_string,
+        status,
+        discovered: 0,
+        imported: 0,
+        skipped: 0,
+        failed: usize::from(!readable),
+        message,
+    };
+    let already_reported = SCAN_SOURCE_RESULTS
+        .lock()
+        .map(|results| {
+            results
+                .iter()
+                .any(|existing| source_results_match(existing, &result))
+        })
+        .unwrap_or(false);
+    if !already_reported {
+        context.record_source_result(result);
+    }
+}
+
+fn source_results_match(left: &ScanSourceResult, right: &ScanSourceResult) -> bool {
+    left.kind == right.kind
+        && left.provider == right.provider
+        && left.mount_name == right.mount_name
+        && source_result_root_key(&left.root) == source_result_root_key(&right.root)
+}
+
+fn source_result_root_key(root: &str) -> String {
+    let normalized = root
+        .trim()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn scan_source_status(readable: bool, complete: bool, discovered: usize, failed: usize) -> String {
+    if !readable {
+        "failed".to_string()
+    } else if !complete || failed > 0 {
+        "partial".to_string()
+    } else if discovered == 0 {
+        "skipped".to_string()
+    } else {
+        "success".to_string()
+    }
+}
+
+fn scan_source_message(
+    readable: bool,
+    complete: bool,
+    discovered: usize,
+    failed: usize,
+) -> Option<String> {
+    if !readable {
+        Some("源目录不可读或不存在".to_string())
+    } else if !complete {
+        Some("源目录遍历未完成，已跳过缺失清理".to_string())
+    } else if failed > 0 {
+        Some("部分候选文件未能导入；已保留既有作品".to_string())
+    } else if discovered == 0 {
+        Some("扫描深度内没有可导入媒体".to_string())
+    } else {
+        None
+    }
 }
 
 async fn catalog_v2_coordinator_owns_kind(state: &AppState, kind: &str) -> Result<bool> {
@@ -1130,8 +1376,11 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
             .iter()
             .map(|source| context.scope("comic", Path::new(&source.root))),
     );
-    let mut count = 0;
+    let mut count: usize = 0;
     for root in roots {
+        let imported_before = count;
+        let skipped = 0_usize;
+        let mut failed = 0_usize;
         let scope = context.prepare_scope("comic", &root).await?;
         let walk = open_matching_file_batches(
             &state.resources,
@@ -1144,15 +1393,30 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
         )
         .await?;
         if !walk.usable() {
-            let _ = walk.finish().await?;
+            let summary = walk.finish().await?;
+            context.record_source_result(ScanSourceResult {
+                kind: "comic".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&root),
+                status: "failed".to_string(),
+                discovered: summary.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: 1,
+                message: Some("源目录不可读或不存在".to_string()),
+            });
             continue;
         }
         while let Some(batch) = walk.next_batch().await? {
             for cbz_path in batch {
                 context.ensure_lease_valid()?;
                 let dir = cbz_path.parent().unwrap_or(root.as_path()).to_path_buf();
-                let ArchiveScanState { fingerprint, cover } =
-                    fingerprint_archive(&state.resources, cbz_path.clone(), true, true).await?;
+                let ArchiveScanState {
+                    fingerprint,
+                    cover,
+                    fallback_title,
+                } = fingerprint_archive(&state.resources, cbz_path.clone(), true, true).await?;
                 let source_path = path_string(&cbz_path);
                 if let Some((work_id, previous)) = state
                     .db
@@ -1168,11 +1432,14 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
                         continue;
                     }
                 }
-                let comic_info = match read_comic_info_blocking(&state.resources, dir.clone()).await
+                let existing_work_id = state.db.scanner_work_id("comic", &source_path).await?;
+                let comic_info_read = match read_comic_info_blocking(&state.resources, dir.clone())
+                    .await
                 {
-                    Ok(comic_info) => comic_info.unwrap_or_default(),
+                    Ok(comic_info) => comic_info,
                     Err(err) => {
                         tracing::warn!(path = %dir.display(), error = %err, "preserving comic after ComicInfo.xml read failure");
+                        failed += 1;
                         if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
                             .await?
                         {
@@ -1181,22 +1448,10 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
                         continue;
                     }
                 };
-                let title = clean_title(
-                    comic_info
-                        .series
-                        .as_deref()
-                        .filter(|s| !s.trim().is_empty())
-                        .unwrap_or_else(|| {
-                            dir.file_name()
-                                .and_then(|v| v.to_str())
-                                .unwrap_or("Untitled comic")
-                        }),
-                );
-                let title = if title.is_empty() {
-                    "Untitled comic".to_string()
-                } else {
-                    title
-                };
+                let preserve_scanner_tags =
+                    comic_info_read.is_missing() && existing_work_id.is_some();
+                let comic_info = comic_info_read.into_info();
+                let title = comic_info.display_title(&fallback_title);
                 let archive_page_count = match count_cbz_pages_blocking(
                     &state.resources,
                     cbz_path.clone(),
@@ -1206,6 +1461,7 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
                     Ok(page_count) => page_count,
                     Err(err) => {
                         tracing::warn!(path = %cbz_path.display(), error = %err, "skipping unreadable comic archive");
+                        failed += 1;
                         if preserve_existing_scanner_work(context, "comic", &source_path, &scope)
                             .await?
                         {
@@ -1243,79 +1499,80 @@ async fn scan_comics(context: &ScanContext<'_>) -> Result<usize> {
                     });
                 }
 
-                let mut tags = Vec::new();
-                if let Some(genre) = comic_info.genre.as_deref() {
-                    for tag in parse_comic_genre_tags(genre) {
-                        tags.push(ScannerTagInput {
-                            namespace: tag.namespace,
-                            key: tag.key,
-                            label: tag.label,
-                            source: "comic-info".to_string(),
-                        });
-                    }
-                }
-                for (namespace, value) in [
-                    ("artist", comic_info.penciller.as_deref()),
-                    ("group", comic_info.writer.as_deref()),
-                ] {
-                    if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
-                        tags.push(ScannerTagInput {
-                            namespace: namespace.to_string(),
-                            key: normalize_key(value),
-                            label: value.to_string(),
-                            source: "comic-info".to_string(),
-                        });
-                    }
-                }
-                if let Some(lang) = comic_info.language_iso.as_deref() {
-                    let label = match lang {
-                        "zh" | "cn" => "chinese",
-                        "ja" => "japanese",
-                        "en" => "english",
-                        other => other,
-                    };
-                    tags.push(ScannerTagInput {
-                        namespace: "language".to_string(),
-                        key: label.to_string(),
-                        label: label.to_string(),
+                let tags = comic_info
+                    .tags()
+                    .into_iter()
+                    .map(|tag| ScannerTagInput {
+                        namespace: tag.namespace,
+                        key: tag.key,
+                        label: tag.label,
                         source: "comic-info".to_string(),
-                    });
+                    })
+                    .collect();
+                let mut comic_meta = comic_info.meta(page_count);
+                if preserve_scanner_tags {
+                    comic_meta["comic_info"]["sidecar_status"] = json!("missing");
                 }
-                state
-                    .db
-                    .commit_scanner_work_snapshot(
-                        ScannerWorkSnapshot {
-                            kind: "comic".to_string(),
-                            title,
-                            source_path: Some(source_path.clone()),
-                            category: Some("Doujinshi".to_string()),
-                            description: comic_info.alternate_series.clone(),
-                            rating,
-                            meta: json!({
-                                "page_count": page_count,
-                                "writer": comic_info.writer.clone(),
-                                "penciller": comic_info.penciller.clone(),
-                                "language_iso": comic_info.language_iso.clone(),
-                            }),
-                            fingerprint: fingerprint.value.clone(),
-                            assets,
-                            tags,
-                            external_ids: Vec::new(),
-                        },
-                        &context.token,
-                        &scope,
-                    )
-                    .await?;
+                let snapshot = ScannerWorkSnapshot {
+                    kind: "comic".to_string(),
+                    title,
+                    source_path: Some(source_path.clone()),
+                    category: Some("Doujinshi".to_string()),
+                    description: comic_info.description(),
+                    rating,
+                    meta: comic_meta,
+                    fingerprint: fingerprint.value.clone(),
+                    assets,
+                    tags,
+                    external_ids: Vec::new(),
+                };
+                if preserve_scanner_tags {
+                    state
+                        .db
+                        .commit_scanner_work_snapshot_preserving_tags(
+                            snapshot,
+                            &context.token,
+                            &scope,
+                        )
+                        .await?;
+                } else {
+                    state
+                        .db
+                        .commit_scanner_work_snapshot(snapshot, &context.token, &scope)
+                        .await?;
+                }
                 count += 1;
             }
         }
-        let walk = walk.finish().await?;
-        if walk.complete {
+        let summary = walk.finish().await?;
+        if summary.complete {
             state
                 .db
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        context.record_source_result(ScanSourceResult {
+            kind: "comic".to_string(),
+            provider: "local".to_string(),
+            mount_name: None,
+            root: path_string(&root),
+            status: scan_source_status(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+            discovered: summary.discovered,
+            imported: count.saturating_sub(imported_before),
+            skipped,
+            failed,
+            message: scan_source_message(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+        });
     }
     count += scan_qmediasync_comics(context, &qms_sources).await?;
     finish_kind_scopes(context, "comic", &active_scopes).await?;
@@ -1335,9 +1592,11 @@ async fn scan_novels(
         .iter()
         .map(|root| context.scope("novel", root))
         .collect::<Vec<_>>();
-    let mut count = 0;
+    let mut count: usize = 0;
     let mut jobs_created = 0;
     for root in roots {
+        let imported_before = count;
+        let mut failed = 0_usize;
         let scope = context.prepare_scope("novel", &root).await?;
         let walk = open_matching_file_batches(
             &state.resources,
@@ -1350,7 +1609,19 @@ async fn scan_novels(
         )
         .await?;
         if !walk.usable() {
-            let _ = walk.finish().await?;
+            let summary = walk.finish().await?;
+            context.record_source_result(ScanSourceResult {
+                kind: "novel".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&root),
+                status: "failed".to_string(),
+                discovered: summary.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped: 0,
+                failed: 1,
+                message: Some("源目录不可读或不存在".to_string()),
+            });
             continue;
         }
         while let Some(batch) = walk.next_batch().await? {
@@ -1395,6 +1666,7 @@ async fn scan_novels(
                     Ok(meta) => meta,
                     Err(err) => {
                         tracing::warn!(path = %epub_path.display(), error = %err, "skipping unreadable EPUB");
+                        failed += 1;
                         if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
                             .await?
                         {
@@ -1472,6 +1744,7 @@ async fn scan_novels(
                     Ok(None) => {}
                     Err(err) => {
                         tracing::warn!(path = %epub_path.display(), error = %err, "preserving previous EPUB assets after cover extraction failure");
+                        failed += 1;
                         if preserve_existing_scanner_work(context, "novel", &source_path, &scope)
                             .await?
                         {
@@ -1569,13 +1842,35 @@ async fn scan_novels(
                 count += 1;
             }
         }
-        let walk = walk.finish().await?;
-        if walk.complete {
+        let summary = walk.finish().await?;
+        if summary.complete {
             state
                 .db
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        context.record_source_result(ScanSourceResult {
+            kind: "novel".to_string(),
+            provider: "local".to_string(),
+            mount_name: None,
+            root: path_string(&root),
+            status: scan_source_status(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+            discovered: summary.discovered,
+            imported: count.saturating_sub(imported_before),
+            skipped: 0,
+            failed,
+            message: scan_source_message(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+        });
     }
     finish_kind_scopes(context, "novel", &active_scopes).await?;
     Ok((count, jobs_created))
@@ -1591,9 +1886,12 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
         .iter()
         .map(|root| context.scope("audio", root))
         .collect::<Vec<_>>();
-    let mut count = 0;
+    let mut count: usize = 0;
     let mut jobs_created = 0;
     for audio_dir in roots {
+        let imported_before = count;
+        let mut skipped = 0_usize;
+        let mut failed = 0_usize;
         let scope = context.prepare_scope("audio", &audio_dir).await?;
         let walk = open_matching_file_batches(
             &state.resources,
@@ -1608,7 +1906,19 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
         )
         .await?;
         if !walk.usable() {
-            let _ = walk.finish().await?;
+            let summary = walk.finish().await?;
+            context.record_source_result(ScanSourceResult {
+                kind: "audio".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&audio_dir),
+                status: "failed".to_string(),
+                discovered: summary.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: 1,
+                message: Some("源目录不可读或不存在".to_string()),
+            });
             continue;
         }
         let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
@@ -1658,6 +1968,23 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     "preserving audio works after the discovery path budget was reached"
                 );
             }
+            let message = if !discovery_within_budget {
+                Some("音声目录发现路径达到安全上限，已跳过缺失清理".to_string())
+            } else {
+                Some("源目录遍历未完成，已跳过缺失清理".to_string())
+            };
+            context.record_source_result(ScanSourceResult {
+                kind: "audio".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&audio_dir),
+                status: "partial".to_string(),
+                discovered: walk.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed,
+                message,
+            });
             continue;
         }
 
@@ -1668,6 +1995,7 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     limit = inspectors::audio::MAX_AUDIO_FILES_PER_WORK,
                     "preserving audio work after reaching the per-work file safety limit"
                 );
+                skipped += 1;
                 continue;
             }
             context.ensure_lease_valid()?;
@@ -1678,13 +2006,21 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                 fingerprint,
                 root,
                 cover,
-            } = fingerprint_audio_group(
+            } = match fingerprint_audio_group(
                 &state.resources,
                 audio_dir.clone(),
                 grouping_key,
                 files.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    tracing::warn!(work_key, error = %err, "skipping audio work after fingerprint failure");
+                    failed += 1;
+                    continue;
+                }
+            };
             let source_path = path_string(&root);
             if let Some((work_id, previous)) = state
                 .db
@@ -1716,11 +2052,38 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     continue;
                 }
             }
-            let audio_metadata = read_audio_group_metadata(&state.resources, files).await?;
+            let audio_metadata = match read_audio_group_metadata(&state.resources, files).await {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::warn!(work_key, error = %err, "preserving audio work after metadata read failure");
+                    failed += 1;
+                    if preserve_existing_scanner_work(context, "audio", &source_path, &scope)
+                        .await?
+                    {
+                        count += 1;
+                    }
+                    continue;
+                }
+            };
             let files = audio_metadata.files;
-            let title = rj
-                .as_deref()
-                .map(|rj| infer_audio_title(&root, rj))
+            let sidecar = match read_comic_info_blocking(&state.resources, root.clone()).await {
+                Ok(sidecar) => sidecar,
+                Err(err) => {
+                    tracing::warn!(path = %root.display(), error = %err, "preserving audio work after ComicInfo.xml read failure");
+                    if preserve_existing_scanner_work(context, "audio", &source_path, &scope)
+                        .await?
+                    {
+                        count += 1;
+                    }
+                    continue;
+                }
+            };
+            let sidecar_missing = sidecar.is_missing();
+            let comic_info = sidecar.into_info();
+            let title = comic_info
+                .title_candidate()
+                .map(|(_, value)| clean_title(value))
+                .or_else(|| rj.as_deref().map(|rj| infer_audio_title(&root, rj)))
                 .unwrap_or_else(|| {
                     root.file_name()
                         .and_then(|value| value.to_str())
@@ -1730,6 +2093,17 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                 });
             let track_count = files.iter().filter(|p| audio_track_file(p)).count();
 
+            let mut work_meta = comic_info.meta(track_count as i64);
+            work_meta["audio"] = json!({
+                "rj": rj.clone(),
+                "track_count": track_count,
+                "grouping": context.settings.audio_grouping.as_str(),
+                "metadata_version": AUDIO_METADATA_VERSION,
+            });
+            if sidecar_missing {
+                work_meta["comic_info"]["sidecar_status"] = json!("missing");
+            }
+            let description = comic_info.description().or(audio_metadata.summary.clone());
             let work_id = state
                 .db
                 .upsert_scanner_work(
@@ -1737,13 +2111,9 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     &title,
                     Some(&source_path),
                     Some("Audio"),
-                    audio_metadata.summary.as_deref(),
-                    None,
-                    json!({
-                        "rj": rj.clone(),
-                        "track_count": track_count,
-                        "grouping": context.settings.audio_grouping.as_str()
-                    }),
+                    description.as_deref(),
+                    comic_info.community_rating,
+                    work_meta,
                     &context.token,
                     &fingerprint.value,
                 )
@@ -1784,6 +2154,14 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     key: "local".to_string(),
                     label: "Audio".to_string(),
                     source: "audio-folder".to_string(),
+                });
+            }
+            for tag in comic_info.tags() {
+                tags.push(ScannerTagInput {
+                    namespace: tag.namespace,
+                    key: tag.key,
+                    label: tag.label,
+                    source: "comic-info".to_string(),
                 });
             }
 
@@ -1912,17 +2290,31 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
                     source: "audio-folder".to_string(),
                 });
             }
-            state
-                .db
-                .commit_scanner_work_metadata(
-                    work_id,
-                    tags,
-                    external_ids,
-                    &context.token,
-                    &scope,
-                    &fingerprint.value,
-                )
-                .await?;
+            if sidecar_missing {
+                state
+                    .db
+                    .commit_scanner_work_metadata_preserving_tags(
+                        work_id,
+                        tags,
+                        external_ids,
+                        &context.token,
+                        &scope,
+                        &fingerprint.value,
+                    )
+                    .await?;
+            } else {
+                state
+                    .db
+                    .commit_scanner_work_metadata(
+                        work_id,
+                        tags,
+                        external_ids,
+                        &context.token,
+                        &scope,
+                        &fingerprint.value,
+                    )
+                    .await?;
+            }
             if enqueue_enrichment && rj.is_some() {
                 let (_, created) = state
                     .db
@@ -1945,6 +2337,18 @@ async fn scan_audio(context: &ScanContext<'_>, enqueue_enrichment: bool) -> Resu
             .db
             .finish_scanner_scope(&scope, &context.token)
             .await?;
+        context.record_source_result(ScanSourceResult {
+            kind: "audio".to_string(),
+            provider: "local".to_string(),
+            mount_name: None,
+            root: path_string(&audio_dir),
+            status: scan_source_status(true, true, walk.discovered, failed),
+            discovered: walk.discovered,
+            imported: count.saturating_sub(imported_before),
+            skipped,
+            failed,
+            message: scan_source_message(true, true, walk.discovered, failed),
+        });
     }
     finish_kind_scopes(context, "audio", &active_scopes).await?;
     Ok((count, jobs_created))
@@ -1960,8 +2364,11 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
         .iter()
         .map(|root| context.scope("gallery", root))
         .collect::<Vec<_>>();
-    let mut count = 0;
+    let mut count: usize = 0;
     for root in roots {
+        let imported_before = count;
+        let mut skipped = 0_usize;
+        let mut failed = 0_usize;
         let scope = context.prepare_scope("gallery", &root).await?;
         let walk = walk_matching_parent_directories(
             &state.resources,
@@ -1974,6 +2381,20 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
         )
         .await?;
         if !walk.usable || !walk.complete {
+            let status = scan_source_status(walk.usable, walk.complete, walk.discovered, 1);
+            let message = scan_source_message(walk.usable, walk.complete, walk.discovered, 1);
+            context.record_source_result(ScanSourceResult {
+                kind: "gallery".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&root),
+                status,
+                discovered: walk.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: 1,
+                message,
+            });
             continue;
         }
         let mut scope_complete = true;
@@ -1988,6 +2409,7 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
             .await?;
             if !folder_complete {
                 scope_complete = false;
+                failed += 1;
                 // Do not commit a partial folder snapshot.  The next
                 // complete reconcile will decide whether entries are truly
                 // missing, preserving the scanner's tombstone safety fence.
@@ -2006,12 +2428,14 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                             error = %err,
                             "preserving gallery after file metadata changed during scan"
                         );
+                        failed += 1;
                         scope_complete = false;
                         continue;
                     }
                 };
             if fingerprint.files.is_empty() {
                 scope_complete = false;
+                skipped += 1;
                 continue;
             }
             let title = folder
@@ -2172,6 +2596,28 @@ async fn scan_gallery(context: &ScanContext<'_>) -> Result<usize> {
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        context.record_source_result(ScanSourceResult {
+            kind: "gallery".to_string(),
+            provider: "local".to_string(),
+            mount_name: None,
+            root: path_string(&root),
+            status: scan_source_status(
+                true,
+                walk.complete && scope_complete,
+                walk.discovered,
+                failed,
+            ),
+            discovered: walk.discovered,
+            imported: count.saturating_sub(imported_before),
+            skipped,
+            failed,
+            message: scan_source_message(
+                true,
+                walk.complete && scope_complete,
+                walk.discovered,
+                failed,
+            ),
+        });
     }
     finish_kind_scopes(context, "gallery", &active_scopes).await?;
     Ok(count)
@@ -2193,8 +2639,11 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
             .iter()
             .map(|source| context.scope("coser-picture", Path::new(&source.root))),
     );
-    let mut count = 0;
+    let mut count: usize = 0;
     for root in roots {
+        let imported_before = count;
+        let mut skipped = 0_usize;
+        let mut failed = 0_usize;
         let scope = context.prepare_scope("coser-picture", &root).await?;
         let walk = open_matching_file_batches(
             &state.resources,
@@ -2207,15 +2656,36 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
         )
         .await?;
         if !walk.usable() {
-            let _ = walk.finish().await?;
+            let summary = walk.finish().await?;
+            context.record_source_result(ScanSourceResult {
+                kind: "coser-picture".to_string(),
+                provider: "local".to_string(),
+                mount_name: None,
+                root: path_string(&root),
+                status: "failed".to_string(),
+                discovered: summary.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: 1,
+                message: Some("源目录不可读或不存在".to_string()),
+            });
             continue;
         }
         while let Some(batch) = walk.next_batch().await? {
             for zip_path in batch {
                 context.ensure_lease_valid()?;
                 let source_path = path_string(&zip_path);
-                let fingerprint =
-                    fingerprint_paths(&state.resources, vec![zip_path.clone()]).await?;
+                let ArchiveScanState {
+                    fingerprint,
+                    cover,
+                    fallback_title,
+                } = fingerprint_archive_with_sidecar_version(
+                    &state.resources,
+                    zip_path.clone(),
+                    true,
+                    "coser-picture-v2",
+                )
+                .await?;
                 if let Some((work_id, previous)) = state
                     .db
                     .scanner_work_fingerprint("coser-picture", &source_path)
@@ -2236,6 +2706,7 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
                     Ok(page_count) => page_count,
                     Err(err) => {
                         tracing::warn!(path = %zip_path.display(), error = %err, "skipping unreadable CoserPicture archive");
+                        failed += 1;
                         if preserve_existing_scanner_work(
                             context,
                             "coser-picture",
@@ -2250,6 +2721,7 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
                     }
                 };
                 if page_count <= 0 {
+                    skipped += 1;
                     if preserve_existing_scanner_work(
                         context,
                         "coser-picture",
@@ -2262,12 +2734,32 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
                     }
                     continue;
                 }
-                let title = zip_path
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("Untitled CoserPicture")
-                    .to_string();
+                let sidecar = match read_comic_info_blocking(
+                    &state.resources,
+                    zip_path.parent().unwrap_or(root.as_path()).to_path_buf(),
+                )
+                .await
+                {
+                    Ok(sidecar) => sidecar,
+                    Err(err) => {
+                        tracing::warn!(path = %zip_path.display(), error = %err, "preserving CoserPicture after ComicInfo.xml read failure");
+                        failed += 1;
+                        if preserve_existing_scanner_work(
+                            context,
+                            "coser-picture",
+                            &source_path,
+                            &scope,
+                        )
+                        .await?
+                        {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                };
+                let sidecar_missing = sidecar.is_missing();
+                let comic_info = sidecar.into_info();
+                let title = comic_info.display_title(&fallback_title);
                 let coser = zip_path
                     .parent()
                     .and_then(|path| path.file_name())
@@ -2282,74 +2774,130 @@ async fn scan_coser_pictures(context: &ScanContext<'_>) -> Result<usize> {
                     .filter(|value| !value.is_empty());
 
                 let size = fingerprint.size(&zip_path);
-                state
-                    .db
-                    .commit_scanner_work_snapshot(
-                        ScannerWorkSnapshot {
-                            kind: "coser-picture".to_string(),
-                            title: clean_title(&title),
-                            source_path: Some(source_path.clone()),
-                            category: Some("CoserPicture".to_string()),
-                            description: relative,
-                            rating: None,
-                            meta: json!({
-                                "page_count": page_count,
-                                "root": path_string(&root),
-                                "archive": path_string(&zip_path),
-                                "coser": coser.clone(),
-                            }),
-                            fingerprint: fingerprint.value.clone(),
-                            assets: vec![ScannerAssetInput {
-                                path: source_path,
-                                mime: "application/zip".to_string(),
-                                role: "archive".to_string(),
-                                variant: Some("zip".to_string()),
+                let mut metadata = comic_info.meta(page_count);
+                metadata["source"] = json!("coser-picture");
+                metadata["archive"] = json!(path_string(&zip_path));
+                metadata["coser"] = json!(coser.clone());
+                if sidecar_missing {
+                    metadata["comic_info"]["sidecar_status"] = json!("missing");
+                }
+                let mut tags = vec![
+                    ScannerTagInput {
+                        namespace: "coser-picture".to_string(),
+                        key: "image-set".to_string(),
+                        label: "CoserPicture".to_string(),
+                        source: "coser-picture-zip".to_string(),
+                    },
+                    ScannerTagInput {
+                        namespace: "folder".to_string(),
+                        key: normalize_key(&coser),
+                        label: coser.clone(),
+                        source: "coser-picture-zip".to_string(),
+                    },
+                    ScannerTagInput {
+                        namespace: "artist".to_string(),
+                        key: normalize_key(&coser),
+                        label: coser.clone(),
+                        source: "coser-picture-zip".to_string(),
+                    },
+                ];
+                tags.extend(comic_info.tags().into_iter().map(|tag| ScannerTagInput {
+                    namespace: tag.namespace,
+                    key: tag.key,
+                    label: tag.label,
+                    source: "comic-info".to_string(),
+                }));
+                let snapshot = ScannerWorkSnapshot {
+                    kind: "coser-picture".to_string(),
+                    title: clean_title(&title),
+                    source_path: Some(source_path.clone()),
+                    category: Some("CoserPicture".to_string()),
+                    description: comic_info.description().or(relative),
+                    rating: comic_info.community_rating,
+                    meta: metadata,
+                    fingerprint: fingerprint.value.clone(),
+                    assets: {
+                        let mut assets = vec![ScannerAssetInput {
+                            path: source_path,
+                            mime: "application/zip".to_string(),
+                            role: "archive".to_string(),
+                            variant: Some("zip".to_string()),
+                            position: None,
+                            size,
+                            meta: fingerprint.asset_meta(
+                                &zip_path,
+                                json!({
+                                    "source": "coser-picture",
+                                    "page_count": page_count
+                                }),
+                            ),
+                        }];
+                        if let Some(cover) = cover {
+                            let cover_mime = mime_guess::from_path(&cover)
+                                .first_or_octet_stream()
+                                .to_string();
+                            assets.push(ScannerAssetInput {
+                                path: path_string(&cover),
+                                mime: cover_mime,
+                                role: "cover".to_string(),
+                                variant: None,
                                 position: None,
-                                size,
-                                meta: fingerprint.asset_meta(
-                                    &zip_path,
-                                    json!({
-                                        "source": "coser-picture",
-                                        "page_count": page_count
-                                    }),
-                                ),
-                            }],
-                            tags: vec![
-                                ScannerTagInput {
-                                    namespace: "coser-picture".to_string(),
-                                    key: "image-set".to_string(),
-                                    label: "CoserPicture".to_string(),
-                                    source: "coser-picture-zip".to_string(),
-                                },
-                                ScannerTagInput {
-                                    namespace: "folder".to_string(),
-                                    key: normalize_key(&coser),
-                                    label: coser.clone(),
-                                    source: "coser-picture-zip".to_string(),
-                                },
-                                ScannerTagInput {
-                                    namespace: "artist".to_string(),
-                                    key: normalize_key(&coser),
-                                    label: coser,
-                                    source: "coser-picture-zip".to_string(),
-                                },
-                            ],
-                            external_ids: Vec::new(),
-                        },
-                        &context.token,
-                        &scope,
-                    )
-                    .await?;
+                                size: fingerprint.size(&cover),
+                                meta: fingerprint.asset_meta(&cover, json!({})),
+                            });
+                        }
+                        assets
+                    },
+                    tags,
+                    external_ids: Vec::new(),
+                };
+                if sidecar_missing {
+                    state
+                        .db
+                        .commit_scanner_work_snapshot_preserving_tags(
+                            snapshot,
+                            &context.token,
+                            &scope,
+                        )
+                        .await?;
+                } else {
+                    state
+                        .db
+                        .commit_scanner_work_snapshot(snapshot, &context.token, &scope)
+                        .await?;
+                }
                 count += 1;
             }
         }
-        let walk = walk.finish().await?;
-        if walk.complete {
+        let summary = walk.finish().await?;
+        if summary.complete {
             state
                 .db
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        context.record_source_result(ScanSourceResult {
+            kind: "coser-picture".to_string(),
+            provider: "local".to_string(),
+            mount_name: None,
+            root: path_string(&root),
+            status: scan_source_status(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+            discovered: summary.discovered,
+            imported: count.saturating_sub(imported_before),
+            skipped,
+            failed,
+            message: scan_source_message(
+                summary.usable,
+                summary.complete,
+                summary.discovered,
+                failed,
+            ),
+        });
     }
     count += scan_qmediasync_coser_pictures(context, &qms_sources).await?;
     finish_kind_scopes(context, "coser-picture", &active_scopes).await?;
@@ -2361,8 +2909,11 @@ async fn scan_qmediasync_comics(
     sources: &[settings::MediaSourceSettings],
 ) -> Result<usize> {
     let state = context.state;
-    let mut count = 0;
+    let mut count: usize = 0;
     for source in sources {
+        let imported_before = count;
+        let mut skipped = 0_usize;
+        let mut failed = 0_usize;
         let root = PathBuf::from(&source.root);
         let scope = context.prepare_scope("comic", &root).await?;
         state
@@ -2385,11 +2936,33 @@ async fn scan_qmediasync_comics(
         )
         .await?;
         if !walk.usable || !walk.complete {
+            context.record_source_result(ScanSourceResult {
+                kind: source.kind.clone(),
+                provider: source.provider.clone(),
+                mount_name: Some(source.mount_name.clone()),
+                root: path_string(&root),
+                status: if walk.usable { "partial" } else { "failed" }.to_string(),
+                discovered: walk.files.len(),
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: if walk.usable { 0 } else { 1 },
+                message: Some(if walk.usable {
+                    "源目录遍历未完成，已跳过缺失清理".to_string()
+                } else {
+                    "源目录不可读，已跳过缺失清理".to_string()
+                }),
+            });
             continue;
         }
+        let discovered = walk.files.len();
+        let complete = walk.complete;
         for archive_path in walk.files {
             context.ensure_lease_valid()?;
             let is_strm = is_strm_file(&archive_path);
+            if is_strm && source::is_secondary_volume(&archive_path) {
+                skipped += 1;
+                continue;
+            }
             let dir = archive_path
                 .parent()
                 .unwrap_or(root.as_path())
@@ -2404,8 +2977,11 @@ async fn scan_qmediasync_comics(
             } else {
                 path_string(&archive_path)
             };
-            let ArchiveScanState { fingerprint, cover } =
-                fingerprint_archive(&state.resources, archive_path.clone(), true, true).await?;
+            let ArchiveScanState {
+                fingerprint,
+                cover,
+                fallback_title,
+            } = fingerprint_archive(&state.resources, archive_path.clone(), true, true).await?;
             if let Some((work_id, previous)) = state
                 .db
                 .scanner_work_fingerprint("comic", &archive_uri)
@@ -2434,14 +3010,24 @@ async fn scan_qmediasync_comics(
                         {
                             count += 1;
                         }
+                        failed += 1;
                         continue;
                     }
                 }
             } else {
                 None
             };
-            let comic_info = match read_comic_info_blocking(&state.resources, dir.clone()).await {
-                Ok(comic_info) => comic_info.unwrap_or_default(),
+            if let Some(target_url) = target_url.as_deref() {
+                if !source::classify(&archive_path, Some(target_url)).is_archive() {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let existing_work_id = state.db.scanner_work_id("comic", &archive_uri).await?;
+            let comic_info_read = match read_comic_info_blocking(&state.resources, dir.clone())
+                .await
+            {
+                Ok(comic_info) => comic_info,
                 Err(err) => {
                     tracing::warn!(path = %dir.display(), error = %err, "preserving qmediasync comic after ComicInfo.xml read failure");
                     if preserve_existing_scanner_work(context, "comic", &archive_uri, &scope)
@@ -2449,21 +3035,13 @@ async fn scan_qmediasync_comics(
                     {
                         count += 1;
                     }
+                    failed += 1;
                     continue;
                 }
             };
-            let title = clean_title(
-                comic_info
-                    .series
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        dir.file_name()
-                            .and_then(|v| v.to_str())
-                            .or_else(|| archive_path.file_stem().and_then(|v| v.to_str()))
-                            .unwrap_or("qmediasync comic")
-                    }),
-            );
+            let preserve_scanner_tags = comic_info_read.is_missing() && existing_work_id.is_some();
+            let comic_info = comic_info_read.into_info();
+            let title = comic_info.display_title(&fallback_title);
             let archive_page_count = if is_strm {
                 None
             } else {
@@ -2476,6 +3054,7 @@ async fn scan_qmediasync_comics(
                         {
                             count += 1;
                         }
+                        failed += 1;
                         continue;
                     }
                 }
@@ -2488,18 +3067,19 @@ async fn scan_qmediasync_comics(
                     &title,
                     Some(&archive_uri),
                     Some("Doujinshi"),
-                    comic_info.alternate_series.as_deref(),
+                    comic_info.description().as_deref(),
                     comic_info.community_rating,
-                    json!({
-                        "source": "qmediasync",
-                        "provider": "qmediasync",
-                        "mount_name": source.mount_name.clone(),
-                        "strm_root": path_string(&root),
-                        "page_count": page_count,
-                        "writer": comic_info.writer.clone(),
-                        "penciller": comic_info.penciller.clone(),
-                        "language_iso": comic_info.language_iso.clone(),
-                    }),
+                    {
+                        let mut meta = comic_info.meta(page_count);
+                        if preserve_scanner_tags {
+                            meta["comic_info"]["sidecar_status"] = json!("missing");
+                        }
+                        meta["source"] = json!("qmediasync");
+                        meta["provider"] = json!("qmediasync");
+                        meta["mount_name"] = json!(source.mount_name);
+                        meta["strm_root"] = json!(path_string(&root));
+                        meta
+                    },
                     &context.token,
                     &fingerprint.value,
                 )
@@ -2507,25 +3087,33 @@ async fn scan_qmediasync_comics(
 
             let size = fingerprint.size(&archive_path);
             let meta = if let Some(target_url) = target_url.as_deref() {
-                vfs::qms_strm_meta_json(
+                let volume_paths = qms_volume_paths(&root, &source.mount_name, &archive_path);
+                let missing_volumes = qms_volume_missing_names(&archive_path);
+                vfs::qms_strm_meta_json_with_volumes(
                     &source.mount_name,
                     &root,
                     &archive_path,
                     &relative,
                     target_url,
+                    &volume_paths,
+                    &missing_volumes,
                 )
                 .await
             } else {
                 json!({ "source": "qmediasync", "provider": "qmediasync", "page_count": page_count })
             };
+            let (archive_mime, archive_variant) = target_url
+                .as_deref()
+                .map(qms_remote_archive_type)
+                .unwrap_or(("application/vnd.comicbook+zip", "cbz"));
             state
                 .db
                 .upsert_scanner_asset(
                     work_id,
                     &archive_uri,
-                    "application/vnd.comicbook+zip",
+                    archive_mime,
                     "archive",
-                    Some(if is_strm { "cbz-strm" } else { "cbz" }),
+                    Some(qms_archive_variant(archive_variant, is_strm)),
                     None,
                     size,
                     fingerprint.asset_meta(&archive_path, meta),
@@ -2554,43 +3142,16 @@ async fn scan_qmediasync_comics(
                     .await?;
             }
 
-            if let Some(genre) = comic_info.genre.as_deref() {
-                for tag in parse_comic_genre_tags(genre) {
-                    link_tag(
-                        context,
-                        work_id,
-                        &tag.namespace,
-                        &tag.key,
-                        &tag.label,
-                        "comic-info",
-                    )
-                    .await?;
-                }
-            }
-            for (namespace, value) in [
-                ("artist", comic_info.penciller.as_deref()),
-                ("group", comic_info.writer.as_deref()),
-            ] {
-                if let Some(value) = value.filter(|v| !v.trim().is_empty()) {
-                    link_tag(
-                        context,
-                        work_id,
-                        namespace,
-                        &normalize_key(value),
-                        value,
-                        "comic-info",
-                    )
-                    .await?;
-                }
-            }
-            if let Some(lang) = comic_info.language_iso.as_deref() {
-                let label = match lang {
-                    "zh" | "cn" => "chinese",
-                    "ja" => "japanese",
-                    "en" => "english",
-                    other => other,
-                };
-                link_tag(context, work_id, "language", label, label, "comic-info").await?;
+            for tag in comic_info.tags() {
+                link_tag(
+                    context,
+                    work_id,
+                    &tag.namespace,
+                    &tag.key,
+                    &tag.label,
+                    "comic-info",
+                )
+                .await?;
             }
             link_tag(
                 context,
@@ -2601,17 +3162,43 @@ async fn scan_qmediasync_comics(
                 "qmediasync",
             )
             .await?;
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
+            if preserve_scanner_tags {
+                context
+                    .finish_work_preserving_tags(work_id, &scope, &fingerprint.value)
+                    .await?;
+            } else {
+                context
+                    .finish_work(work_id, &scope, &fingerprint.value)
+                    .await?;
+            }
             count += 1;
         }
-        if walk.complete {
+        if complete {
             state
                 .db
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        let imported = count.saturating_sub(imported_before);
+        context.record_source_result(ScanSourceResult {
+            kind: source.kind.clone(),
+            provider: source.provider.clone(),
+            mount_name: Some(source.mount_name.clone()),
+            root: path_string(&root),
+            status: if failed > 0 && imported > 0 {
+                "partial"
+            } else if failed > 0 {
+                "failed"
+            } else {
+                "success"
+            }
+            .to_string(),
+            discovered,
+            imported,
+            skipped,
+            failed,
+            message: (failed > 0).then(|| "部分候选文件未能导入；已保留既有作品".to_string()),
+        });
     }
     Ok(count)
 }
@@ -2621,8 +3208,11 @@ async fn scan_qmediasync_coser_pictures(
     sources: &[settings::MediaSourceSettings],
 ) -> Result<usize> {
     let state = context.state;
-    let mut count = 0;
+    let mut count: usize = 0;
     for source in sources {
+        let imported_before = count;
+        let mut skipped = 0_usize;
+        let mut failed = 0_usize;
         let root = PathBuf::from(&source.root);
         let scope = context.prepare_scope("coser-picture", &root).await?;
         state
@@ -2645,11 +3235,31 @@ async fn scan_qmediasync_coser_pictures(
         )
         .await?;
         if !walk.usable || !walk.complete {
+            context.record_source_result(ScanSourceResult {
+                kind: source.kind.clone(),
+                provider: source.provider.clone(),
+                mount_name: Some(source.mount_name.clone()),
+                root: path_string(&root),
+                status: if walk.usable { "partial" } else { "failed" }.to_string(),
+                discovered: walk.discovered,
+                imported: count.saturating_sub(imported_before),
+                skipped,
+                failed: if walk.usable { 1 } else { 1 },
+                message: Some(if walk.usable {
+                    "源目录遍历未完成，已跳过缺失清理".to_string()
+                } else {
+                    "源目录不可读，已跳过缺失清理".to_string()
+                }),
+            });
             continue;
         }
         for archive_path in walk.files {
             context.ensure_lease_valid()?;
             let is_strm = is_strm_file(&archive_path);
+            if is_strm && source::is_secondary_volume(&archive_path) {
+                skipped += 1;
+                continue;
+            }
             let dir = archive_path
                 .parent()
                 .unwrap_or(root.as_path())
@@ -2664,8 +3274,17 @@ async fn scan_qmediasync_coser_pictures(
             } else {
                 path_string(&archive_path)
             };
-            let ArchiveScanState { fingerprint, cover } =
-                fingerprint_archive(&state.resources, archive_path.clone(), false, true).await?;
+            let ArchiveScanState {
+                fingerprint,
+                cover,
+                fallback_title,
+            } = fingerprint_archive_with_sidecar_version(
+                &state.resources,
+                archive_path.clone(),
+                true,
+                "coser-picture-v2",
+            )
+            .await?;
             if let Some((work_id, previous)) = state
                 .db
                 .scanner_work_fingerprint("coser-picture", &archive_uri)
@@ -2699,12 +3318,19 @@ async fn scan_qmediasync_coser_pictures(
                         {
                             count += 1;
                         }
+                        failed += 1;
                         continue;
                     }
                 }
             } else {
                 None
             };
+            if let Some(target_url) = target_url.as_deref() {
+                if !source::classify(&archive_path, Some(target_url)).is_archive() {
+                    skipped += 1;
+                    continue;
+                }
+            }
             let page_count = if is_strm {
                 0
             } else {
@@ -2722,23 +3348,47 @@ async fn scan_qmediasync_coser_pictures(
                         {
                             count += 1;
                         }
+                        failed += 1;
                         continue;
                     }
                 }
             };
-            let title = archive_path
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| dir.file_name().and_then(|value| value.to_str()))
-                .unwrap_or("qmediasync CoserPicture")
-                .to_string();
+            let sidecar = match read_comic_info_blocking(&state.resources, dir.clone()).await {
+                Ok(sidecar) => sidecar,
+                Err(err) => {
+                    tracing::warn!(path = %dir.display(), error = %err, "preserving qmediasync CoserPicture after ComicInfo.xml read failure");
+                    if preserve_existing_scanner_work(
+                        context,
+                        "coser-picture",
+                        &archive_uri,
+                        &scope,
+                    )
+                    .await?
+                    {
+                        count += 1;
+                    }
+                    failed += 1;
+                    continue;
+                }
+            };
+            let sidecar_missing = sidecar.is_missing();
+            let comic_info = sidecar.into_info();
+            let title = comic_info.display_title(&fallback_title);
             let coser = dir
                 .file_name()
                 .and_then(|value| value.to_str())
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or("CoserPicture")
                 .to_string();
+            let mut work_meta = comic_info.meta(page_count);
+            work_meta["source"] = json!("qmediasync");
+            work_meta["provider"] = json!("qmediasync");
+            work_meta["mount_name"] = json!(source.mount_name.clone());
+            work_meta["strm_root"] = json!(path_string(&root));
+            work_meta["coser"] = json!(coser.clone());
+            if sidecar_missing {
+                work_meta["comic_info"]["sidecar_status"] = json!("missing");
+            }
             let work_id = state
                 .db
                 .upsert_scanner_work(
@@ -2746,16 +3396,9 @@ async fn scan_qmediasync_coser_pictures(
                     &clean_title(&title),
                     Some(&archive_uri),
                     Some("CoserPicture"),
-                    Some(&relative),
-                    None,
-                    json!({
-                        "source": "qmediasync",
-                        "provider": "qmediasync",
-                        "mount_name": source.mount_name.clone(),
-                        "strm_root": path_string(&root),
-                        "page_count": page_count,
-                        "coser": coser.clone(),
-                    }),
+                    comic_info.description().as_deref().or(Some(&relative)),
+                    comic_info.community_rating,
+                    work_meta,
                     &context.token,
                     &fingerprint.value,
                 )
@@ -2763,25 +3406,33 @@ async fn scan_qmediasync_coser_pictures(
 
             let size = fingerprint.size(&archive_path);
             let meta = if let Some(target_url) = target_url.as_deref() {
-                vfs::qms_strm_meta_json(
+                let volume_paths = qms_volume_paths(&root, &source.mount_name, &archive_path);
+                let missing_volumes = qms_volume_missing_names(&archive_path);
+                vfs::qms_strm_meta_json_with_volumes(
                     &source.mount_name,
                     &root,
                     &archive_path,
                     &relative,
                     target_url,
+                    &volume_paths,
+                    &missing_volumes,
                 )
                 .await
             } else {
                 json!({ "source": "qmediasync", "provider": "qmediasync", "page_count": page_count })
             };
+            let (archive_mime, archive_variant) = target_url
+                .as_deref()
+                .map(qms_remote_archive_type)
+                .unwrap_or(("application/zip", "zip"));
             state
                 .db
                 .upsert_scanner_asset(
                     work_id,
                     &archive_uri,
-                    "application/zip",
+                    archive_mime,
                     "archive",
-                    Some(if is_strm { "zip-strm" } else { "zip" }),
+                    Some(qms_archive_variant(archive_variant, is_strm)),
                     None,
                     size,
                     fingerprint.asset_meta(&archive_path, meta),
@@ -2819,6 +3470,17 @@ async fn scan_qmediasync_coser_pictures(
                 "qmediasync",
             )
             .await?;
+            for tag in comic_info.tags() {
+                link_tag(
+                    context,
+                    work_id,
+                    &tag.namespace,
+                    &tag.key,
+                    &tag.label,
+                    "comic-info",
+                )
+                .await?;
+            }
             link_tag(
                 context,
                 work_id,
@@ -2837,9 +3499,15 @@ async fn scan_qmediasync_coser_pictures(
                 "qmediasync",
             )
             .await?;
-            context
-                .finish_work(work_id, &scope, &fingerprint.value)
-                .await?;
+            if sidecar_missing {
+                context
+                    .finish_work_preserving_tags(work_id, &scope, &fingerprint.value)
+                    .await?;
+            } else {
+                context
+                    .finish_work(work_id, &scope, &fingerprint.value)
+                    .await?;
+            }
             count += 1;
         }
         if walk.complete {
@@ -2848,12 +3516,160 @@ async fn scan_qmediasync_coser_pictures(
                 .finish_scanner_scope(&scope, &context.token)
                 .await?;
         }
+        let imported = count.saturating_sub(imported_before);
+        context.record_source_result(ScanSourceResult {
+            kind: source.kind.clone(),
+            provider: source.provider.clone(),
+            mount_name: Some(source.mount_name.clone()),
+            root: path_string(&root),
+            status: scan_source_status(true, walk.complete, walk.discovered, failed),
+            discovered: walk.discovered,
+            imported,
+            skipped,
+            failed,
+            message: scan_source_message(true, walk.complete, walk.discovered, failed),
+        });
     }
     Ok(count)
 }
 
 fn is_strm_file(path: &Path) -> bool {
     extension_is(path, &["strm"])
+}
+
+fn qms_volume_paths(root: &Path, mount_name: &str, primary: &Path) -> Vec<String> {
+    if !source::is_primary_volume(primary) {
+        return Vec::new();
+    }
+    let Some(group_key) = source::volume_group_key(primary) else {
+        return Vec::new();
+    };
+    let Some(parent) = primary.parent() else {
+        return Vec::new();
+    };
+    let mut members = std::fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| is_strm_file(path) && path.parent() == Some(parent))
+        .filter_map(|path| {
+            let part = source::volume_part(&path)?;
+            (part.group_key == group_key).then_some((part.index, path))
+        })
+        .collect::<Vec<_>>();
+    if members.len() <= 1 {
+        return Vec::new();
+    }
+    members.sort_by_key(|(index, path)| (*index, path.clone()));
+    members
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let relative = path
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            Some(vfs::qms_strm_uri(mount_name, &relative))
+        })
+        .collect()
+}
+
+pub(crate) fn qms_volume_missing_names(primary: &Path) -> Vec<String> {
+    let Some(group_key) = source::volume_group_key(primary) else {
+        return Vec::new();
+    };
+    let Some(parent) = primary.parent() else {
+        return Vec::new();
+    };
+    let members = std::fs::read_dir(parent)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| is_strm_file(path) && path.parent() == Some(parent))
+        .filter_map(|path| {
+            let part = source::volume_part(&path)?;
+            (part.group_key == group_key).then_some((part.index, path))
+        })
+        .collect::<Vec<_>>();
+    let Some(max_index) = members.iter().map(|(index, _)| *index).max() else {
+        return Vec::new();
+    };
+    if members.len() <= 1 || max_index <= 1 {
+        return Vec::new();
+    }
+    let present = members
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<BTreeSet<_>>();
+    (1..=max_index)
+        .filter(|index| !present.contains(index))
+        .filter_map(|index| expected_volume_name(primary, index))
+        .collect()
+}
+
+fn expected_volume_name(primary: &Path, index: u32) -> Option<String> {
+    let raw = primary.file_name()?.to_str()?.strip_suffix(".strm")?;
+    let lower = raw.to_ascii_lowercase();
+    if let Some(part_start) = lower.rfind(".part") {
+        if lower[part_start + 5..].ends_with(".rar") {
+            return Some(format!("{}{:02}.rar.strm", &raw[..part_start + 5], index));
+        }
+    }
+    for archive in ["7z", "zip", "rar"] {
+        let marker = format!(".{archive}.");
+        if let Some(volume_start) = lower.rfind(&marker) {
+            if lower[volume_start + marker.len()..]
+                .chars()
+                .all(|value| value.is_ascii_digit())
+            {
+                return Some(format!(
+                    "{}.{archive}.{index:03}.strm",
+                    &raw[..volume_start]
+                ));
+            }
+        }
+    }
+    if lower.ends_with(".rar") && index >= 2 {
+        return Some(format!(
+            "{}.r{:02}.strm",
+            &raw[..raw.len().saturating_sub(4)],
+            index - 2
+        ));
+    }
+    if lower.ends_with(".zip") && index >= 2 {
+        return Some(format!(
+            "{}.z{:02}.strm",
+            &raw[..raw.len().saturating_sub(4)],
+            index - 1
+        ));
+    }
+    None
+}
+
+fn qms_remote_archive_type(target_url: &str) -> (&'static str, &'static str) {
+    match source::extension_from_target(target_url)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("cbz") | Some("cb7") => ("application/vnd.comicbook+zip", "cbz"),
+        Some("rar") | Some("r00") | Some("part01.rar") => ("application/vnd.rar", "rar"),
+        Some("7z") => ("application/x-7z-compressed", "7z"),
+        _ => ("application/zip", "zip"),
+    }
+}
+
+fn qms_archive_variant(base: &'static str, is_strm: bool) -> &'static str {
+    if !is_strm {
+        return base;
+    }
+    match base {
+        "cbz" => "cbz-strm",
+        "rar" => "rar-strm",
+        "7z" => "7z-strm",
+        _ => "zip-strm",
+    }
 }
 
 async fn link_tag(
@@ -2883,11 +3699,13 @@ async fn link_tag(
     Ok(())
 }
 
-fn read_comic_info(dir: &Path) -> Result<Option<ComicInfo>> {
+pub(crate) fn read_comic_info(dir: &Path) -> Result<ComicInfoRead> {
     let path = dir.join("ComicInfo.xml");
     let file = match File::open(&path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ComicInfoRead::Missing)
+        }
         Err(err) => return Err(err.into()),
     };
     if file.metadata()?.len() > MAX_COMIC_INFO_BYTES {
@@ -2905,7 +3723,7 @@ fn read_comic_info(dir: &Path) -> Result<Option<ComicInfo>> {
         )));
     }
     quick_xml::de::from_str(&xml)
-        .map(Some)
+        .map(ComicInfoRead::Present)
         .map_err(|err| AppError::Other(format!("invalid ComicInfo.xml: {err}")))
 }
 
@@ -3633,9 +4451,6 @@ mod tests {
                 gallery_dir: temp.path().join("gallery"),
                 coser_picture_dir: temp.path().join("coser-picture"),
                 generated_dir,
-                app_admin_password: "admin".to_string(),
-                admin_password_persisted: false,
-                admin_password_ephemeral: false,
                 lightnovel_api_bases: Vec::new(),
                 lightnovel_access_token: None,
                 enrichment_concurrency: 1,
@@ -3643,6 +4458,7 @@ mod tests {
                 openai_api_key: None,
                 openai_image_model: "gpt-image-2".to_string(),
                 qmediasync_base_url: String::new(),
+                qmediasync_strm_dir: None,
                 cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
                 thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
                 catalog_v2_enabled: true,
@@ -3658,7 +4474,6 @@ mod tests {
                 derivative_cache_dir: temp.path().join("derivatives"),
                 derivative_cache_max_bytes: 1024,
                 derivative_cache_low_watermark_bytes: 512,
-                session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
@@ -3672,8 +4487,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -4332,9 +5145,6 @@ mod tests {
                 gallery_dir: temp.path().join("图库"),
                 coser_picture_dir: coser_root,
                 generated_dir,
-                app_admin_password: "admin".to_string(),
-                admin_password_persisted: false,
-                admin_password_ephemeral: false,
                 lightnovel_api_bases: Vec::new(),
                 lightnovel_access_token: None,
                 enrichment_concurrency: 1,
@@ -4342,6 +5152,7 @@ mod tests {
                 openai_api_key: None,
                 openai_image_model: "gpt-image-2".to_string(),
                 qmediasync_base_url: String::new(),
+                qmediasync_strm_dir: None,
                 cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
                 thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
                 catalog_v2_enabled: true,
@@ -4357,7 +5168,6 @@ mod tests {
                 derivative_cache_dir: temp.path().join("derivatives"),
                 derivative_cache_max_bytes: 1024,
                 derivative_cache_low_watermark_bytes: 512,
-                session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
@@ -4371,8 +5181,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let response = scan_all(&state, false).await.unwrap();
@@ -4571,9 +5379,6 @@ mod tests {
             gallery_dir: temp.path().join("gallery"),
             coser_picture_dir: temp.path().join("coser-picture"),
             generated_dir,
-            app_admin_password: "admin".to_string(),
-            admin_password_persisted: false,
-            admin_password_ephemeral: false,
             lightnovel_api_bases: Vec::new(),
             lightnovel_access_token: None,
             enrichment_concurrency: 1,
@@ -4581,6 +5386,7 @@ mod tests {
             openai_api_key: None,
             openai_image_model: "gpt-image-2".to_string(),
             qmediasync_base_url: String::new(),
+            qmediasync_strm_dir: None,
             cloud_cache_max_bytes: 64 * 1024 * 1024 * 1024,
             thumbnail_cache_max_bytes_per_dir: 8 * 1024 * 1024 * 1024,
             catalog_v2_enabled: true,
@@ -4596,7 +5402,6 @@ mod tests {
             derivative_cache_dir: temp.path().join("derivatives"),
             derivative_cache_max_bytes: 1024,
             derivative_cache_low_watermark_bytes: 512,
-            session_secret: "test-secret".to_string(),
             enable_file_watcher: false,
             watch_debounce_seconds: 20,
         };
@@ -4618,8 +5423,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: crate::search::SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let context = ScanContext {

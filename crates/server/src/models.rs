@@ -283,6 +283,20 @@ pub struct ScanRequest {
     pub kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanSourceResult {
+    pub kind: String,
+    pub provider: String,
+    pub mount_name: Option<String>,
+    pub root: String,
+    pub status: String,
+    pub discovered: usize,
+    pub imported: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ScanResponse {
     pub comics: usize,
@@ -291,4 +305,6 @@ pub struct ScanResponse {
     pub gallery: usize,
     pub coser_picture: usize,
     pub jobs_created: usize,
+    pub status: String,
+    pub source_results: Vec<ScanSourceResult>,
 }

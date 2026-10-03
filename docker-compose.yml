@@ -2,7 +2,7 @@
 #
 # 路径规则：
 # - volumes 左侧是宿主机/NAS 上的真实路径，右侧是容器内路径。
-# - 设置页里填写媒体目录时，应填写右侧的容器内路径，例如 /library/comics。
+# - 设置页只展示右侧的容器内路径；需要更换资源时，修改 volumes 右侧路径和对应环境变量。
 # - 媒体目录建议保持 :ro 只读；本项目只会写入 /app/data 和 /app/generated。
 # - 同一种媒体有多个目录时，不要挂到同一个容器路径，应该挂到不同子目录：
 #   例如 /volume1/comics:/library/comics/main:ro
@@ -27,16 +27,12 @@ services:
     # N100 NAS 默认把容器硬限制在 4GiB；可在 .env 中覆盖。
     mem_limit: ${APP_MEMORY_LIMIT:-4g}
 
-    # 可选 .env 文件。需要覆盖密码、qmediasync 地址等配置时，优先改 .env。
+    # 可选 .env 文件。需要覆盖 qmediasync 地址等运行配置时，优先改 .env。
     env_file:
       - path: .env
         required: false
 
     environment:
-      # APP_BIND is public inside the container, so explicit strong credentials are required.
-      APP_ADMIN_PASSWORD: ${APP_ADMIN_PASSWORD:?set APP_ADMIN_PASSWORD in .env}
-      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET (at least 32 random characters) in .env}
-
       # SQLite 数据库位置，保存索引、历史、阅读进度、设置等应用数据。
       DATABASE_URL: sqlite:///app/data/library.sqlite
 
@@ -44,7 +40,7 @@ services:
       APP_BIND: 0.0.0.0:8787
 
       # 默认媒体目录。这些都是容器内路径，需要和下方 volumes 右侧路径对应。
-      # 如果设置页里已经保存了媒体目录，实际扫描会优先使用设置页中的目录列表。
+      # 设置页只读展示这些路径，修改资源位置请改这里和下方 volumes 后重启容器。
       COMICS_DIR: /library/comics
       NOVELS_DIR: /library/novels
       AUDIO_DIR: /library/audio
@@ -109,6 +105,17 @@ services:
       # qmediasync 服务地址，可在 .env 中设置，例如：
       # QMEDIASYNC_BASE_URL=http://192.168.31.39:8095
       QMEDIASYNC_BASE_URL: ${QMEDIASYNC_BASE_URL:-}
+      # 容器内的 STRM 访问目录；宿主机路径只配置在下方 volume 左侧。
+      QMEDIASYNC_STRM_DIR: /qms-strm
+      # STRM 远程请求治理：默认单并发、每次真实请求至少间隔 1 秒。
+      REMOTE_SOURCE_WORKERS: ${REMOTE_SOURCE_WORKERS:-1}
+      STRM_MIN_REQUEST_INTERVAL_MS: ${STRM_MIN_REQUEST_INTERVAL_MS:-1000}
+      STRM_MAX_REDIRECTS: ${STRM_MAX_REDIRECTS:-5}
+      # 仅在明确需要访问内网/NAS 源时配置，多个值用逗号分隔。
+      STRM_PAGE_CACHE_MAX_BYTES: ${STRM_PAGE_CACHE_MAX_BYTES:-536870912}
+      STRM_TRUSTED_ORIGINS: ${STRM_TRUSTED_ORIGINS:-}
+      STRM_TRUSTED_NETWORKS: ${STRM_TRUSTED_NETWORKS:-}
+      STRM_7ZIP_PATH: ${STRM_7ZIP_PATH:-7z}
 
       # NAS/Docker 部署建议关闭文件监听，新增资源后在网页里手动“重新扫描并重建索引”。
       ENABLE_FILE_WATCHER: ${ENABLE_FILE_WATCHER:-false}

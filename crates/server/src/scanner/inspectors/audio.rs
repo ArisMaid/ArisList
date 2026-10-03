@@ -10,13 +10,12 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use url::Url;
 
 use super::super::audio_grouping::{self, AudioGroupingMode};
 use super::super::{
     audio_cover_candidate, audio_track_file, clean_title, common_rj_root, infer_audio_title,
     infer_audio_variant, normalize_key, normalize_track_key, path_string, read_audio_metadata,
-    read_first_text_summary, ScanFingerprint, SCANNER_PROCESSING_BUDGET_BYTES,
+    read_comic_info, read_first_text_summary, ScanFingerprint, SCANNER_PROCESSING_BUDGET_BYTES,
 };
 use crate::catalog_writer::{
     AssetMutation, ExternalIdMutation, MutationFence, MutationOwner, MutationSource, TagMutation,
@@ -24,9 +23,10 @@ use crate::catalog_writer::{
 };
 use crate::error::{AppError, Result};
 use crate::resource::{ResourceClass, ResourceGovernor};
+use crate::strm::source::{self, SourceKind};
 use crate::vfs;
 
-const AUDIO_INSPECTOR_VERSION: &str = "audio-v1";
+const AUDIO_INSPECTOR_VERSION: &str = "audio-v2";
 const AUDIO_ASSET_CHUNK_SIZE: usize = 256;
 const AUDIO_MUTATION_CHANNEL_DEPTH: usize = 2;
 pub(crate) const MAX_AUDIO_FILES_PER_WORK: usize = 20_000;
@@ -94,7 +94,7 @@ struct AudioMutationTemplate {
 struct RemoteStrmInfo {
     target_url: String,
     extension: String,
-    image: bool,
+    kind: SourceKind,
 }
 
 fn inspect_blocking(
@@ -138,13 +138,13 @@ fn inspect_blocking(
         if is_qmediasync && extension_is(&path, &["strm"]) {
             let target_url = vfs::read_qms_strm_url(&path)?;
             let extension = remote_audio_extension(&path, &target_url);
-            let image = matches!(extension.as_str(), "jpg" | "jpeg" | "png" | "webp");
+            let kind = source::classify(&path, Some(&target_url));
             remote_info.insert(
                 path.clone(),
                 RemoteStrmInfo {
                     target_url,
                     extension,
-                    image,
+                    kind,
                 },
             );
         }
@@ -158,10 +158,17 @@ fn inspect_blocking(
         .filter(|path| audio_track(path, is_qmediasync, remote_info.get(*path)))
         .count();
     if track_count == 0 {
-        return Err(AppError::Other(format!(
-            "audio work {} contains no supported tracks",
-            work_key
-        )));
+        let has_archive = files.iter().any(|path| {
+            remote_info
+                .get(path)
+                .is_some_and(|info| info.kind.is_archive())
+        });
+        if !has_archive {
+            return Err(AppError::Other(format!(
+                "audio work {} contains no supported tracks",
+                work_key
+            )));
+        }
     }
 
     // Duplicate detection is complete once the inventory paths have been
@@ -182,7 +189,7 @@ fn inspect_blocking(
             .filter(|path| {
                 remote_info
                     .get(*path)
-                    .is_some_and(|info| info.image && is_cover_name(path))
+                    .is_some_and(|info| info.kind.is_image() && is_cover_name(path))
             })
             .min()
             .cloned()
@@ -193,7 +200,12 @@ fn inspect_blocking(
             fingerprint_files.push(cover.clone());
         }
     }
-    let fingerprint = ScanFingerprint::from_paths(fingerprint_files);
+    let sidecar_path = work_root.join("ComicInfo.xml");
+    if sidecar_path.is_file() {
+        fingerprint_files.push(sidecar_path.clone());
+    }
+    let mut fingerprint = ScanFingerprint::from_paths(fingerprint_files);
+    fingerprint.value = format!("{AUDIO_INSPECTOR_VERSION}:{}", fingerprint.value);
     for path in &files {
         if fingerprint.source_version(path).is_none() {
             return Err(AppError::Other(format!(
@@ -203,6 +215,9 @@ fn inspect_blocking(
         }
     }
 
+    let sidecar = read_comic_info(&work_root)?;
+    let sidecar_missing = sidecar.is_missing();
+    let comic_info = sidecar.into_info();
     let mut variants = BTreeSet::new();
     for path in files
         .iter()
@@ -211,7 +226,13 @@ fn inspect_blocking(
         variants.insert(infer_audio_variant(path));
     }
     let base_tag_count = if rj.is_some() { 2 } else { 1 };
-    if variants.len().saturating_add(base_tag_count) > WORK_MUTATION_TAG_LIMIT {
+    let comic_info_tags = comic_info.tags();
+    if variants
+        .len()
+        .saturating_add(base_tag_count)
+        .saturating_add(comic_info_tags.len())
+        > WORK_MUTATION_TAG_LIMIT
+    {
         return Err(AppError::Other(format!(
             "audio work {} has too many playback variants ({})",
             work_key,
@@ -223,7 +244,7 @@ fn inspect_blocking(
         .as_deref()
         .map(|mount| vfs::qms_strm_uri(mount, &work_key))
         .unwrap_or_else(|| path_string(&work_root));
-    let title = if let Some(rj) = rj.as_deref() {
+    let fallback_title = if let Some(rj) = rj.as_deref() {
         infer_audio_title(&work_root, rj)
     } else {
         work_root
@@ -233,7 +254,21 @@ fn inspect_blocking(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| work_key.clone())
     };
+    let title = comic_info
+        .title_candidate()
+        .map(|(_, value)| clean_title(value))
+        .unwrap_or(fallback_title);
     let summary = read_first_text_summary(&files);
+    let mut work_meta = comic_info.meta(track_count as i64);
+    work_meta["audio"] = json!({
+        "rj": rj,
+        "track_count": track_count,
+        "grouping": grouping.as_str(),
+        "metadata_version": AUDIO_INSPECTOR_VERSION,
+    });
+    if sidecar_missing {
+        work_meta["comic_info"]["sidecar_status"] = json!("missing");
+    }
     let template = AudioMutationTemplate {
         source: MutationSource {
             kind: "audio".to_string(),
@@ -245,20 +280,17 @@ fn inspect_blocking(
             root_generation,
             scan_token,
             complete_snapshot: false,
+            preserve_scanner_tags: sidecar_missing,
         },
-        fingerprint: format!("{AUDIO_INSPECTOR_VERSION}:{}", fingerprint.value),
+        fingerprint: fingerprint.value.clone(),
         work: WorkMutationFields {
             title,
             subtitle: None,
             category: Some("Audio".to_string()),
-            description: summary,
-            rating: None,
+            description: comic_info.description().or(summary),
+            rating: comic_info.community_rating,
             source_path,
-            meta: json!({
-                "rj": rj,
-                "track_count": track_count,
-                "grouping": grouping.as_str(),
-            }),
+            meta: work_meta,
         },
         root: root.clone(),
         qmediasync_mount_name: qmediasync_mount_name.clone(),
@@ -268,6 +300,47 @@ fn inspect_blocking(
     let mut chunk = Vec::with_capacity(AUDIO_ASSET_CHUNK_SIZE);
     let mut next_position = 0_i64;
     let mut track_positions = BTreeMap::new();
+    for file in files.iter().filter(|path| {
+        remote_info
+            .get(*path)
+            .is_some_and(|info| info.kind.is_archive())
+    }) {
+        let remote = remote_info
+            .get(file)
+            .expect("archive STRM files have remote metadata");
+        let mime = archive_mime(&remote.extension);
+        let volume_paths = template
+            .qmediasync_mount_name
+            .as_deref()
+            .map(|mount_name| super::super::qms_volume_paths(&template.root, mount_name, file))
+            .unwrap_or_default();
+        let missing_volumes = super::super::qms_volume_missing_names(file);
+        let mut remote_meta = json!({
+            "remote": true,
+            "source_kind": "archive",
+            "target_url_hash": vfs::short_hash(&remote.target_url),
+            "archive_extension": remote.extension,
+        });
+        if !volume_paths.is_empty() {
+            remote_meta["volume_paths"] = json!(volume_paths);
+        }
+        if !missing_volumes.is_empty() {
+            remote_meta["missing_volumes"] = json!(missing_volumes);
+        }
+        chunk.push(AssetMutation {
+            path: asset_path_for_file(&template, file),
+            mime,
+            role: "archive".to_string(),
+            variant: None,
+            position: None,
+            size: None,
+            source_version: fingerprint
+                .source_version(file)
+                .expect("fingerprint was validated before streaming")
+                .to_string(),
+            meta: fingerprint.asset_meta(file, remote_meta),
+        });
+    }
     for file in files
         .iter()
         .filter(|path| audio_track(path, is_qmediasync, remote_info.get(*path)))
@@ -372,7 +445,12 @@ fn inspect_blocking(
         send_partial(&sender, &template, chunk, previous_work_key.take())?;
     }
 
-    let tags = audio_tags(rj.as_deref(), &variants);
+    let mut tags = audio_tags(rj.as_deref(), &variants);
+    tags.extend(
+        comic_info_tags
+            .into_iter()
+            .map(|tag| tag_with_source(&tag.namespace, &tag.key, &tag.label, "comic-info")),
+    );
     let external_ids = audio_external_ids(rj.as_deref());
     let mut final_fence = template.fence.clone();
     final_fence.complete_snapshot = true;
@@ -431,13 +509,17 @@ fn audio_tags(rj: Option<&str>, variants: &BTreeSet<String>) -> Vec<TagMutation>
 }
 
 fn tag(namespace: &str, key: &str, label: &str) -> TagMutation {
+    tag_with_source(namespace, key, label, "audio-folder")
+}
+
+fn tag_with_source(namespace: &str, key: &str, label: &str, source: &str) -> TagMutation {
     TagMutation {
         namespace: namespace.to_string(),
         key: key.to_string(),
         label: label.to_string(),
         translated_label: None,
         translated_namespace: None,
-        source: "audio-folder".to_string(),
+        source: source.to_string(),
         intro: None,
         links: None,
         owner: MutationOwner::Scanner,
@@ -483,14 +565,36 @@ fn bounded_audio_meta(mut meta: Value) -> Value {
 }
 
 fn supported_audio_file(path: &Path, remote: bool, remote_info: Option<&RemoteStrmInfo>) -> bool {
+    if remote && source::is_secondary_volume(path) {
+        return false;
+    }
     audio_track(path, remote, remote_info)
         || extension_is(path, &["jpg", "jpeg", "png", "webp", "txt"])
-        || (remote && extension_is(path, &["strm"]) && remote_info.is_some())
+        || (remote
+            && extension_is(path, &["strm"])
+            && remote_info.is_some_and(|info| {
+                matches!(
+                    info.kind,
+                    SourceKind::Audio | SourceKind::Image | SourceKind::Archive
+                )
+            }))
 }
 
 fn audio_track(path: &Path, remote: bool, remote_info: Option<&RemoteStrmInfo>) -> bool {
     audio_track_file(path)
-        || (remote && extension_is(path, &["strm"]) && remote_info.is_some_and(|info| !info.image))
+        || (remote
+            && extension_is(path, &["strm"])
+            && remote_info.is_some_and(|info| info.kind.is_audio()))
+}
+
+fn archive_mime(extension: &str) -> String {
+    match extension {
+        "cbz" => "application/vnd.comicbook+zip".to_string(),
+        "zip" => "application/zip".to_string(),
+        "rar" => "application/vnd.rar".to_string(),
+        "7z" | "cb7" => "application/x-7z-compressed".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
 }
 
 fn extension_is(path: &Path, extensions: &[&str]) -> bool {
@@ -505,17 +609,14 @@ fn extension_is(path: &Path, extensions: &[&str]) -> bool {
 }
 
 fn remote_audio_extension(path: &Path, target_url: &str) -> String {
-    let target_extension = Url::parse(target_url).ok().and_then(|url| {
-        Path::new(url.path())
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-    });
+    let target_extension = source::extension_from_target(target_url).map(str::to_ascii_lowercase);
     let stem_extension = path
-        .file_stem()
-        .and_then(|value| Path::new(value).extension())
+        .file_name()
         .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase);
+        .and_then(|name| {
+            source::extension_from_target(name.strip_suffix(".strm").unwrap_or(name))
+                .map(str::to_ascii_lowercase)
+        });
     target_extension
         .or(stem_extension)
         .unwrap_or_else(|| "remote".to_string())

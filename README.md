@@ -4,6 +4,8 @@ ArisList 是一个自托管的本地媒体书架，用于管理漫画、轻小�
 
 ## 功能
 
+当前版本：**v0.5.0**。升级注意事项与镜像用法见 [发布说明](docs/releases/v0.5.0.md)。
+
 - 扫描本地 CBZ 漫画、EPUB 轻小说、音声文件夹、图库文件夹和 CoserPicture zip 图片包。
 - 图库支持缩略图、虚拟网格、浏览历史和进度恢复。
 - 内置全屏漫画/CoserPicture 阅读器、EPUB 阅读器、音频播放器和图库浏览器。
@@ -12,7 +14,9 @@ ArisList 是一个自托管的本地媒体书架，用于管理漫画、轻小�
 
 ## Docker
 
-复制 `.env.example` 为 `.env`，然后修改管理员密码、会话密钥和可选的 qmediasync 配置。
+复制 `.env.example` 为 `.env`，然后按需修改 qmediasync 等运行配置。
+
+本项目不再提供管理员密码机制。请通过 Docker 端口暴露范围、反向代理或局域网访问控制保护服务；不要将未额外保护的端口直接暴露到公网。
 
 ```bash
 docker compose pull
@@ -25,7 +29,7 @@ docker compose up -d
 http://localhost:8787
 ```
 
-NAS 部署时，修改 `docker-compose.yml` 里的 `volumes`。左侧是宿主机/NAS 路径，右侧是 ArisList 容器内使用的路径：
+NAS 部署时，修改 `docker-compose.yml` 里的 `volumes`。左侧是宿主机/NAS 路径，右侧是 ArisList 容器内使用的路径。设置页中的资源目录为只读展示，修改资源位置需要改动 volume 映射和对应的容器环境变量后重启：
 
 ```yaml
 - /volume1/media/comics:/library/comics:ro
@@ -57,7 +61,7 @@ ghcr.io/arismaid/arislist:latest
 如需固定版本或使用自己的镜像仓库，在 `.env` 中修改：
 
 ```env
-ARISLIST_IMAGE=ghcr.io/arismaid/arislist:v1.0.0
+ARISLIST_IMAGE=ghcr.io/arismaid/arislist:v0.5.0
 ```
 
 如果要从当前源码本地构建：
@@ -77,6 +81,15 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up --build -d
 ```bash
 cargo run -p media-shelf-server
 ```
+
+Windows 本地 STRM 来源有意使用 Fake-IP/内网解析时，可明确指定已确认的来源启动（不自动信任整个内网）：
+
+```powershell
+.\scripts\start-local-strm.ps1 -TrustedOrigin 'http://your-media-host:12366'
+```
+
+该配置仅用于此次后端启动；普通 `cargo run` 不会自动读取 `.env`。公网来源继续使用普通启动方式。
+
 
 前端：
 

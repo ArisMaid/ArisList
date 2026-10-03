@@ -5,7 +5,6 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
 use axum::Json;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -22,7 +21,6 @@ use tantivy::tokenizer::NgramTokenizer;
 use tantivy::{doc, Document, Index, IndexReader, TantivyDocument};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell};
 
-use crate::auth;
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::resource::{ResourceClass, ResourceGovernor};
@@ -110,6 +108,7 @@ struct SearchIndexRow {
     id: i64,
     kind: String,
     title: String,
+    subtitle: Option<String>,
     category: Option<String>,
     description: Option<String>,
     source_path: Option<String>,
@@ -125,6 +124,7 @@ impl SearchIndexRow {
     /// the title token.
     fn body_text(&self) -> String {
         [
+            self.subtitle.as_deref().unwrap_or_default(),
             self.category.as_deref().unwrap_or_default(),
             self.description.as_deref().unwrap_or_default(),
             self.source_path.as_deref().unwrap_or_default(),
@@ -641,6 +641,7 @@ const SEARCH_INDEX_SQL: &str = r#"
         w.id,
         w.kind,
         w.title,
+        w.subtitle,
         w.category,
         w.description,
         w.source_path,
@@ -1506,11 +1507,7 @@ pub async fn prewarm_production_reader(state: Arc<AppState>) -> Result<()> {
     state.search_runtime.prewarm_reader(index_dir).await
 }
 
-pub async fn enqueue_rebuild(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>> {
-    auth::require_csrf(&state, &headers, "search.rebuild").await?;
+pub async fn enqueue_rebuild(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     let (id, created) = state
         .db
         .create_job_if_absent("rebuild-search-index", "queued", json!({ "source": "api" }))
@@ -1526,11 +1523,7 @@ pub async fn enqueue_rebuild(
     ))
 }
 
-pub async fn enqueue_shadow_rebuild(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>> {
-    auth::require_csrf(&state, &headers, "search.shadow-rebuild").await?;
+pub async fn enqueue_shadow_rebuild(State(state): State<Arc<AppState>>) -> Result<Json<Value>> {
     if !state.config.search_outbox_shadow_enabled {
         return Err(AppError::BadRequest(
             "shadow search worker is disabled".to_string(),
@@ -1781,6 +1774,7 @@ fn search_index_row(row: &sqlx::sqlite::SqliteRow) -> SearchIndexRow {
         id: row.get("id"),
         kind: row.get("kind"),
         title: row.get("title"),
+        subtitle: row.get("subtitle"),
         category: row.get("category"),
         description: row.get("description"),
         source_path: row.get("source_path"),
@@ -2076,6 +2070,7 @@ mod tests {
             id,
             kind: "novel".to_string(),
             title: title.to_string(),
+            subtitle: None,
             category: None,
             description: None,
             source_path: None,
@@ -2212,9 +2207,6 @@ mod tests {
                 gallery_dir: temp.path().join("gallery"),
                 coser_picture_dir: temp.path().join("coser-picture"),
                 generated_dir,
-                app_admin_password: "test-admin".to_string(),
-                admin_password_persisted: false,
-                admin_password_ephemeral: false,
                 lightnovel_api_bases: Vec::new(),
                 lightnovel_access_token: None,
                 enrichment_concurrency: 1,
@@ -2222,6 +2214,7 @@ mod tests {
                 openai_api_key: None,
                 openai_image_model: "gpt-image-2".to_string(),
                 qmediasync_base_url: String::new(),
+                qmediasync_strm_dir: None,
                 cloud_cache_max_bytes: 1024,
                 thumbnail_cache_max_bytes_per_dir: 1024,
                 catalog_v2_enabled: true,
@@ -2237,7 +2230,6 @@ mod tests {
                 derivative_cache_dir: temp.path().join("derivatives"),
                 derivative_cache_max_bytes: 1024,
                 derivative_cache_low_watermark_bytes: 512,
-                session_secret: "test-secret".to_string(),
                 enable_file_watcher: false,
                 watch_debounce_seconds: 20,
             },
@@ -2251,8 +2243,6 @@ mod tests {
             catalog_runtime: crate::catalog::CatalogRuntime::default(),
             search_runtime: SearchRuntime::default(),
             comic_page_cache: Arc::new(assets::ComicPageCache::default()),
-            auth_epoch: Arc::new(tokio::sync::RwLock::new("test".to_string())),
-            admin_password_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
